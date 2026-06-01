@@ -64,6 +64,15 @@ create table if not exists transfers (
   amount bigint not null
 );
 
+-- Collaborative document (Yjs CRDT). `body` is the opaque merged Yjs state,
+-- nullable so a fresh doc starts empty. Backs the notes.* collab handlers.
+create table if not exists notes (
+  _id uuid primary key default gen_random_uuid(),
+  _creation_time bigint not null default (extract(epoch from now()) * 1000)::bigint,
+  title text not null,
+  body bytea
+);
+
 -- Seed a channel + user so the example has something to read immediately.
 insert into channels (_id, name, is_private)
 values ('00000000-0000-0000-0000-000000000001', 'general', false)
