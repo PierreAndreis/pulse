@@ -6,6 +6,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
+    // The load suite has its own config (vitest.load.config.ts) and is timing-
+    // sensitive (throughput ratios), so it's not part of the correctness gate.
+    exclude: ["**/node_modules/**", "tests/load/**"],
     testTimeout: 30_000,
     hookTimeout: 120_000,
     fileParallelism: false,

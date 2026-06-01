@@ -161,17 +161,25 @@ export async function startEngine(opts: StartOptions = {}): Promise<Harness> {
       liveEngines.delete(child);
     },
     async reset() {
-      await execFileAsync("docker", [
-        "exec",
-        PG_CONTAINER,
-        "psql",
-        "-U",
-        "pulse",
-        "-d",
-        "pulse",
-        "-c",
-        "truncate messages, counters, accounts, transfers",
-      ]);
+      const truncate = "truncate messages, counters, accounts, transfers";
+      // Prefer a direct psql against DATABASE_URL (CI has psql but no named
+      // container); fall back to `docker exec` into the local dev container
+      // (local dev has the container but not psql on the host).
+      try {
+        await execFileAsync("psql", [DATABASE_URL, "-v", "ON_ERROR_STOP=1", "-c", truncate]);
+      } catch {
+        await execFileAsync("docker", [
+          "exec",
+          PG_CONTAINER,
+          "psql",
+          "-U",
+          "pulse",
+          "-d",
+          "pulse",
+          "-c",
+          truncate,
+        ]);
+      }
     },
   };
 }
