@@ -130,9 +130,9 @@ impl DbOp {
     /// to capture read/write-sets. Raw analytical SQL is opaque (returns `None`).
     pub fn access(&self) -> Option<(&str, bool)> {
         match self {
-            DbOp::Get { table, .. }
-            | DbOp::Query { table, .. }
-            | DbOp::GetCollab { table, .. } => Some((table, false)),
+            DbOp::Get { table, .. } | DbOp::Query { table, .. } | DbOp::GetCollab { table, .. } => {
+                Some((table, false))
+            }
             DbOp::Insert { table, .. }
             | DbOp::Patch { table, .. }
             | DbOp::Replace { table, .. }
@@ -164,14 +164,17 @@ fn raw_bind(value: &Value) -> Option<String> {
 }
 
 fn table<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a Table, SqlError> {
-    catalog.table(name).ok_or_else(|| SqlError::UnknownTable(name.to_string()))
+    catalog
+        .table(name)
+        .ok_or_else(|| SqlError::UnknownTable(name.to_string()))
 }
 
 fn column<'a>(t: &'a Table, field: &str) -> Result<&'a Column, SqlError> {
-    t.column_by_field(field).ok_or_else(|| SqlError::UnknownField {
-        table: t.name.clone(),
-        field: field.to_string(),
-    })
+    t.column_by_field(field)
+        .ok_or_else(|| SqlError::UnknownField {
+            table: t.name.clone(),
+            field: field.to_string(),
+        })
 }
 
 /// Convert a stored value (read as text) to JSON, honoring id encoding and type.
@@ -181,8 +184,14 @@ fn text_to_json(text: Option<String>, col: &Column) -> Value {
         return Value::String(encode_id(ref_table, &s));
     }
     match col.type_class {
-        PgTypeClass::Int8 => s.parse::<i64>().map(|n| json!(n)).unwrap_or(Value::String(s)),
-        PgTypeClass::Float8 => s.parse::<f64>().map(|n| json!(n)).unwrap_or(Value::String(s)),
+        PgTypeClass::Int8 => s
+            .parse::<i64>()
+            .map(|n| json!(n))
+            .unwrap_or(Value::String(s)),
+        PgTypeClass::Float8 => s
+            .parse::<f64>()
+            .map(|n| json!(n))
+            .unwrap_or(Value::String(s)),
         PgTypeClass::Bool => Value::Bool(s == "true" || s == "t"),
         PgTypeClass::Jsonb => serde_json::from_str(&s).unwrap_or(Value::String(s)),
         _ => Value::String(s),
@@ -247,7 +256,9 @@ fn json_to_key_value(value: &Value, col: &Column) -> Option<KeyValue> {
         return None;
     }
     if col.id_ref.is_some() {
-        return Uuid::parse_str(decode_id(value.as_str()?)).ok().map(KeyValue::Uuid);
+        return Uuid::parse_str(decode_id(value.as_str()?))
+            .ok()
+            .map(KeyValue::Uuid);
     }
     match col.type_class {
         PgTypeClass::Int8 => value
@@ -256,9 +267,10 @@ fn json_to_key_value(value: &Value, col: &Column) -> Option<KeyValue> {
             .map(KeyValue::Int),
         PgTypeClass::Bool => value.as_bool().map(KeyValue::Bool),
         PgTypeClass::Text => value.as_str().map(|s| KeyValue::Text(s.to_string())),
-        PgTypeClass::Uuid => {
-            value.as_str().and_then(|s| Uuid::parse_str(decode_id(s)).ok()).map(KeyValue::Uuid)
-        }
+        PgTypeClass::Uuid => value
+            .as_str()
+            .and_then(|s| Uuid::parse_str(decode_id(s)).ok())
+            .map(KeyValue::Uuid),
         _ => None,
     }
 }
@@ -274,7 +286,11 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
                 Err(_) => rs.add_table(tid),
             }
         }
-        DbOp::Query { table: name, predicates, .. } => {
+        DbOp::Query {
+            table: name,
+            predicates,
+            ..
+        } => {
             let tid = TableId::new(name.clone());
             if predicates.is_empty() {
                 rs.add_table(tid); // full-table read
@@ -288,7 +304,11 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
             for p in predicates {
                 if let Some(col) = t.column_by_field(&p.field) {
                     if let Some(value) = json_to_key_value(&p.value, col) {
-                        conds.push(Cond { field: p.field.clone(), op: pred_op_to_filter(p.op), value });
+                        conds.push(Cond {
+                            field: p.field.clone(),
+                            op: pred_op_to_filter(p.op),
+                            value,
+                        });
                     }
                     // unbuildable cond dropped → filter broadens (still safe)
                 }
@@ -301,7 +321,9 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
                 rs.add_table(TableId::new(name.clone()));
             }
         }
-        DbOp::GetCollab { table: name, id, .. } => {
+        DbOp::GetCollab {
+            table: name, id, ..
+        } => {
             // Reading a collab doc depends on that row (key-level).
             let tid = TableId::new(name.clone());
             match Uuid::parse_str(decode_id(id)) {
@@ -434,7 +456,13 @@ pub async fn execute_op(
             Ok((rows.into_iter().next().unwrap_or(Value::Null), None))
         }
 
-        DbOp::Query { table: name, predicates, order, limit, mode } => {
+        DbOp::Query {
+            table: name,
+            predicates,
+            order,
+            limit,
+            mode,
+        } => {
             let t = table(catalog, name)?;
             let mut sql = format!("SELECT {} FROM {}", t.select_list(), name);
             let mut binds: Vec<Option<String>> = Vec::new();
@@ -501,7 +529,10 @@ pub async fn execute_op(
                 placeholders.push(format!("${}::{}", binds.len(), col.type_class.cast()));
             }
             let sql = if cols.is_empty() {
-                format!("INSERT INTO {name} DEFAULT VALUES RETURNING {}", t.select_list())
+                format!(
+                    "INSERT INTO {name} DEFAULT VALUES RETURNING {}",
+                    t.select_list()
+                )
             } else {
                 format!(
                     "INSERT INTO {name} ({}) VALUES ({}) RETURNING {}",
@@ -527,16 +558,23 @@ pub async fn execute_op(
                 None => Value::Null,
             };
             // Insert returns the new id.
-            let id = value.get("_id").and_then(|v| v.as_str()).map(str::to_string);
+            let id = value
+                .get("_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             Ok((id.map(Value::String).unwrap_or(Value::Null), change))
         }
 
-        DbOp::Patch { table: name, id, fields } => {
-            update(&mut *conn, catalog, name, id, fields).await
-        }
-        DbOp::Replace { table: name, id, value } => {
-            update(&mut *conn, catalog, name, id, value).await
-        }
+        DbOp::Patch {
+            table: name,
+            id,
+            fields,
+        } => update(&mut *conn, catalog, name, id, fields).await,
+        DbOp::Replace {
+            table: name,
+            id,
+            value,
+        } => update(&mut *conn, catalog, name, id, value).await,
 
         DbOp::Delete { table: name, id } => {
             let t = table(catalog, name)?;
@@ -546,7 +584,10 @@ pub async fn execute_op(
                 "DELETE FROM {name} WHERE _id = $1::uuid RETURNING {}",
                 t.select_list()
             );
-            let row = sqlx::query(&sql).bind(decode_id(id).to_string()).fetch_optional(&mut *conn).await?;
+            let row = sqlx::query(&sql)
+                .bind(decode_id(id).to_string())
+                .fetch_optional(&mut *conn)
+                .await?;
             let change = row.as_ref().map(|r| Change {
                 table: TableId::new(name.to_string()),
                 key: pk_of(r),
@@ -557,7 +598,11 @@ pub async fn execute_op(
             Ok((Value::Null, change))
         }
 
-        DbOp::GetCollab { table: name, id, field } => {
+        DbOp::GetCollab {
+            table: name,
+            id,
+            field,
+        } => {
             let t = table(catalog, name)?;
             let col = column(t, field)?.column.clone();
             let sql = format!("SELECT {col} FROM {name} WHERE _id = $1::uuid");
@@ -566,18 +611,26 @@ pub async fn execute_op(
                 .fetch_optional(&mut *conn)
                 .await?;
             let state: Vec<u8> = match &row {
-                Some(r) => r.try_get::<Option<Vec<u8>>, _>(col.as_str())?.unwrap_or_default(),
+                Some(r) => r
+                    .try_get::<Option<Vec<u8>>, _>(col.as_str())?
+                    .unwrap_or_default(),
                 None => Vec::new(),
             };
             // Collab state crosses the wire base64-encoded.
             Ok((Value::String(B64.encode(state)), None))
         }
 
-        DbOp::ApplyCollab { table: name, id, field, update } => {
+        DbOp::ApplyCollab {
+            table: name,
+            id,
+            field,
+            update,
+        } => {
             let t = table(catalog, name)?;
             let col = column(t, field)?.column.clone();
-            let update_bytes =
-                B64.decode(update).map_err(|e| SqlError::Db(sqlx::Error::Protocol(e.to_string())))?;
+            let update_bytes = B64
+                .decode(update)
+                .map_err(|e| SqlError::Db(sqlx::Error::Protocol(e.to_string())))?;
 
             // Load current state, merge via the CRDT, persist — all on `conn`
             // (inside the surrounding serializable tx for mutations).
@@ -587,7 +640,9 @@ pub async fn execute_op(
                 .fetch_optional(&mut *conn)
                 .await?;
             let state: Vec<u8> = match &cur {
-                Some(r) => r.try_get::<Option<Vec<u8>>, _>(col.as_str())?.unwrap_or_default(),
+                Some(r) => r
+                    .try_get::<Option<Vec<u8>>, _>(col.as_str())?
+                    .unwrap_or_default(),
                 None => Vec::new(),
             };
             let merged = pulse_collab::apply_update(&state, &update_bytes)
@@ -648,15 +703,26 @@ async fn update(
 
     // Pre-image: needed so a row leaving a filter (e.g. channelId A→B) still
     // invalidates the old channel's subscriptions (matching evaluates new OR old).
-    let pre_sql = format!("SELECT {} FROM {name} WHERE _id = $1::uuid", t.select_list());
-    let old_row = sqlx::query(&pre_sql).bind(raw_id.clone()).fetch_optional(&mut *conn).await?;
+    let pre_sql = format!(
+        "SELECT {} FROM {name} WHERE _id = $1::uuid",
+        t.select_list()
+    );
+    let old_row = sqlx::query(&pre_sql)
+        .bind(raw_id.clone())
+        .fetch_optional(&mut *conn)
+        .await?;
 
     let mut sets = Vec::new();
     let mut binds: Vec<Option<String>> = Vec::new();
     for (field, val) in fields {
         let col = column(t, field)?;
         binds.push(json_to_bind(val, col));
-        sets.push(format!("{} = ${}::{}", col.column, binds.len(), col.type_class.cast()));
+        sets.push(format!(
+            "{} = ${}::{}",
+            col.column,
+            binds.len(),
+            col.type_class.cast()
+        ));
     }
     binds.push(Some(raw_id));
     let sql = format!(

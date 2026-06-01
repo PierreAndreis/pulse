@@ -168,7 +168,13 @@ mod tests {
         // Client reconnects; its offline update is replayed onto the new state.
         let merged = apply_update(&server_state, &offline_update).unwrap();
         let body = read_body(&merged);
-        assert!(body.contains("offline-edit"), "offline edit clobbered: {body:?}");
-        assert!(body.contains("server-edit"), "server edit clobbered: {body:?}");
+        assert!(
+            body.contains("offline-edit"),
+            "offline edit clobbered: {body:?}"
+        );
+        assert!(
+            body.contains("server-edit"),
+            "server edit clobbered: {body:?}"
+        );
     }
 }

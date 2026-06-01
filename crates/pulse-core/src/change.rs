@@ -89,7 +89,13 @@ pub struct Change {
 impl Change {
     /// A change carrying only table + key (no row images) — coarse matching only.
     pub fn point(table: TableId, key: PrimaryKey, op: ChangeOp) -> Self {
-        Change { table, key, op, new: None, old: None }
+        Change {
+            table,
+            key,
+            op,
+            new: None,
+            old: None,
+        }
     }
 }
 
@@ -102,7 +108,10 @@ pub struct ChangeSet {
 
 impl ChangeSet {
     pub fn new(commit_lsn: Lsn) -> Self {
-        ChangeSet { commit_lsn, changes: Vec::new() }
+        ChangeSet {
+            commit_lsn,
+            changes: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, change: Change) {

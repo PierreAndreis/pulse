@@ -58,12 +58,17 @@ pub enum BusError {
 /// Publish a change-set to every node (including the origin). Small change-sets
 /// ship in full; oversized ones degrade to a `Resync` marker.
 pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
-    let full = Wire::Changes { origin: node_id.to_string(), data: cs.clone() };
+    let full = Wire::Changes {
+        origin: node_id.to_string(),
+        data: cs.clone(),
+    };
     let payload = serde_json::to_string(&full)?;
     let payload = if payload.len() <= MAX_PAYLOAD {
         payload
     } else {
-        serde_json::to_string(&Wire::Resync { origin: node_id.to_string() })?
+        serde_json::to_string(&Wire::Resync {
+            origin: node_id.to_string(),
+        })?
     };
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(CHANNEL)

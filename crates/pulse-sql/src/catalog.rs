@@ -161,13 +161,16 @@ pub async fn introspect(pool: &PgPool, schema: &SchemaMeta) -> Result<Catalog, s
             }
         }
 
-        tables.entry(row.table_name.clone()).or_default().push(Column {
-            column: row.column_name.clone(),
-            field,
-            type_class: PgTypeClass::from_udt(&row.udt_name),
-            nullable: row.is_nullable.eq_ignore_ascii_case("yes"),
-            id_ref,
-        });
+        tables
+            .entry(row.table_name.clone())
+            .or_default()
+            .push(Column {
+                column: row.column_name.clone(),
+                field,
+                type_class: PgTypeClass::from_udt(&row.udt_name),
+                nullable: row.is_nullable.eq_ignore_ascii_case("yes"),
+                id_ref,
+            });
     }
 
     let mut catalog = Catalog::default();
@@ -182,9 +185,15 @@ pub async fn introspect(pool: &PgPool, schema: &SchemaMeta) -> Result<Catalog, s
             .enumerate()
             .map(|(i, c)| (c.column.clone(), i))
             .collect();
-        catalog
-            .tables
-            .insert(name.clone(), Table { name, columns, by_field, by_column });
+        catalog.tables.insert(
+            name.clone(),
+            Table {
+                name,
+                columns,
+                by_field,
+                by_column,
+            },
+        );
     }
     Ok(catalog)
 }
@@ -203,4 +212,3 @@ pub fn decode_id(value: &str) -> &str {
         None => value,
     }
 }
-

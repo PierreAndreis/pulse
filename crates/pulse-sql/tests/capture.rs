@@ -13,9 +13,27 @@ use uuid::Uuid;
 
 fn chat_schema() -> SchemaMeta {
     let mut messages = HashMap::new();
-    messages.insert("authorId".to_string(), FieldMeta { kind: "id".into(), ref_table: Some("users".into()) });
-    messages.insert("channelId".to_string(), FieldMeta { kind: "id".into(), ref_table: Some("channels".into()) });
-    messages.insert("body".to_string(), FieldMeta { kind: "string".into(), ref_table: None });
+    messages.insert(
+        "authorId".to_string(),
+        FieldMeta {
+            kind: "id".into(),
+            ref_table: Some("users".into()),
+        },
+    );
+    messages.insert(
+        "channelId".to_string(),
+        FieldMeta {
+            kind: "id".into(),
+            ref_table: Some("channels".into()),
+        },
+    );
+    messages.insert(
+        "body".to_string(),
+        FieldMeta {
+            kind: "string".into(),
+            ref_table: None,
+        },
+    );
     let mut tables = HashMap::new();
     tables.insert("messages".to_string(), TableSchema { fields: messages });
     SchemaMeta { tables }
@@ -75,18 +93,33 @@ async fn capture_reads_prunes_foreign_channel() {
     .ok();
 
     // It must be a precise filter, NOT a coarse table read.
-    assert!(rs.tables.is_empty(), "expected no table-wildcard, got {:?}", rs.tables);
-    assert!(rs.filters.contains_key(&TableId::new("messages")), "expected a messages filter: {rs:?}");
+    assert!(
+        rs.tables.is_empty(),
+        "expected no table-wildcard, got {:?}",
+        rs.tables
+    );
+    assert!(
+        rs.filters.contains_key(&TableId::new("messages")),
+        "expected a messages filter: {rs:?}"
+    );
 
-    assert!(rs.matches_change(&change_into(a)), "same-channel change must match");
-    assert!(!rs.matches_change(&change_into(b)), "foreign-channel change must be pruned: {rs:?}");
+    assert!(
+        rs.matches_change(&change_into(a)),
+        "same-channel change must match"
+    );
+    assert!(
+        !rs.matches_change(&change_into(b)),
+        "foreign-channel change must be pruned: {rs:?}"
+    );
 }
 
 #[tokio::test]
 async fn capture_reads_raw_matches_table_insert() {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    let Ok(pool) = connect(&url, 2).await else { return };
+    let Ok(pool) = connect(&url, 2).await else {
+        return;
+    };
     let catalog = introspect(&pool, &chat_schema()).await.expect("introspect");
 
     let op = DbOp::Raw {
@@ -96,6 +129,13 @@ async fn capture_reads_raw_matches_table_insert() {
     let mut rs = ReadSet::new();
     capture_reads(&op, &catalog, &mut rs);
 
-    assert!(rs.tables.contains(&TableId::new("messages")), "raw read must cover messages: {:?}", rs.tables);
-    assert!(rs.matches_change(&change_into(Uuid::nil())), "raw read must match an insert to messages");
+    assert!(
+        rs.tables.contains(&TableId::new("messages")),
+        "raw read must cover messages: {:?}",
+        rs.tables
+    );
+    assert!(
+        rs.matches_change(&change_into(Uuid::nil())),
+        "raw read must match an insert to messages"
+    );
 }

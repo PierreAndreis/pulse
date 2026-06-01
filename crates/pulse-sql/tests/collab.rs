@@ -49,7 +49,9 @@ async fn collab_ops_merge_two_updates_in_db() {
     };
 
     // A throwaway table with a bytea collab column.
-    pool.execute("drop table if exists collab_docs cascade").await.unwrap();
+    pool.execute("drop table if exists collab_docs cascade")
+        .await
+        .unwrap();
     pool.execute(
         "create table collab_docs (\
             _id uuid primary key default gen_random_uuid(),\
@@ -58,10 +60,11 @@ async fn collab_ops_merge_two_updates_in_db() {
     )
     .await
     .unwrap();
-    let id: String = sqlx::query_scalar("insert into collab_docs default values returning _id::text")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let id: String =
+        sqlx::query_scalar("insert into collab_docs default values returning _id::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     let schema = SchemaMeta::default();
     let catalog = introspect(&pool, &schema).await.unwrap();
@@ -76,7 +79,10 @@ async fn collab_ops_merge_two_updates_in_db() {
             update: B64.encode(insert_update(text)),
         };
         let (_merged, change) = execute_op(&mut conn, &catalog, &op).await.unwrap();
-        assert!(change.is_some(), "ApplyCollab must emit a change for reactivity");
+        assert!(
+            change.is_some(),
+            "ApplyCollab must emit a change for reactivity"
+        );
     }
 
     // Read the merged state back via GetCollab.
@@ -92,5 +98,7 @@ async fn collab_ops_merge_two_updates_in_db() {
     assert!(body.contains("hello"), "first edit lost: {body:?}");
     assert!(body.contains("world"), "second edit lost: {body:?}");
 
-    pool.execute("drop table if exists collab_docs cascade").await.unwrap();
+    pool.execute("drop table if exists collab_docs cascade")
+        .await
+        .unwrap();
 }

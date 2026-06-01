@@ -36,7 +36,11 @@ impl WorkerError {
 
 /// Messages the worker sends to the engine (worker stdout).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum WorkerOut {
     /// Sent once at startup: the loaded procedures and the schema metadata.
     Manifest {
@@ -70,7 +74,11 @@ pub enum WorkerOut {
 
 /// Messages the engine sends to the worker (worker stdin).
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum EngineMsg {
     /// Run a procedure.
     Execute {

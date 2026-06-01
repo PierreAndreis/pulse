@@ -72,7 +72,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let database_url = env_or("DATABASE_URL", "postgres://pulse:pulse@localhost:54329/pulse");
+    let database_url = env_or(
+        "DATABASE_URL",
+        "postgres://pulse:pulse@localhost:54329/pulse",
+    );
     // The OLAP pool may point at a read replica; defaults to the same DB.
     let olap_url = env_or("PULSE_OLAP_DATABASE_URL", &database_url);
     let port: u16 = env_or("PULSE_PORT", "8787").parse().unwrap_or(8787);
@@ -80,8 +83,12 @@ async fn main() -> anyhow::Result<()> {
     let olap_max_conns: u32 = env_or("PULSE_OLAP_MAX_CONNS", "4").parse().unwrap_or(4);
     // Statement timeouts (ms): OLTP low so a slow query can't pin the reactive
     // hot path; OLAP high for heavy analytics. 0 disables.
-    let oltp_timeout: u64 = env_or("PULSE_OLTP_STATEMENT_TIMEOUT_MS", "15000").parse().unwrap_or(15000);
-    let olap_timeout: u64 = env_or("PULSE_OLAP_STATEMENT_TIMEOUT_MS", "60000").parse().unwrap_or(60000);
+    let oltp_timeout: u64 = env_or("PULSE_OLTP_STATEMENT_TIMEOUT_MS", "15000")
+        .parse()
+        .unwrap_or(15000);
+    let olap_timeout: u64 = env_or("PULSE_OLAP_STATEMENT_TIMEOUT_MS", "60000")
+        .parse()
+        .unwrap_or(60000);
 
     let worker_bin = env_or("PULSE_WORKER_BIN", "bun");
     let worker_script = env_or("PULSE_WORKER_SCRIPT", "packages/runtime-node/src/worker.ts");
@@ -119,10 +126,15 @@ async fn main() -> anyhow::Result<()> {
         self_url: format!("http://127.0.0.1:{port}"),
     })
     .await?;
-    tracing::info!("worker ready — {} procedures loaded", worker.procedures().len());
+    tracing::info!(
+        "worker ready — {} procedures loaded",
+        worker.procedures().len()
+    );
 
     let worker = Arc::new(worker);
-    let reexec = Arc::new(WorkerReExecutor { worker: worker.clone() });
+    let reexec = Arc::new(WorkerReExecutor {
+        worker: worker.clone(),
+    });
     let reactor: Arc<dyn Reactor> = Arc::new(InMemoryReactor::new(reexec));
 
     // Cross-node change bus: each node has an id; after a local mutation it
@@ -147,7 +159,12 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::error!("failed to start change bus listener: {e}"),
     }
 
-    let state = Arc::new(AppState { worker, reactor, pool: pool.clone(), node_id });
+    let state = Arc::new(AppState {
+        worker,
+        reactor,
+        pool: pool.clone(),
+        node_id,
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -220,10 +237,22 @@ async fn rpc(
         return (StatusCode::NOT_FOUND, Json(error_body(&err)));
     }
 
-    match state.worker.execute(req.path, req.input, collect_headers(&headers), req.mutation_id).await {
+    match state
+        .worker
+        .execute(
+            req.path,
+            req.input,
+            collect_headers(&headers),
+            req.mutation_id,
+        )
+        .await
+    {
         Ok(res) => {
             if !res.changes.is_empty() {
-                let change_set = ChangeSet { commit_lsn: Lsn::ZERO, changes: res.changes };
+                let change_set = ChangeSet {
+                    commit_lsn: Lsn::ZERO,
+                    changes: res.changes,
+                };
                 // Apply locally now (low latency for this node's own subscribers)...
                 let reactor = state.reactor.clone();
                 tokio::spawn({
@@ -278,7 +307,11 @@ async fn subscribe(
     Json(req): Json<SubscribeReq>,
 ) -> (StatusCode, Json<Value>) {
     let hdrs = collect_headers(&headers);
-    match state.worker.execute(req.path.clone(), req.input.clone(), hdrs.clone(), None).await {
+    match state
+        .worker
+        .execute(req.path.clone(), req.input.clone(), hdrs.clone(), None)
+        .await
+    {
         Ok(res) => {
             state
                 .reactor
@@ -293,7 +326,10 @@ async fn subscribe(
                 })
                 .await;
             // Initial push reflects no committed change yet → LSN zero.
-            state.reactor.push(&req.client_id, &req.sub, &res.value, Lsn::ZERO).await;
+            state
+                .reactor
+                .push(&req.client_id, &req.sub, &res.value, Lsn::ZERO)
+                .await;
             (StatusCode::OK, Json(json!({ "result": "ok" })))
         }
         Err(err) => (status_for(&err.code), Json(error_body(&err))),
@@ -311,6 +347,9 @@ async fn unsubscribe(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UnsubscribeReq>,
 ) -> StatusCode {
-    state.reactor.remove_subscription(&req.client_id, &req.sub).await;
+    state
+        .reactor
+        .remove_subscription(&req.client_id, &req.sub)
+        .await;
     StatusCode::OK
 }

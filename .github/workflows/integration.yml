@@ -1,0 +1,83 @@
+name: Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Engine + Postgres (end-to-end)
+    runs-on: ubuntu-latest
+
+    # Mirrors docker-compose.yml: Postgres 16 with logical replication enabled,
+    # mapped to the port the test harness connects to (54329).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pulse
+          POSTGRES_PASSWORD: pulse
+          POSTGRES_DB: pulse
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U pulse -d pulse"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://pulse:pulse@localhost:54329/pulse
+      PULSE_TEST_DATABASE_URL: postgres://pulse:pulse@localhost:54329/pulse
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The service container can't take custom `command` args, so enable
+      # logical replication on the running instance and restart it.
+      - name: Enable logical replication
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET wal_level = 'logical';"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_replication_slots = 8;"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_senders = 8;"
+          docker restart "$(docker ps -q --filter ancestor=postgres:16)"
+          for i in $(seq 1 30); do
+            pg_isready -d "$DATABASE_URL" && break
+            sleep 2
+          done
+          psql "$DATABASE_URL" -tAc "SHOW wal_level"
+
+      - name: Apply dev schema
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/dev-db.sql
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # The handler worker runs under Bun (PULSE_WORKER_BIN defaults to "bun").
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The harness spawns target/debug/pulse-server, so build it first.
+      - name: Build engine
+        run: cargo build -p pulse-server
+
+      - name: Integration tests
+        run: pnpm test:integration

@@ -23,7 +23,10 @@ async fn pooled_tx_is_serializable() {
         .unwrap();
     let level: String = row.get(0);
     std::fs::write("/tmp/iso_level.txt", &level).ok();
-    assert_eq!(level, "serializable", "pooled tx isolation is `{level}`, expected serializable");
+    assert_eq!(
+        level, "serializable",
+        "pooled tx isolation is `{level}`, expected serializable"
+    );
 }
 
 #[tokio::test]
@@ -44,24 +47,46 @@ async fn concurrent_rmw_raises_serialization_failure() {
     let mut a = pool.begin().await.unwrap();
     let mut b = pool.begin().await.unwrap();
 
-    let va: i64 = sqlx::query("SELECT value FROM counters WHERE _id='00000000-0000-0000-0000-0000000000ff'")
-        .fetch_one(&mut *a).await.unwrap().get(0);
-    let vb: i64 = sqlx::query("SELECT value FROM counters WHERE _id='00000000-0000-0000-0000-0000000000ff'")
-        .fetch_one(&mut *b).await.unwrap().get(0);
+    let va: i64 =
+        sqlx::query("SELECT value FROM counters WHERE _id='00000000-0000-0000-0000-0000000000ff'")
+            .fetch_one(&mut *a)
+            .await
+            .unwrap()
+            .get(0);
+    let vb: i64 =
+        sqlx::query("SELECT value FROM counters WHERE _id='00000000-0000-0000-0000-0000000000ff'")
+            .fetch_one(&mut *b)
+            .await
+            .unwrap()
+            .get(0);
 
     sqlx::query("UPDATE counters SET value=$1 WHERE _id='00000000-0000-0000-0000-0000000000ff'")
-        .bind(va + 1).execute(&mut *a).await.unwrap();
+        .bind(va + 1)
+        .execute(&mut *a)
+        .await
+        .unwrap();
     a.commit().await.unwrap();
 
     // B's write now conflicts with A's committed change → must fail at update or commit.
-    let upd = sqlx::query("UPDATE counters SET value=$1 WHERE _id='00000000-0000-0000-0000-0000000000ff'")
-        .bind(vb + 1).execute(&mut *b).await;
-    let commit = if upd.is_ok() { b.commit().await.map(|_| ()) } else { Err(upd.err().unwrap()) };
+    let upd = sqlx::query(
+        "UPDATE counters SET value=$1 WHERE _id='00000000-0000-0000-0000-0000000000ff'",
+    )
+    .bind(vb + 1)
+    .execute(&mut *b)
+    .await;
+    let commit = if upd.is_ok() {
+        b.commit().await.map(|_| ())
+    } else {
+        Err(upd.err().unwrap())
+    };
 
     let failed = match commit {
         Err(sqlx::Error::Database(db)) => db.code().as_deref() == Some("40001"),
         _ => false,
     };
     std::fs::write("/tmp/iso_conflict.txt", format!("failed={failed}")).ok();
-    assert!(failed, "expected a 40001 serialization failure on the conflicting tx");
+    assert!(
+        failed,
+        "expected a 40001 serialization failure on the conflicting tx"
+    );
 }

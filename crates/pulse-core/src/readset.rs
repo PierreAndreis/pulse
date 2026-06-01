@@ -70,7 +70,10 @@ fn eval(cond: &Cond, row: &RowValues) -> bool {
         Some(v) => match cond.op {
             FilterOp::Eq => v == &cond.value,
             FilterOp::Gt => matches!(v.order(&cond.value), Some(Ordering::Greater)),
-            FilterOp::Gte => matches!(v.order(&cond.value), Some(Ordering::Greater | Ordering::Equal)),
+            FilterOp::Gte => matches!(
+                v.order(&cond.value),
+                Some(Ordering::Greater | Ordering::Equal)
+            ),
             FilterOp::Lt => matches!(v.order(&cond.value), Some(Ordering::Less)),
             FilterOp::Lte => matches!(v.order(&cond.value), Some(Ordering::Less | Ordering::Equal)),
         },
@@ -152,11 +155,20 @@ mod tests {
     }
 
     fn row(pairs: &[(&str, KeyValue)]) -> RowValues {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
     }
 
     fn eq(field: &str, value: KeyValue) -> Filter {
-        Filter { conds: vec![Cond { field: field.to_string(), op: FilterOp::Eq, value }] }
+        Filter {
+            conds: vec![Cond {
+                field: field.to_string(),
+                op: FilterOp::Eq,
+                value,
+            }],
+        }
     }
 
     #[test]
@@ -171,7 +183,10 @@ mod tests {
     #[test]
     fn key_level_match_is_precise() {
         let mut rs = ReadSet::new();
-        rs.add_key(TableId::new("messages"), PrimaryKey::single(KeyValue::Int(7)));
+        rs.add_key(
+            TableId::new("messages"),
+            PrimaryKey::single(KeyValue::Int(7)),
+        );
         let hit = insert("messages", 7);
         let miss = insert("messages", 8);
         assert!(rs.matches_change(&hit));
@@ -191,7 +206,10 @@ mod tests {
     fn filter_prunes_other_channel() {
         // Read messages WHERE channelId = A.
         let mut rs = ReadSet::new();
-        rs.add_filter(TableId::new("messages"), eq("channelId", KeyValue::Text("A".into())));
+        rs.add_filter(
+            TableId::new("messages"),
+            eq("channelId", KeyValue::Text("A".into())),
+        );
 
         let into_a = Change {
             new: Some(row(&[("channelId", KeyValue::Text("A".into()))])),
@@ -209,7 +227,10 @@ mod tests {
     fn filter_matches_via_old_image_on_move() {
         // A row leaving channel A (patched A→B) must still invalidate channel A.
         let mut rs = ReadSet::new();
-        rs.add_filter(TableId::new("messages"), eq("channelId", KeyValue::Text("A".into())));
+        rs.add_filter(
+            TableId::new("messages"),
+            eq("channelId", KeyValue::Text("A".into())),
+        );
         let moved = Change {
             op: ChangeOp::Update,
             old: Some(row(&[("channelId", KeyValue::Text("A".into()))])),
@@ -232,8 +253,14 @@ mod tests {
                 }],
             },
         );
-        let after = Change { new: Some(row(&[("_creationTime", KeyValue::Int(150))])), ..insert("messages", 1) };
-        let before = Change { new: Some(row(&[("_creationTime", KeyValue::Int(50))])), ..insert("messages", 2) };
+        let after = Change {
+            new: Some(row(&[("_creationTime", KeyValue::Int(150))])),
+            ..insert("messages", 1)
+        };
+        let before = Change {
+            new: Some(row(&[("_creationTime", KeyValue::Int(50))])),
+            ..insert("messages", 2)
+        };
         assert!(rs.matches_change(&after));
         assert!(!rs.matches_change(&before));
     }

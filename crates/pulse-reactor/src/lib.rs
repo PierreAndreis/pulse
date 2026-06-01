@@ -125,7 +125,10 @@ impl InMemoryReactor {
                     if !self.record_value(&sub.client_id, &sub.sub, &value).await {
                         continue; // unchanged result → no redundant push
                     }
-                    if !self.send(&sub.client_id, &sub.sub, &value, commit_lsn).await {
+                    if !self
+                        .send(&sub.client_id, &sub.sub, &value, commit_lsn)
+                        .await
+                    {
                         self.remove_client(&sub.client_id).await;
                     }
                 }
@@ -158,13 +161,19 @@ impl InMemoryReactor {
 impl Reactor for InMemoryReactor {
     async fn register_client(&self, client_id: String) -> mpsc::Receiver<SsePush> {
         let (tx, rx) = mpsc::channel(256);
-        self.clients.lock().await.insert(client_id, Client { tx, seq: 0 });
+        self.clients
+            .lock()
+            .await
+            .insert(client_id, Client { tx, seq: 0 });
         rx
     }
 
     async fn remove_client(&self, client_id: &str) {
         self.clients.lock().await.remove(client_id);
-        self.subs.lock().await.retain(|_, s| s.client_id != client_id);
+        self.subs
+            .lock()
+            .await
+            .retain(|_, s| s.client_id != client_id);
     }
 
     async fn add_subscription(&self, sub: Subscription) {
@@ -184,7 +193,10 @@ impl Reactor for InMemoryReactor {
         // Match (dedup: a multi-row tx re-runs each sub at most once).
         let dirty: Vec<Subscription> = {
             let subs = self.subs.lock().await;
-            subs.values().filter(|s| s.read_set.matches(&change_set)).cloned().collect()
+            subs.values()
+                .filter(|s| s.read_set.matches(&change_set))
+                .cloned()
+                .collect()
         };
         self.reexec_and_push(dirty, change_set.commit_lsn).await;
     }
@@ -198,7 +210,9 @@ impl Reactor for InMemoryReactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulse_core::{Change, ChangeOp, ChangeSet, Cond, Filter, FilterOp, KeyValue, PrimaryKey, ReadSet, TableId};
+    use pulse_core::{
+        Change, ChangeOp, ChangeSet, Cond, Filter, FilterOp, KeyValue, PrimaryKey, ReadSet, TableId,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Re-executor that records how many times it ran and returns a fixed value.
@@ -265,7 +279,9 @@ mod tests {
     /// re-running only the matching subscription.
     #[tokio::test]
     async fn apply_change_set_reexecutes_only_matching_subs() {
-        let reexec = Arc::new(CountingReExec { calls: AtomicUsize::new(0) });
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
         let reactor = InMemoryReactor::new(reexec.clone());
 
         let mut rx_a = reactor.register_client("a".into()).await;
@@ -275,11 +291,21 @@ mod tests {
 
         // A change into channel A must re-run exactly one subscription (A's).
         reactor
-            .apply_change_set(ChangeSet { commit_lsn: pulse_core::Lsn::ZERO, changes: vec![insert_into("A")] })
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
             .await;
 
-        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1, "only the matching sub re-executes");
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            1,
+            "only the matching sub re-executes"
+        );
         assert!(rx_a.try_recv().is_ok(), "channel-A client received a push");
-        assert!(rx_b.try_recv().is_err(), "channel-B client received nothing");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "channel-B client received nothing"
+        );
     }
 }

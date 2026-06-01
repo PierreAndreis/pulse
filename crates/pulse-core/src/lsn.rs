@@ -27,7 +27,9 @@ impl FromStr for Lsn {
     type Err = ParseLsnError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (hi, lo) = s.split_once('/').ok_or_else(|| ParseLsnError(s.to_string()))?;
+        let (hi, lo) = s
+            .split_once('/')
+            .ok_or_else(|| ParseLsnError(s.to_string()))?;
         let hi = u64::from_str_radix(hi.trim(), 16).map_err(|_| ParseLsnError(s.to_string()))?;
         let lo = u64::from_str_radix(lo.trim(), 16).map_err(|_| ParseLsnError(s.to_string()))?;
         Ok(Lsn((hi << 32) | lo))

@@ -12,7 +12,7 @@ mod catalog;
 mod ops;
 
 pub use catalog::{
-    encode_id, decode_id, introspect, Catalog, Column, FieldMeta, PgTypeClass, SchemaMeta, Table,
+    decode_id, encode_id, introspect, Catalog, Column, FieldMeta, PgTypeClass, SchemaMeta, Table,
     TableSchema,
 };
 pub use naming::{column_to_field, field_to_column};
@@ -54,7 +54,8 @@ pub async fn connect_with(url: &str, config: PoolConfig) -> Result<PgPool, sqlx:
                 }
                 if let Some(ms) = timeout {
                     // statement_timeout takes a value in ms; 0 disables it.
-                    conn.execute(format!("SET statement_timeout = {ms}").as_str()).await?;
+                    conn.execute(format!("SET statement_timeout = {ms}").as_str())
+                        .await?;
                 }
                 Ok(())
             })
@@ -68,7 +69,11 @@ pub async fn connect_with(url: &str, config: PoolConfig) -> Result<PgPool, sqlx:
 pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
     connect_with(
         url,
-        PoolConfig { max_connections, serializable: true, statement_timeout_ms: None },
+        PoolConfig {
+            max_connections,
+            serializable: true,
+            statement_timeout_ms: None,
+        },
     )
     .await
 }

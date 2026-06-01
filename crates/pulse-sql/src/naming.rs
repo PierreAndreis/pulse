@@ -67,7 +67,14 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        for f in ["channelId", "authorId", "editedAt", "isPrivate", "_id", "_creationTime"] {
+        for f in [
+            "channelId",
+            "authorId",
+            "editedAt",
+            "isPrivate",
+            "_id",
+            "_creationTime",
+        ] {
             assert_eq!(column_to_field(&field_to_column(f)), f);
         }
     }

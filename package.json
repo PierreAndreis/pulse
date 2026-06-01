@@ -12,6 +12,8 @@
     "typecheck": "pnpm -r --filter=./packages/* run typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:load": "vitest run --config vitest.load.config.ts",
     "clean": "pnpm -r exec rm -rf dist node_modules/.cache .tsbuildinfo"
   },
   "devDependencies": {
