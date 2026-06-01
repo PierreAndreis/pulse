@@ -1,0 +1,88 @@
+name: Release
+
+# Tag-driven: pushing v0.1.0 builds the engine for every target and attaches the
+# binaries + SHA256SUMS to the GitHub Release that @onveloz/pulse-engine downloads.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  engine:
+    name: Build engine (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross linker (aarch64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build pulse-server
+        run: cargo build --release -p pulse-server --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/pulse-server" "out/pulse-server-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.target }}
+          path: out/pulse-server-${{ matrix.target }}
+
+  release:
+    name: Publish GitHub Release
+    needs: engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum pulse-server-* > SHA256SUMS
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/pulse-server-*
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true

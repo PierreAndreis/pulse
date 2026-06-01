@@ -1,0 +1,39 @@
+name: Publish (npm)
+
+# Tag-driven: pushing v0.1.0 publishes every @onveloz/pulse-* package to npm.
+# The ONLY required setup is the NPM_TOKEN secret (an npm automation token with
+# publish rights to the @onveloz scope). Everything else is automated.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    name: Publish packages to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - run: pnpm install --frozen-lockfile
+
+      # Build every package's dist (prepack also does this, but build first so a
+      # failure stops us before any publish).
+      - name: Build packages
+        run: pnpm -r --filter='./packages/*' run build
+
+      # Publish all non-private packages. pnpm rewrites workspace:* to the real
+      # versions and applies each package's publishConfig. --no-git-checks lets
+      # the tagged commit publish without a clean-tree assertion.
+      - name: Publish to npm
+        run: pnpm -r publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

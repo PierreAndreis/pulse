@@ -12,7 +12,8 @@
     "prepack": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@onveloz/pulse-schema": "workspace:*"
+    "@onveloz/pulse-schema": "workspace:*",
+    "@onveloz/pulse-engine": "workspace:*"
   },
   "devDependencies": {
     "@onveloz/pulse-tsconfig": "workspace:*",

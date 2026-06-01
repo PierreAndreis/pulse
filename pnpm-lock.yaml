@@ -29,6 +29,9 @@ importers:
 
   packages/cli:
     dependencies:
+      '@onveloz/pulse-engine':
+        specifier: workspace:*
+        version: link:../engine
       '@onveloz/pulse-schema':
         specifier: workspace:*
         version: link:../schema
@@ -77,6 +80,18 @@ importers:
       '@onveloz/pulse-tsconfig':
         specifier: workspace:*
         version: link:../tsconfig
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
+  packages/engine:
+    devDependencies:
+      '@onveloz/pulse-tsconfig':
+        specifier: workspace:*
+        version: link:../tsconfig
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.19.19
       typescript:
         specifier: ^5.9.3
         version: 5.9.3

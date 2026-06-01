@@ -161,11 +161,17 @@ async function main(): Promise<void> {
       if (!appPath || appPath.startsWith("-"))
         throw new Error("usage: pulse dev <app.ts> [--port P] [--database-url URL]");
       const root = repoRoot();
-      const bin = resolveEngineBin(root);
+      const { enginePathSync, ensureEngine } = await import("@onveloz/pulse-engine");
+      let bin = resolveEngineBin(root, process.env, undefined, enginePathSync);
+      if (!bin) {
+        // No local build and nothing cached → fetch the prebuilt engine.
+        process.stdout.write("pulse: no engine found locally; downloading…\n");
+        bin = await ensureEngine();
+      }
       if (!bin)
         throw new Error(
-          "engine binary not found — build it first: `cargo build -p pulse-server` " +
-            "(or set PULSE_SERVER_BIN).",
+          "engine binary not found — no prebuilt engine for this platform. " +
+            "Build it (`cargo build -p pulse-server`) and set PULSE_SERVER_BIN.",
         );
       const env = buildEngineEnv({
         appPath: resolve(appPath),

@@ -1,12 +1,15 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-/** Resolve the pulse-server binary path, preferring release over debug.
- *  `PULSE_SERVER_BIN` overrides everything. Returns null if none is found. */
+/** Resolve a pulse-server binary path WITHOUT downloading, in priority order:
+ *  1. `PULSE_SERVER_BIN` override, 2. a monorepo `target/{release,debug}` build
+ *  (dev), 3. an already-cached engine from `@onveloz/pulse-engine`.
+ *  Returns null if none is present (the caller may then download it). */
 export function resolveEngineBin(
   root: string,
   env: Record<string, string | undefined> = process.env,
   exists: (p: string) => boolean = existsSync,
+  cachedEngine?: () => string | null,
 ): string | null {
   const override = env.PULSE_SERVER_BIN;
   if (override) return exists(override) ? override : null;
@@ -14,7 +17,7 @@ export function resolveEngineBin(
   if (exists(release)) return release;
   const debug = resolve(root, "target/debug/pulse-server");
   if (exists(debug)) return debug;
-  return null;
+  return cachedEngine?.() ?? null;
 }
 
 export interface DevEnvOptions {
