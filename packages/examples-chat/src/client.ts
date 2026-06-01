@@ -1,4 +1,4 @@
-import { createClient } from "@pulse/client";
+import { createClient } from "@onveloz/pulse-client";
 import type { contract } from "./contract.js";
 
 // Point straight at the engine. It sets permissive CORS, so cross-origin /rpc

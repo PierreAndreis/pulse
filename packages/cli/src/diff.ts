@@ -2,7 +2,7 @@ import type {
   AnyTableDefinition,
   SchemaDefinition,
   ValidatorDescription,
-} from "@pulse/schema";
+} from "@onveloz/pulse-schema";
 import { fieldToColumn, pgType } from "./ddl.js";
 
 /** One live Postgres column, as read from `information_schema.columns`. */

@@ -1,6 +1,6 @@
 import { createContext, createElement, useContext, type ReactNode } from "react";
-import type { ContractRouter } from "@pulse/contract";
-import type { Client } from "@pulse/client";
+import type { ContractRouter } from "@onveloz/pulse-contract";
+import type { Client } from "@onveloz/pulse-client";
 
 interface PulseContextValue {
   client: Client<ContractRouter>;

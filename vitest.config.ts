@@ -1,7 +1,7 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  // Resolve the `development` export condition so in-repo @pulse/* imports hit
+  // Resolve the `development` export condition so in-repo @onveloz/pulse-* imports hit
   // raw src (not the built dist that external consumers get).
   resolve: { conditions: ["development"] },
   test: {

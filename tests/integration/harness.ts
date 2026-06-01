@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve } from "node:path";
-import { createClient, PulseClientError, type Client } from "@pulse/client";
+import { createClient, PulseClientError, type Client } from "@onveloz/pulse-client";
 import type { contract } from "../../packages/examples-chat/src/contract.js";
 
 const execFileAsync = promisify(execFile);

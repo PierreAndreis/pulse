@@ -1,5 +1,5 @@
-import { oc } from "@pulse/contract";
-import { v } from "@pulse/schema";
+import { oc } from "@onveloz/pulse-contract";
+import { v } from "@onveloz/pulse-schema";
 
 export const contract = {
   messages: {

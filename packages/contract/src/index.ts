@@ -1,4 +1,4 @@
-import type { AnyValidator, Infer, Prettify } from "@pulse/schema";
+import type { AnyValidator, Infer, Prettify } from "@onveloz/pulse-schema";
 
 /**
  * The kind of a procedure. Determines runtime, determinism rules, and routing:
@@ -78,7 +78,7 @@ export const oc = {
   action: () => start("action"),
 };
 
-// ── Inference helpers (used by @pulse/server and @pulse/client) ──────────────
+// ── Inference helpers (used by @onveloz/pulse-server and @onveloz/pulse-client) ──────────────
 
 export type InferKind<P> = P extends ContractProcedure<infer K, any, any, ErrorMap>
   ? K

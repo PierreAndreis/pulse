@@ -5,7 +5,7 @@ import type {
   InferOutput,
   InferKind,
   ProcedureKind,
-} from "@pulse/contract";
+} from "@onveloz/pulse-contract";
 import { type ClientOptions, rpcCall } from "./transport.js";
 import { SyncClient, type SyncStatus } from "./sync.js";
 import { LocalFirst, type MutateOptions } from "./localfirst.js";

@@ -1,6 +1,6 @@
 {
-  "name": "@pulse/react",
-  "version": "0.0.0",
+  "name": "@onveloz/pulse-react",
+  "version": "0.1.0",
   "type": "module",
   "license": "MIT",
   "exports": {
@@ -14,19 +14,20 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "prepack": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@pulse/client": "workspace:*",
-    "@pulse/contract": "workspace:*"
+    "@onveloz/pulse-client": "workspace:*",
+    "@onveloz/pulse-contract": "workspace:*"
   },
   "peerDependencies": {
     "@tanstack/react-query": "^5.0.0",
     "react": "^18.0.0 || ^19.0.0"
   },
   "devDependencies": {
-    "@pulse/tsconfig": "workspace:*",
+    "@onveloz/pulse-tsconfig": "workspace:*",
     "@tanstack/react-query": "^5.62.0",
     "@types/react": "^19.0.0",
     "react": "^19.0.0",
@@ -34,6 +35,28 @@
   },
   "files": [
     "dist",
-    "src"
-  ]
+    "src",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PierreAndreis/pulse.git",
+    "directory": "packages/react"
+  },
+  "homepage": "https://github.com/PierreAndreis/pulse#readme",
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
+  "author": "Pierre Ortega",
+  "sideEffects": false
 }

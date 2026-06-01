@@ -1,5 +1,5 @@
-import type { CollabField, Doc, Id } from "@pulse/schema";
-import type { ProcedureKind } from "@pulse/contract";
+import type { CollabField, Doc, Id } from "@onveloz/pulse-schema";
+import type { ProcedureKind } from "@onveloz/pulse-contract";
 
 /** Fields the engine injects on insert. */
 type SystemFieldKeys = "_id" | "_creationTime";

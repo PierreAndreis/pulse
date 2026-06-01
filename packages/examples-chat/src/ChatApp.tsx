@@ -1,6 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
-import type { Doc, Id } from "@pulse/schema";
-import type { SyncStatus } from "@pulse/client";
+import type { Doc, Id } from "@onveloz/pulse-schema";
+import type { SyncStatus } from "@onveloz/pulse-client";
 import { isOffline, onOffline, pulse, setOffline } from "./client.js";
 
 const GENERAL = "channels:00000000-0000-0000-0000-000000000001" as Id<"channels">;
@@ -11,7 +11,7 @@ type Message = Doc<"messages">;
 // server confirms them — we use that to render a per-message sync indicator.
 const isPending = (m: Message) => String(m._id).includes("opt-");
 
-// This example dogfoods the REAL @pulse/client SDK end to end — nothing here
+// This example dogfoods the REAL @onveloz/pulse-client SDK end to end — nothing here
 // re-implements fetch, SSE, optimism, IndexedDB, or reconnect:
 //   • pulse.messages.list.subscribe(...)  → reactive SSE, auto-reconnecting
 //   • pulse.$local.mutate(..., {optimistic}) → instant UI + DURABLE offline queue

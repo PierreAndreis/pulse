@@ -1,20 +1,47 @@
 {
-  "name": "@pulse/cli",
-  "version": "0.0.0",
+  "name": "@onveloz/pulse-cli",
+  "version": "0.1.0",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "pulse": "./src/bin.ts"
+    "pulse": "./dist/bin.js"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@pulse/schema": "workspace:*"
+    "@onveloz/pulse-schema": "workspace:*"
   },
   "devDependencies": {
-    "@pulse/tsconfig": "workspace:*",
+    "@onveloz/pulse-tsconfig": "workspace:*",
     "@types/node": "^22.10.0",
     "typescript": "^5.9.3"
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PierreAndreis/pulse.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/PierreAndreis/pulse#readme",
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
+  "author": "Pierre Ortega",
+  "peerDependencies": {
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
   }
 }

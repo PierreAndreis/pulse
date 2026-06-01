@@ -1,6 +1,6 @@
 {
-  "name": "@pulse/runtime-node",
-  "version": "0.0.0",
+  "name": "@onveloz/pulse-runtime-node",
+  "version": "0.1.0",
   "type": "module",
   "license": "MIT",
   "exports": {
@@ -15,19 +15,42 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@pulse/schema": "workspace:*",
-    "@pulse/server": "workspace:*"
+    "@onveloz/pulse-schema": "workspace:*",
+    "@onveloz/pulse-server": "workspace:*"
   },
   "devDependencies": {
-    "@pulse/tsconfig": "workspace:*",
+    "@onveloz/pulse-tsconfig": "workspace:*",
     "@types/node": "^22.10.0",
     "typescript": "^5.9.3"
   },
   "files": [
     "dist",
-    "src"
-  ]
+    "src",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PierreAndreis/pulse.git",
+    "directory": "packages/runtime-node"
+  },
+  "homepage": "https://github.com/PierreAndreis/pulse#readme",
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
+  "author": "Pierre Ortega",
+  "sideEffects": false
 }

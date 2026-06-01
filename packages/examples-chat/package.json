@@ -1,5 +1,5 @@
 {
-  "name": "@pulse/examples-chat",
+  "name": "@onveloz/pulse-examples-chat",
   "version": "0.0.0",
   "type": "module",
   "private": true,
@@ -7,16 +7,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@pulse/client": "workspace:*",
-    "@pulse/contract": "workspace:*",
-    "@pulse/react": "workspace:*",
-    "@pulse/schema": "workspace:*",
-    "@pulse/server": "workspace:*",
+    "@onveloz/pulse-client": "workspace:*",
+    "@onveloz/pulse-contract": "workspace:*",
+    "@onveloz/pulse-react": "workspace:*",
+    "@onveloz/pulse-schema": "workspace:*",
+    "@onveloz/pulse-server": "workspace:*",
     "react-dom": "^19.2.6",
     "yjs": "^13.6.31"
   },
   "devDependencies": {
-    "@pulse/tsconfig": "workspace:*",
+    "@onveloz/pulse-tsconfig": "workspace:*",
     "@tanstack/react-query": "^5.62.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.2.3",

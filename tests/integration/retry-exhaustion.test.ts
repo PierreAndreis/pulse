@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { PulseClientError } from "@pulse/client";
+import { PulseClientError } from "@onveloz/pulse-client";
 import { isPulseConflictError, startEngine, type Harness } from "./harness.js";
 
 // S4 (CI-safe) — retries exhaust into a CLEAN 409 CONFLICT, never an INTERNAL/500

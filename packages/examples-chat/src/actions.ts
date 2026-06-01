@@ -1,5 +1,5 @@
-import { implement } from "@pulse/server";
-import type { Doc } from "@pulse/schema";
+import { implement } from "@onveloz/pulse-server";
+import type { Doc } from "@onveloz/pulse-schema";
 import { contract } from "./contract.js";
 import { authedBase } from "./middleware.js";
 import "./_generated/dataModel.js";

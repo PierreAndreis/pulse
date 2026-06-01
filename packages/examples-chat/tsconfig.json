@@ -1,5 +1,5 @@
 {
-  "extends": "@pulse/tsconfig/base.json",
+  "extends": "@onveloz/pulse-tsconfig/base.json",
   "compilerOptions": {
     "outDir": "dist",
     "rootDir": "src",

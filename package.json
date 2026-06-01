@@ -17,8 +17,8 @@
     "clean": "pnpm -r exec rm -rf dist node_modules/.cache .tsbuildinfo"
   },
   "devDependencies": {
-    "@pulse/client": "workspace:*",
-    "@pulse/contract": "workspace:*",
+    "@onveloz/pulse-client": "workspace:*",
+    "@onveloz/pulse-contract": "workspace:*",
     "@types/node": "^22.10.0",
     "typescript": "^5.9.3",
     "vitest": "^3.0.0",

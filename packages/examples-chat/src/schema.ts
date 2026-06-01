@@ -1,4 +1,4 @@
-import { defineSchema, defineTable, v } from "@pulse/schema";
+import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
 
 export default defineSchema({
   users: defineTable({

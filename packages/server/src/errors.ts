@@ -1,5 +1,5 @@
-import type { AnyValidator, Infer } from "@pulse/schema";
-import type { ErrorMap } from "@pulse/contract";
+import type { AnyValidator, Infer } from "@onveloz/pulse-schema";
+import type { ErrorMap } from "@onveloz/pulse-contract";
 
 /** A structured, typed error thrown from middleware or handlers. */
 export class PulseError<Data = unknown> extends Error {

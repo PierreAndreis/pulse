@@ -1,7 +1,8 @@
+#!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { AnyTableDefinition, SchemaDefinition } from "@pulse/schema";
+import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema";
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
 import { buildEngineEnv, resolveEngineBin } from "./dev.js";

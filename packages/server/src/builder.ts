@@ -7,8 +7,8 @@ import {
   type InferOutput,
   type ProcedureDef,
   isProcedure,
-} from "@pulse/contract";
-import type { Prettify } from "@pulse/schema";
+} from "@onveloz/pulse-contract";
+import type { Prettify } from "@onveloz/pulse-schema";
 import {
   type ErrorConstructors,
   makeErrors,

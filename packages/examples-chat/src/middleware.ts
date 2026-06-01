@@ -1,5 +1,5 @@
-import { os } from "@pulse/server";
-import type { Id } from "@pulse/schema";
+import { os } from "@onveloz/pulse-server";
+import type { Id } from "@onveloz/pulse-schema";
 
 async function verifyJwt(header: string | null): Promise<{ id: Id<"users">; name: string } | null> {
   if (!header) return null;

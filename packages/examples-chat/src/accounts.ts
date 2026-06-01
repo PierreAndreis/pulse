@@ -1,4 +1,4 @@
-import { implement } from "@pulse/server";
+import { implement } from "@onveloz/pulse-server";
 import { contract } from "./contract.js";
 import { authedBase } from "./middleware.js";
 import "./_generated/dataModel.js";

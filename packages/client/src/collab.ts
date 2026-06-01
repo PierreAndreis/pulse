@@ -114,7 +114,7 @@ export class CollabHandle {
     } catch {
       // Offline / failed: the doc keeps the local edit; it will be re-sent on the
       // next local change or when connectivity returns. (Full offline-queue
-      // integration mirrors @pulse/client's mutation queue.)
+      // integration mirrors @onveloz/pulse-client's mutation queue.)
       this.setStatus("offline");
     }
   }

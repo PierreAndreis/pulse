@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import type { Id } from "@pulse/schema";
+import type { Id } from "@onveloz/pulse-schema";
 import { pulse } from "./client.js";
 
 export function Channel({ channelId }: { channelId: Id<"channels"> }) {

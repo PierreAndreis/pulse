@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { oc } from "@pulse/contract";
-import { v } from "@pulse/schema";
+import { oc } from "@onveloz/pulse-contract";
+import { v } from "@onveloz/pulse-schema";
 import { executeProcedure, implement, os } from "./index.js";
 
 describe("server builder", () => {

@@ -37,3 +37,4 @@ pnpm-debug.log*
 
 # Tooling scratch
 .playwright-mcp/
+/packages/*/LICENSE

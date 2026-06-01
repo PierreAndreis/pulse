@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineSchema, defineTable, v } from "@pulse/schema";
+import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
 import {
   diffSchema,
   isEmptyDiff,

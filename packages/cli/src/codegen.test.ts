@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineSchema, defineTable, v } from "@pulse/schema";
+import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
 
@@ -40,7 +40,7 @@ describe("generateDataModel", () => {
   const out = generateDataModel(schema);
 
   it("emits a PulseDataModel augmentation with system fields", () => {
-    expect(out).toContain('declare module "@pulse/schema"');
+    expect(out).toContain('declare module "@onveloz/pulse-schema"');
     expect(out).toContain("interface PulseDataModel");
     expect(out).toContain('_id: Id<"users">;');
     expect(out).toContain("_creationTime: number;");

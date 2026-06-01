@@ -1,6 +1,6 @@
 import { expectTypeOf, test } from "vitest";
-import type { InferInput, InferKind, InferOutput } from "@pulse/contract";
-import type { Doc, Id } from "@pulse/schema";
+import type { InferInput, InferKind, InferOutput } from "@onveloz/pulse-contract";
+import type { Doc, Id } from "@onveloz/pulse-schema";
 import { contract } from "./contract.js";
 import "./_generated/dataModel.js";
 

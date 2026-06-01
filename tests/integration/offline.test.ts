@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
-import { createClient, InMemoryKV, type PulseClient } from "@pulse/client";
+import { createClient, InMemoryKV, type PulseClient } from "@onveloz/pulse-client";
 import type { contract } from "../../packages/examples-chat/src/contract.js";
 import { GENERAL_CHANNEL, startEngine, type Harness } from "./harness.js";
 

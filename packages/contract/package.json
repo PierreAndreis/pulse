@@ -1,6 +1,6 @@
 {
-  "name": "@pulse/contract",
-  "version": "0.0.0",
+  "name": "@onveloz/pulse-contract",
+  "version": "0.1.0",
   "type": "module",
   "license": "MIT",
   "exports": {
@@ -14,18 +14,41 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "prepack": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@pulse/schema": "workspace:*"
+    "@onveloz/pulse-schema": "workspace:*"
   },
   "devDependencies": {
-    "@pulse/tsconfig": "workspace:*",
+    "@onveloz/pulse-tsconfig": "workspace:*",
     "typescript": "^5.9.3"
   },
   "files": [
     "dist",
-    "src"
-  ]
+    "src",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PierreAndreis/pulse.git",
+    "directory": "packages/contract"
+  },
+  "homepage": "https://github.com/PierreAndreis/pulse#readme",
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
+  "author": "Pierre Ortega",
+  "sideEffects": false
 }

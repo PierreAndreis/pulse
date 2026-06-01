@@ -2,7 +2,7 @@ import type {
   AnyTableDefinition,
   SchemaDefinition,
   ValidatorDescription,
-} from "@pulse/schema";
+} from "@onveloz/pulse-schema";
 
 /** camelCase logical field → snake_case Postgres column (mirrors pulse-sql/naming.rs). */
 export function fieldToColumn(field: string): string {

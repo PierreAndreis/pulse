@@ -2,9 +2,9 @@
 // (schema + handlers), reports a manifest, then for each `execute` runs the
 // handler with an instrumented `ctx.db` whose operations are proxied back to the
 // engine (which owns Postgres). See `pulse-jsruntime` for the engine side.
-import { executeProcedure, PulseError } from "@pulse/server";
-import type { RegisteredProcedure } from "@pulse/server";
-import { ValidationError } from "@pulse/schema";
+import { executeProcedure, PulseError } from "@onveloz/pulse-server";
+import type { RegisteredProcedure } from "@onveloz/pulse-server";
+import { ValidationError } from "@onveloz/pulse-schema";
 
 const appPath = process.argv[2];
 if (!appPath) {
@@ -106,7 +106,7 @@ function makeDb(requestId: string) {
     delete: (id: unknown) => call({ kind: "delete", table: tableOf(id), id }),
     // Collaborative (CRDT / Yjs) fields. `update`/result are base64 Yjs bytes;
     // the engine merges via `yrs` server-side. Users never call these directly —
-    // the client's CollabHandle does (see @pulse/client).
+    // the client's CollabHandle does (see @onveloz/pulse-client).
     getCollab: (id: unknown, field: string) =>
       call({ kind: "getcollab", table: tableOf(id), id, field }) as Promise<string>,
     applyCollab: (id: unknown, field: string, update: string) =>

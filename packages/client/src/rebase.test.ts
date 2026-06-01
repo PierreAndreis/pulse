@@ -4,7 +4,7 @@ import { LocalFirst } from "./localfirst.js";
 import { queryKeyOf, type OptimisticUpdater } from "./local.js";
 
 // S3 (CI-safe) — local-first optimistic overlay + rebase, driven entirely through
-// the PUBLIC @pulse/client API with a controllable fake transport (the `fetch`
+// the PUBLIC @onveloz/pulse-client API with a controllable fake transport (the `fetch`
 // option). No engine, no Postgres: pure, deterministic. Asserts the overlay is
 // immediate, confirms drop the overlay, handler-rejects roll back, network errors
 // keep the write durably queued (sent exactly once on reconnect), and the queue

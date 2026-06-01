@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ContractRouter } from "@pulse/contract";
+import type { ContractRouter } from "@onveloz/pulse-contract";
 import { createClient } from "./client.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
