@@ -94,8 +94,20 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Look up a table by name. Postgres folds unquoted identifiers to lowercase,
+    /// so a camelCase schema table like `issueLabels` is physically `issuelabels`
+    /// and introspection keys the catalog by that lowercase name — while ops pass
+    /// the logical (camelCase) name. Try exact first, then a case-insensitive
+    /// match so both single-word and camelCase tables resolve.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.tables.get(name)
+        if let Some(t) = self.tables.get(name) {
+            return Some(t);
+        }
+        let lower = name.to_ascii_lowercase();
+        self.tables
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+            .map(|(_, t)| t)
     }
 }
 
@@ -152,8 +164,19 @@ pub async fn introspect(pool: &PgPool, schema: &SchemaMeta) -> Result<Catalog, s
         if row.column_name == "_id" {
             id_ref = Some(row.table_name.clone());
         }
-        // User-declared id fields reference their target table.
-        if let Some(ts) = schema.tables.get(&row.table_name) {
+        // User-declared id fields reference their target table. The worker keys
+        // schema.tables by the logical (camelCase) name, while `row.table_name` is
+        // the physical Postgres name Postgres folded to lowercase — so match
+        // case-insensitively, else id columns on camelCase tables (e.g.
+        // `issueLabels.issueId`) miss their meta and skip id decoding.
+        let ts = schema.tables.get(&row.table_name).or_else(|| {
+            schema
+                .tables
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&row.table_name))
+                .map(|(_, v)| v)
+        });
+        if let Some(ts) = ts {
             if let Some(fm) = ts.fields.get(&field) {
                 if fm.kind == "id" {
                     id_ref = fm.ref_table.clone();
@@ -210,5 +233,37 @@ pub fn decode_id(value: &str) -> &str {
     match value.split_once(':') {
         Some((_table, raw)) => raw,
         None => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn table_named(name: &str) -> Table {
+        Table {
+            name: name.to_string(),
+            columns: vec![],
+            by_field: HashMap::new(),
+            by_column: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn table_lookup_is_case_insensitive_for_folded_names() {
+        // Postgres folded `issueLabels` → `issuelabels` at introspection time.
+        let mut catalog = Catalog::default();
+        catalog
+            .tables
+            .insert("issuelabels".to_string(), table_named("issuelabels"));
+
+        // Ops pass the logical camelCase name — it must still resolve.
+        assert!(
+            catalog.table("issueLabels").is_some(),
+            "camelCase must resolve"
+        );
+        assert!(catalog.table("issuelabels").is_some(), "exact still works");
+        assert!(catalog.table("nope").is_none(), "unknown stays unknown");
     }
 }
