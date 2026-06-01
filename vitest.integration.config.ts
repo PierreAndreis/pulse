@@ -4,6 +4,7 @@ import { defineConfig } from "vitest/config";
 // against the dev Postgres. They run serially in a single fork — one engine,
 // shared DB — and get generous timeouts.
 export default defineConfig({
+  resolve: { conditions: ["development"] },
   test: {
     include: ["tests/**/*.test.ts"],
     // The load suite has its own config (vitest.load.config.ts) and is timing-
