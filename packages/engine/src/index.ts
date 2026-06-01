@@ -49,30 +49,58 @@ export async function ensureEngine(opts: { download?: boolean } = {}): Promise<s
   }
   const bytes = Buffer.from(await res.arrayBuffer());
 
-  // Optional integrity check: a SHA256SUMS asset listing "<sha>  pulse-server-<target>".
-  const sumsUrl = `https://github.com/${REPO}/releases/download/v${version}/SHA256SUMS`;
-  try {
-    const sums = await fetch(sumsUrl);
-    if (sums.ok) {
-      const want = (await sums.text())
-        .split("\n")
-        .map((l) => l.trim().split(/\s+/))
-        .find(([, name]) => name === `pulse-server-${target}`)?.[0];
-      if (want) {
-        const got = createHash("sha256").update(bytes).digest("hex");
-        if (got !== want) {
-          throw new Error(`pulse-engine: checksum mismatch for ${target} (got ${got}, want ${want})`);
-        }
-      }
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message.includes("checksum mismatch")) throw e;
-    // network hiccup fetching sums → proceed without verification (best-effort)
+  // Integrity: the expected SHA256 must come from a trust root the attacker who
+  // can edit the (mutable) GitHub Release cannot also rewrite. Prefer checksums
+  // baked into THIS npm tarball (immutable + provenance-attested); fall back to
+  // the Release SHA256SUMS only to fill a gap. A missing checksum for a known
+  // version is FATAL — we never install an unverified binary.
+  const want = expectedChecksum(version, target) ?? (await fetchReleaseChecksum(version, target));
+  if (!want) {
+    throw new Error(
+      `pulse-engine: no known checksum for pulse-server-${target}@${version}; refusing to install. ` +
+        "Build the engine and set PULSE_SERVER_BIN, or upgrade to a release that ships checksums.",
+    );
+  }
+  const got = createHash("sha256").update(bytes).digest("hex");
+  if (got !== want) {
+    throw new Error(`pulse-engine: checksum mismatch for ${target} (got ${got}, want ${want})`);
   }
 
   writeFileSync(dest, bytes);
   chmodSync(dest, 0o755);
   return dest;
+}
+
+/** Expected SHA256 baked into this package's `checksums.json` (the immutable
+ *  trust root), keyed by version → asset name. Undefined if absent. */
+function expectedChecksum(version: string, target: EngineTarget): string | undefined {
+  try {
+    const map = JSON.parse(readFileSync(resolve(here, "..", "checksums.json"), "utf8")) as Record<
+      string,
+      Record<string, string>
+    >;
+    return map[version]?.[`pulse-server-${target}`];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Last-resort checksum from the Release's SHA256SUMS — only used to fill a gap
+ *  the baked-in file doesn't cover (never the sole trust root for a known ver). */
+async function fetchReleaseChecksum(
+  version: string,
+  target: EngineTarget,
+): Promise<string | undefined> {
+  try {
+    const sums = await fetch(`https://github.com/${REPO}/releases/download/v${version}/SHA256SUMS`);
+    if (!sums.ok) return undefined;
+    return (await sums.text())
+      .split("\n")
+      .map((l) => l.trim().split(/\s+/))
+      .find(([, name]) => name === `pulse-server-${target}`)?.[0];
+  } catch {
+    return undefined;
+  }
 }
 
 /** Synchronous lookup of an already-resolved engine path (no download). */

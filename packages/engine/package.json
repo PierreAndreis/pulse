@@ -33,7 +33,8 @@
   "files": [
     "dist",
     "postinstall.cjs",
-    "LICENSE"
+    "LICENSE",
+    "checksums.json"
   ],
   "repository": {
     "type": "git",

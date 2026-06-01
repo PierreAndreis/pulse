@@ -3,14 +3,30 @@
 Releasing is **fully automated by a git tag**. The only one-time manual setup is
 an npm token; after that, `git tag vX.Y.Z && git push --tags` ships everything.
 
-## One-time setup (the only manual piece)
+## One-time setup (the only manual pieces)
 
-1. Own the **`@onveloz`** scope on npm (create the org/scope while logged in).
-2. Create an **automation access token** with publish rights to `@onveloz`.
+1. Own the **`@onveloz`** scope on npm (create the org/scope while logged in),
+   with **2FA enabled** on that account and on the GitHub account that owns the repo.
+2. Create a **Granular Access Token** scoped to **publish on `@onveloz` only**
+   (no delete/org-admin rights), from a **dedicated CI npm account**, with the
+   shortest workable expiry — and rotate it on a schedule. Avoid classic,
+   never-expiring automation tokens.
 3. Add it to the GitHub repo as the secret **`NPM_TOKEN`**
    (Settings → Secrets and variables → Actions → New repository secret).
+4. Configure the **`production`** environment (Settings → Environments) with
+   **required reviewers** — both `publish.yml` and `release.yml` are gated on it,
+   so a tag push can't ship without a human approval.
+5. Run **`scripts/protect-repo.sh`** once to apply branch + tag protection
+   (requires admin on the repo).
 
-That's it. No other manual step is required to publish.
+> **Better end state — eliminate the static token.** Once provenance is live
+> (it is, via `id-token: write` + `--provenance`), configure npm **Trusted
+> Publishing (OIDC)** for `repo=PierreAndreis/pulse, workflow=publish.yml,
+> environment=production` and **delete `NPM_TOKEN` entirely** — OIDC replaces it,
+> so there is no long-lived credential to leak.
+
+After that, `git tag vX.Y.Z && git push --tags` ships everything (subject to the
+environment approval).
 
 ## Releasing
 

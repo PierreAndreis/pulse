@@ -1,0 +1,7 @@
+# Require maintainer review on the supply-chain-critical paths: a poisoned
+# lockfile or workflow is the cheapest way to reach the publish/release path.
+/.github/workflows/   @PierreAndreis
+/.github/CODEOWNERS   @PierreAndreis
+/pnpm-lock.yaml       @PierreAndreis
+/Cargo.lock           @PierreAndreis
+/packages/engine/     @PierreAndreis
