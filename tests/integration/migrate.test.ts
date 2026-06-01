@@ -6,21 +6,30 @@ import { generateDDL } from "../../packages/cli/src/ddl.js";
 
 const execFileAsync = promisify(execFile);
 const PG_CONTAINER = process.env.PULSE_PG_CONTAINER ?? "pulse-pg";
+const DATABASE_URL =
+  process.env.PULSE_TEST_DATABASE_URL ?? "postgres://pulse:pulse@localhost:54329/pulse";
 
-/** Run SQL in the dev Postgres, returning trimmed tab-separated rows. */
+/** Run SQL in the dev Postgres, returning trimmed tab-separated rows.
+ *  Prefers a direct `psql $DATABASE_URL` (CI has psql but no named container);
+ *  falls back to `docker exec` into the local dev container. */
 async function psql(sql: string): Promise<string> {
-  const { stdout } = await execFileAsync("docker", [
-    "exec",
-    PG_CONTAINER,
-    "psql",
-    "-U",
-    "pulse",
-    "-d",
-    "pulse",
-    "-tAc",
-    sql,
-  ]);
-  return stdout.trim();
+  try {
+    const { stdout } = await execFileAsync("psql", [DATABASE_URL, "-tAc", sql]);
+    return stdout.trim();
+  } catch {
+    const { stdout } = await execFileAsync("docker", [
+      "exec",
+      PG_CONTAINER,
+      "psql",
+      "-U",
+      "pulse",
+      "-d",
+      "pulse",
+      "-tAc",
+      sql,
+    ]);
+    return stdout.trim();
+  }
 }
 
 // A throwaway schema that doesn't collide with the app tables.
