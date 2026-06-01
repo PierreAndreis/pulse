@@ -71,6 +71,31 @@ describe("LocalStore", () => {
     expect(seen.at(-1)).toEqual(["y"]);
   });
 
+  it("notifies a derived query's listeners when its confirmed source changes", () => {
+    // An optimistic updater mirrors the messages list into a separate "count"
+    // query. A subscriber to that derived query must see it update when the
+    // confirmed source list changes — setConfirmed recomputes the whole view,
+    // so every key whose view actually changed must be notified, not just the
+    // key that was set.
+    const COUNT = ["messages", "count"];
+    const COUNT_KEY = queryKeyOf(COUNT, INPUT);
+    const s = new LocalStore();
+    s.setConfirmed(KEY, [{ _id: "a" }]);
+    s.addOptimistic("mirror", (st) => {
+      const cur = st.getQuery<Doc>(PATH, INPUT);
+      st.setQuery(COUNT, INPUT, [{ _id: "count", body: String(cur.length) }]);
+    });
+
+    const seen: string[] = [];
+    s.subscribe(COUNT_KEY, (v) => seen.push((v as Doc[])[0]!.body!));
+    expect(seen.at(-1)).toBe("1"); // initial
+
+    // A second message is confirmed → derived count view becomes "2".
+    s.setConfirmed(KEY, [{ _id: "a" }, { _id: "b" }]);
+    expect(s.getView(COUNT_KEY)).toEqual([{ _id: "count", body: "2" }]);
+    expect(seen.at(-1)).toBe("2"); // the derived listener must have been notified
+  });
+
   it("reports listener presence for cleanup", () => {
     const s = new LocalStore();
     const unsub = s.subscribe(KEY, () => {});

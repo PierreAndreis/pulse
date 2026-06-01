@@ -41,9 +41,7 @@ export class LocalStore {
   onPersist?: (key: QueryKey, docs: unknown[]) => void;
 
   setConfirmed(key: QueryKey, docs: unknown[]): void {
-    this.confirmed.set(key, docs);
-    this.recompute();
-    this.notify(key);
+    this.mutateAndNotify(() => this.confirmed.set(key, docs));
     this.onPersist?.(key, docs);
   }
 
@@ -54,24 +52,17 @@ export class LocalStore {
    */
   hydrate(key: QueryKey, docs: unknown[]): void {
     if (this.confirmed.has(key)) return; // never clobber fresher live data
-    this.confirmed.set(key, docs);
-    this.recompute();
-    this.notify(key);
+    this.mutateAndNotify(() => this.confirmed.set(key, docs));
   }
 
   addOptimistic(id: string, updater: OptimisticUpdater): void {
-    this.pending.push({ id, updater });
-    this.recompute();
-    this.notifyAll();
+    this.mutateAndNotify(() => this.pending.push({ id, updater }));
   }
 
   removeOptimistic(id: string): void {
-    const before = this.pending.length;
-    this.pending = this.pending.filter((p) => p.id !== id);
-    if (this.pending.length !== before) {
-      this.recompute();
-      this.notifyAll();
-    }
+    this.mutateAndNotify(() => {
+      this.pending = this.pending.filter((p) => p.id !== id);
+    });
   }
 
   getView(key: QueryKey): unknown[] | undefined {
@@ -95,6 +86,27 @@ export class LocalStore {
     return () => {
       this.listeners.get(key)?.delete(listener);
     };
+  }
+
+  /**
+   * Snapshot the current views, apply `mutate` (which changes confirmed data or
+   * the pending overlay), recompute, then notify the listeners of every key
+   * whose view actually changed — not just the key that triggered it. A single
+   * confirmed change can shift any query an optimistic updater derives from it,
+   * so notifying only the triggering key would leave those derived subscribers
+   * stale. The pre/post diff also avoids blanket over-notification on each change.
+   * The snapshot must be taken BEFORE `mutate`, since `getView` falls through to
+   * the confirmed map.
+   */
+  private mutateAndNotify(mutate: () => void): void {
+    const before = new Map<QueryKey, unknown[] | undefined>();
+    for (const key of this.listeners.keys()) before.set(key, this.getView(key));
+    mutate();
+    this.recompute();
+    for (const [key, prev] of before) {
+      const next = this.getView(key);
+      if (next !== undefined && next !== prev) this.notify(key);
+    }
   }
 
   private recompute(): void {
@@ -130,9 +142,5 @@ export class LocalStore {
     const view = this.getView(key);
     if (view === undefined) return;
     this.listeners.get(key)?.forEach((l) => l(view));
-  }
-
-  private notifyAll(): void {
-    for (const key of this.listeners.keys()) this.notify(key);
   }
 }
