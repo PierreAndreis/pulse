@@ -1,0 +1,13 @@
+[package]
+name = "pulse-reactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Subscription manager: read-set registry, change matching, debounce, dedup."
+
+[dependencies]
+pulse-core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

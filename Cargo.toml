@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pulse-core",
+    "crates/pulse-collab",
+    "crates/pulse-sql",
+    "crates/pulse-cdc",
+    "crates/pulse-reactor",
+    "crates/pulse-sse",
+    "crates/pulse-jsruntime",
+    "crates/pulse-server",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/pierre/pulse"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Internal crates
+pulse-core = { path = "crates/pulse-core" }
+pulse-collab = { path = "crates/pulse-collab" }
+pulse-sql = { path = "crates/pulse-sql" }
+pulse-cdc = { path = "crates/pulse-cdc" }
+pulse-reactor = { path = "crates/pulse-reactor" }
+pulse-sse = { path = "crates/pulse-sse" }
+pulse-jsruntime = { path = "crates/pulse-jsruntime" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP + SSE
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Postgres
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "uuid",
+    "json",
+    "chrono",
+] }
+tokio-postgres = "0.7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+
+# Types / utils
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+dashmap = "6"
+parking_lot = "0.12"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+[profile.dev]
+# Faster incremental builds during the heavy iteration phase.
+opt-level = 0
+debug = 1

@@ -1,0 +1,26 @@
+[package]
+name = "pulse-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OLTP/OLAP connection pools, query builder → SQL, and read-set extraction."
+
+[dependencies]
+pulse-core = { workspace = true }
+pulse-collab = { workspace = true }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+pulse-core = { workspace = true }
+yrs = "0.26"
+base64 = "0.22"

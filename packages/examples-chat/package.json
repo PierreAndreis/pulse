@@ -1,0 +1,29 @@
+{
+  "name": "@pulse/examples-chat",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pulse/client": "workspace:*",
+    "@pulse/contract": "workspace:*",
+    "@pulse/react": "workspace:*",
+    "@pulse/schema": "workspace:*",
+    "@pulse/server": "workspace:*",
+    "react-dom": "^19.2.6",
+    "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "@pulse/tsconfig": "workspace:*",
+    "@tanstack/react-query": "^5.62.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.7.0",
+    "react": "^19.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.2",
+    "vitest": "^3.0.0"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "pulse-jsruntime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TS query/mutation execution. M1: Node/Bun worker driver. Later: embedded V8 (deno_core)."
+
+[dependencies]
+pulse-core = { workspace = true }
+pulse-sql = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

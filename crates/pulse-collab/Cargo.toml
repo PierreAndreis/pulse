@@ -1,0 +1,12 @@
+[package]
+name = "pulse-collab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CRDT document merge for v.collab() fields, backed by Yjs (yrs)."
+
+[dependencies]
+yrs = "0.26"
+thiserror = { workspace = true }
+
+[dev-dependencies]

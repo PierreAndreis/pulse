@@ -1,0 +1,9 @@
+[package]
+name = "pulse-sse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSE transport: per-subscription channel, ring buffer, Last-Event-ID replay."
+
+[dependencies]
+pulse-core = { workspace = true }

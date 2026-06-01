@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pulse — dev console</title>
+    <style>
+      :root {
+        --bg: #0b0e14; --panel: #131826; --panel2: #1b2233; --line: #232b3d;
+        --txt: #e6e9ef; --dim: #8b93a7; --accent: #6366f1; --good: #16a34a;
+        --warn: #d97706; --bad: #dc2626; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--txt); }
+      .top { display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+        border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+      .top .brand { font-weight: 800; letter-spacing: .5px; }
+      .top .sub { color: var(--dim); font-size: 13px; }
+      .pill { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; background: #374151; color: #fff; }
+      .grid { display: grid; grid-template-columns: 360px 1fr 320px; gap: 14px; padding: 14px; align-items: start; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+      .panel h3 { margin: 0; padding: 11px 14px; font-size: 13px; letter-spacing: .4px; text-transform: uppercase;
+        color: var(--dim); border-bottom: 1px solid var(--line); background: var(--panel2); }
+      .panel .body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+      label.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 14px; }
+      label.row .hint { color: var(--dim); font-size: 12px; }
+      input[type=text], input[type=number], select {
+        background: var(--panel2); border: 1px solid var(--line); color: var(--txt);
+        border-radius: 8px; padding: 8px 10px; font-size: 14px; outline: none; width: 100%; }
+      input[type=range] { width: 150px; }
+      button { background: var(--accent); color: #fff; border: none; border-radius: 8px;
+        padding: 9px 14px; font-size: 14px; font-weight: 600; cursor: pointer; }
+      button.ghost { background: var(--panel2); border: 1px solid var(--line); color: var(--txt); }
+      button.bad { background: var(--bad); } button.warn { background: var(--warn); }
+      button:disabled { opacity: .5; cursor: default; }
+      .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+      /* toggle switch */
+      .switch { position: relative; width: 42px; height: 24px; }
+      .switch input { display: none; }
+      .slider { position: absolute; inset: 0; background: #374151; border-radius: 999px; transition: .15s; }
+      .slider::before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px;
+        background: #fff; border-radius: 50%; transition: .15s; }
+      .switch input:checked + .slider { background: var(--accent); }
+      .switch input:checked + .slider::before { transform: translateX(18px); }
+      .switch.danger input:checked + .slider { background: var(--bad); }
+      /* chat */
+      .chat { display: flex; flex-direction: column; height: calc(100vh - 110px); }
+      .msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+      .msg { background: var(--panel2); border-radius: 8px; padding: 7px 11px; font-size: 14px; word-break: break-word; }
+      .msg .meta { color: var(--dim); font-size: 11px; margin-top: 2px; }
+      .msg.optimistic { opacity: .55; border: 1px dashed var(--line); }
+      .composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+      .empty { color: var(--dim); text-align: center; margin-top: 40px; }
+      /* metrics */
+      .metric { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+      .metric b { font-variant-numeric: tabular-nums; }
+      .metric.big b { font-size: 22px; }
+      .bars { height: 60px; display: flex; align-items: flex-end; gap: 1px; }
+      .bar { flex: 1; background: var(--accent); min-height: 1px; border-radius: 1px 1px 0 0; }
+      pre.log { margin: 0; padding: 10px; font-family: var(--mono); font-size: 11px; color: var(--dim);
+        background: var(--bg); border-top: 1px solid var(--line); height: 150px; overflow-y: auto; white-space: pre-wrap; }
+      .swatch { font-family: var(--mono); font-size: 12px; }
+      .ok { color: var(--good); } .err { color: var(--bad); } .muted { color: var(--dim); }
+    </style>
+  </head>
+  <body>
+    <div class="top">
+      <span class="brand">PULSE</span>
+      <span class="sub">dev console · reactive Postgres engine</span>
+      <span class="pill" id="connPill">connecting…</span>
+      <span class="pill" id="netPill" style="background:var(--good)">ONLINE</span>
+      <span class="pill" id="subPill" style="background:#374151">subs: 0</span>
+      <span style="flex:1"></span>
+      <span class="sub swatch" id="engineUrl"></span>
+    </div>
+
+    <div class="grid">
+      <!-- LEFT: controls -->
+      <div style="display:flex; flex-direction:column; gap:14px">
+        <div class="panel">
+          <h3>Network simulation</h3>
+          <div class="body">
+            <label class="row">
+              <span>Offline mode <span class="hint">queue writes locally</span></span>
+              <span class="switch danger"><input type="checkbox" id="offline" /><span class="slider"></span></span>
+            </label>
+            <label class="row">
+              <span>Latency inject</span>
+              <span><input type="range" id="latency" min="0" max="2000" step="50" value="0" /> <span id="latencyVal" class="swatch">0ms</span></span>
+            </label>
+            <label class="row">
+              <span>Error rate</span>
+              <span><input type="range" id="errrate" min="0" max="100" step="5" value="0" /> <span id="errrateVal" class="swatch">0%</span></span>
+            </label>
+            <div class="metric"><span class="muted">Queued offline writes</span><b id="queued">0</b></div>
+            <div class="btnrow">
+              <button id="flushBtn" class="ghost" disabled>Flush queue</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Load generator</h3>
+          <div class="body">
+            <label class="row"><span>Total ops</span><input type="number" id="loadTotal" value="500" style="width:90px" /></label>
+            <label class="row"><span>Concurrency</span><input type="number" id="loadConc" value="32" style="width:90px" /></label>
+            <label class="row"><span>Workload</span>
+              <select id="loadKind" style="width:150px">
+                <option value="send">writes (send)</option>
+                <option value="list">reads (list)</option>
+                <option value="mixed">mixed 1:3 w/r</option>
+                <option value="increment">contention (increment)</option>
+              </select>
+            </label>
+            <div class="btnrow">
+              <button id="runBtn">Run load</button>
+              <button id="burstBtn" class="ghost">Burst 50</button>
+              <button id="stopBtn" class="bad" disabled>Stop</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Scenarios</h3>
+          <div class="body">
+            <div class="btnrow">
+              <button id="contendBtn" class="ghost">Lost-update check</button>
+              <button id="precisionBtn" class="ghost">Cross-channel precision</button>
+            </div>
+            <div class="metric"><span class="muted" id="scenarioMsg">Run a scenario to verify correctness under load.</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CENTER: chat -->
+      <div class="panel chat">
+        <h3>#general — live</h3>
+        <div class="msgs" id="msgs"><div class="empty">No messages yet.</div></div>
+        <div class="composer">
+          <input type="text" id="input" placeholder="Message #general (Enter to send)" autocomplete="off" />
+          <button id="sendBtn">Send</button>
+        </div>
+      </div>
+
+      <!-- RIGHT: metrics -->
+      <div style="display:flex; flex-direction:column; gap:14px">
+        <div class="panel">
+          <h3>Live metrics</h3>
+          <div class="body">
+            <div class="metric big"><span class="muted">throughput</span><b><span id="mThru">0</span> <span class="muted" style="font-size:12px">ops/s</span></b></div>
+            <div class="metric"><span class="muted">completed</span><b id="mDone">0</b></div>
+            <div class="metric"><span class="err">errors</span><b id="mErr">0</b></div>
+            <div class="metric"><span class="muted">p50 / p95 / p99</span><b id="mPct">– / – / –</b></div>
+            <div class="metric"><span class="muted">max</span><b id="mMax">–</b></div>
+            <div class="bars" id="bars"></div>
+            <div class="metric"><span class="muted">SSE pushes received</span><b id="mPush">0</b></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Event log</h3>
+          <pre class="log" id="log"></pre>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // ── config / state ──────────────────────────────────────────────────
+      const ENGINE = location.port === "8787" ? "" : "http://127.0.0.1:8787";
+      const AUTH = { authorization: "Bearer demo", "content-type": "application/json" };
+      const CHANNEL = "channels:00000000-0000-0000-0000-000000000001";
+      const clientId = "console-" + Math.random().toString(36).slice(2);
+      const subKey = (input) => `messages.list::${JSON.stringify(input)}`;
+      const GENERAL_SUB = subKey({ channelId: CHANNEL });
+
+      const net = { offline: false, latencyMs: 0, errorRate: 0 };
+      let offlineQueue = []; // {path, input} — persisted to IndexedDB (see idb below)
+      let pushCount = 0;
+      let subCount = 0;
+      const $ = (id) => document.getElementById(id);
+
+      document.getElementById("engineUrl").textContent = (ENGINE || location.origin) + " · " + clientId.slice(0, 16);
+
+      // ── IndexedDB-backed durable offline queue ──────────────────────────
+      // This mirrors @pulse/client's IndexedDbKV: the offline write queue is
+      // persisted so it SURVIVES A PAGE RELOAD. Go offline, send, reload — the
+      // writes are still queued; go online and flush to deliver them.
+      const idb = {
+        db: null,
+        open() {
+          if (this._p) return this._p;
+          this._p = new Promise((resolve, reject) => {
+            const r = indexedDB.open("pulse-console", 1);
+            r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains("kv")) r.result.createObjectStore("kv"); };
+            r.onsuccess = () => {
+              this.db = r.result;
+              // If another (older) page version triggers an upgrade later, close
+              // so we don't block it; we'll lazily reopen on next use.
+              this.db.onversionchange = () => { this.db.close(); this._p = null; };
+              resolve(this.db);
+            };
+            r.onerror = () => { this._p = null; reject(r.error); };
+            // A still-open connection from the previous page can block reopen;
+            // surface it instead of hanging forever.
+            r.onblocked = () => { this._p = null; reject(new Error("IndexedDB open blocked by another connection")); };
+          });
+          return this._p;
+        },
+        async save(queue) {
+          const db = await this.open();
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction("kv", "readwrite");
+            tx.objectStore("kv").put(JSON.stringify(queue), "offline-queue");
+            tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); // wait for commit!
+          });
+        },
+        async load() {
+          const db = await this.open();
+          return new Promise((resolve) => {
+            const tx = db.transaction("kv", "readonly");
+            const req = tx.objectStore("kv").get("offline-queue");
+            req.onsuccess = () => { try { resolve(JSON.parse(req.result || "[]")); } catch { resolve([]); } };
+            req.onerror = () => resolve([]);
+          });
+        },
+      };
+
+      function log(msg, cls) {
+        const el = $("log");
+        const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+        el.innerHTML = `<span class="${cls || ""}">${line.replace(/</g,"&lt;")}</span>` + el.innerHTML;
+      }
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      // ── network shim: latency + error injection + offline queueing ──────
+      async function rpc(path, input, { queueable = false } = {}) {
+        if (net.latencyMs) await sleep(net.latencyMs);
+        if (net.errorRate && Math.random() * 100 < net.errorRate) {
+          throw new Error("injected network error");
+        }
+        if (net.offline) {
+          if (queueable) { offlineQueue.push({ path, input }); await idb.save(offlineQueue); renderQueue(); return { queued: true }; }
+          throw new Error("offline");
+        }
+        const res = await fetch(`${ENGINE}/rpc`, { method: "POST", headers: AUTH, body: JSON.stringify({ path, input }) });
+        const j = await res.json();
+        if (!res.ok || j.error) throw new Error(j.error?.message || j.error?.code || `HTTP ${res.status}`);
+        return j.result;
+      }
+
+      function renderQueue() {
+        $("queued").textContent = offlineQueue.length;
+        $("flushBtn").disabled = offlineQueue.length === 0 || net.offline;
+      }
+      async function flushQueue() {
+        if (net.offline) { log("can't flush while offline", "err"); return; }
+        const n = offlineQueue.length;
+        log(`flushing ${n} queued writes…`);
+        while (offlineQueue.length) {
+          const { path, input } = offlineQueue[0];
+          try {
+            await rpc(path, input);
+            offlineQueue.shift();              // delivered → drop from durable queue
+            await idb.save(offlineQueue);
+            renderQueue();
+          } catch (e) { log("flush failed: " + e.message, "err"); break; }
+        }
+        log(`flush done (${n - offlineQueue.length}/${n} delivered)`, "ok");
+      }
+
+      // ── chat ────────────────────────────────────────────────────────────
+      let serverMsgs = [];
+      const optimistic = []; // {tempId, body, ts}
+      function renderChat() {
+        const el = $("msgs");
+        const all = [...[...serverMsgs].reverse().map((m) => ({ ...m, _opt: false })),
+                     ...optimistic.map((o) => ({ _id: o.tempId, body: o.body, _creationTime: o.ts, _opt: true }))];
+        if (!all.length) { el.innerHTML = '<div class="empty">No messages yet.</div>'; return; }
+        el.innerHTML = "";
+        for (const m of all) {
+          const d = document.createElement("div");
+          d.className = "msg" + (m._opt ? " optimistic" : "");
+          const b = document.createElement("div"); b.textContent = m.body;
+          const meta = document.createElement("div"); meta.className = "meta";
+          meta.textContent = (m._opt ? "pending · " : "") + new Date(m._creationTime).toLocaleTimeString();
+          d.appendChild(b); d.appendChild(meta); el.appendChild(d);
+        }
+        el.scrollTop = el.scrollHeight;
+      }
+      async function send() {
+        const body = $("input").value.trim();
+        if (!body) return;
+        $("input").value = "";
+        const tempId = "opt-" + Math.random().toString(36).slice(2);
+        optimistic.push({ tempId, body, ts: Date.now() }); renderChat(); // optimistic overlay
+        try {
+          await rpc(["messages", "send"], { channelId: CHANNEL, body }, { queueable: true });
+        } catch (e) {
+          log("send failed: " + e.message, "err");
+          const i = optimistic.findIndex((o) => o.tempId === tempId);
+          if (i >= 0) optimistic.splice(i, 1); // rollback
+          renderChat();
+        }
+      }
+      // When the server list arrives, drop optimistic entries that are now confirmed.
+      function reconcile(list) {
+        serverMsgs = list;
+        for (let i = optimistic.length - 1; i >= 0; i--) {
+          if (list.some((m) => m.body === optimistic[i].body)) optimistic.splice(i, 1);
+        }
+        renderChat();
+      }
+
+      // ── SSE subscription ────────────────────────────────────────────────
+      function connect() {
+        const es = new EventSource(`${ENGINE}/sync?clientId=${clientId}`);
+        es.onopen = async () => {
+          $("connPill").textContent = "LIVE"; $("connPill").style.background = "var(--good)";
+          await fetch(`${ENGINE}/subscribe`, { method: "POST", headers: AUTH,
+            body: JSON.stringify({ clientId, sub: GENERAL_SUB, path: ["messages", "list"], input: { channelId: CHANNEL } }) });
+          subCount = 1; $("subPill").textContent = "subs: " + subCount;
+          log("subscribed to #general", "ok");
+        };
+        es.onmessage = (ev) => {
+          pushCount++; $("mPush").textContent = pushCount;
+          try { const p = JSON.parse(ev.data); if (p.sub === GENERAL_SUB) reconcile(p.data); } catch {}
+        };
+        es.onerror = () => { $("connPill").textContent = "reconnecting…"; $("connPill").style.background = "var(--warn)"; };
+      }
+
+      // ── metrics / load generator ────────────────────────────────────────
+      function percentile(sorted, p) { if (!sorted.length) return 0; return sorted[Math.min(sorted.length-1, Math.floor(p/100*sorted.length))]; }
+      function renderBars(lat) {
+        const el = $("bars"); el.innerHTML = "";
+        const recent = lat.slice(-60); const max = Math.max(1, ...recent);
+        for (const v of recent) { const b = document.createElement("div"); b.className = "bar"; b.style.height = (v/max*100)+"%";
+          if (v > 500) b.style.background = "var(--bad)"; else if (v > 150) b.style.background = "var(--warn)"; el.appendChild(b); }
+      }
+      let running = false;
+      async function runLoad(total, concurrency, kind) {
+        if (running) return; running = true;
+        $("runBtn").disabled = true; $("stopBtn").disabled = false;
+        const lat = []; let done = 0, errors = 0, next = 0; const t0 = performance.now();
+        let counterId = null;
+        if (kind === "increment") { try { counterId = await rpc(["counters","create"],{name:"load"}); } catch(e){ log("counter create failed: "+e.message,"err"); } }
+        log(`load start: ${total} ops, c=${concurrency}, ${kind}`);
+        const op = async (i) => {
+          if (kind === "send") return rpc(["messages","send"],{channelId:CHANNEL, body:`load-${i}`});
+          if (kind === "list") return rpc(["messages","list"],{channelId:CHANNEL});
+          if (kind === "increment") return rpc(["counters","increment"],{id:counterId});
+          return i % 4 === 0 ? rpc(["messages","send"],{channelId:CHANNEL,body:`m-${i}`}) : rpc(["messages","list"],{channelId:CHANNEL});
+        };
+        async function worker() {
+          while (running) {
+            const i = next++; if (i >= total) return;
+            const s = performance.now();
+            try { await op(i); lat.push(performance.now()-s); } catch { errors++; }
+            done++;
+            if (done % 5 === 0 || done === total) {
+              const sorted=[...lat].sort((a,b)=>a-b); const secs=(performance.now()-t0)/1000;
+              $("mThru").textContent = Math.round(done/secs);
+              $("mDone").textContent = done; $("mErr").textContent = errors;
+              $("mPct").textContent = `${percentile(sorted,50).toFixed(0)} / ${percentile(sorted,95).toFixed(0)} / ${percentile(sorted,99).toFixed(0)}`;
+              $("mMax").textContent = (sorted[sorted.length-1]||0).toFixed(0)+"ms";
+              renderBars(lat);
+            }
+          }
+        }
+        await Promise.all(Array.from({length:Math.min(concurrency,total)}, worker));
+        const secs=(performance.now()-t0)/1000;
+        log(`load done: ${done} ops in ${secs.toFixed(1)}s · ${Math.round(done/secs)} ops/s · ${errors} errors`, errors?"err":"ok");
+        if (kind === "increment" && counterId) {
+          const val = await rpc(["counters","get"],{id:counterId});
+          const ok = val === (total - errors);
+          log(`increment result: value=${val}, expected≈${total-errors} → ${ok?"NO LOST UPDATES ✓":"LOST UPDATES ✗"}`, ok?"ok":"err");
+        }
+        running = false; $("runBtn").disabled = false; $("stopBtn").disabled = true;
+      }
+
+      // ── scenarios ───────────────────────────────────────────────────────
+      async function lostUpdateCheck() {
+        $("scenarioMsg").textContent = "running lost-update check…";
+        try {
+          const id = await rpc(["counters","create"],{name:"check"});
+          const N = 50;
+          await Promise.all(Array.from({length:N},()=>rpc(["counters","increment"],{id}).catch(()=>{})));
+          const val = await rpc(["counters","get"],{id});
+          const ok = val === N;
+          $("scenarioMsg").innerHTML = `<span class="${ok?'ok':'err'}">${N} concurrent increments → value=${val} ${ok?"(exactly 50, no lost updates ✓)":"(LOST UPDATES ✗)"}</span>`;
+          log(`lost-update check: ${val}/${N} ${ok?"✓":"✗"}`, ok?"ok":"err");
+        } catch(e){ $("scenarioMsg").textContent = "failed: "+e.message; }
+      }
+      async function precisionCheck() {
+        $("scenarioMsg").textContent = "running cross-channel precision…";
+        // subscribe to channel B on a side EventSource, count pushes, then write to A.
+        const cid = "probe-" + Math.random().toString(36).slice(2);
+        const B = "channels:00000000-0000-0000-0000-0000000000bb";
+        const bSub = subKey({ channelId: B });
+        let bPushes = 0;
+        const es = new EventSource(`${ENGINE}/sync?clientId=${cid}`);
+        await new Promise((res)=>{ es.onopen=res; });
+        await fetch(`${ENGINE}/subscribe`,{method:"POST",headers:AUTH,body:JSON.stringify({clientId:cid,sub:bSub,path:["messages","list"],input:{channelId:B}})});
+        es.onmessage=(ev)=>{ try{ if(JSON.parse(ev.data).sub===bSub) bPushes++; }catch{} };
+        await sleep(400); const initial = bPushes;
+        await rpc(["messages","send"],{channelId:CHANNEL, body:"precision-probe"}); // write to A
+        await sleep(700);
+        const ok = bPushes === initial; // B must NOT be re-pushed by an A write
+        $("scenarioMsg").innerHTML = `<span class="${ok?'ok':'err'}">write to channel A → channel-B subscriber pushes: ${bPushes-initial} ${ok?"(precise, no spurious re-run ✓)":"(over-invalidated ✗)"}</span>`;
+        log(`precision check: B re-runs on A-write = ${bPushes-initial} ${ok?"✓":"✗"}`, ok?"ok":"err");
+        es.close();
+      }
+
+      // ── wire up controls ────────────────────────────────────────────────
+      $("offline").onchange = (e) => { net.offline = e.target.checked;
+        $("netPill").textContent = net.offline?"OFFLINE":"ONLINE"; $("netPill").style.background = net.offline?"var(--bad)":"var(--good)";
+        renderQueue(); log("network: "+(net.offline?"OFFLINE":"ONLINE"), net.offline?"err":"ok"); };
+      $("latency").oninput = (e) => { net.latencyMs = +e.target.value; $("latencyVal").textContent = net.latencyMs+"ms"; };
+      $("errrate").oninput = (e) => { net.errorRate = +e.target.value; $("errrateVal").textContent = net.errorRate+"%"; };
+      $("flushBtn").onclick = flushQueue;
+      $("sendBtn").onclick = send;
+      $("input").onkeydown = (e) => { if (e.key === "Enter") send(); };
+      $("runBtn").onclick = () => runLoad(+$("loadTotal").value, +$("loadConc").value, $("loadKind").value);
+      $("burstBtn").onclick = () => runLoad(50, 50, $("loadKind").value);
+      $("stopBtn").onclick = () => { running = false; log("load stopped"); };
+      $("contendBtn").onclick = lostUpdateCheck;
+      $("precisionBtn").onclick = precisionCheck;
+
+      // Restore any durably-queued offline writes from a previous session, so a
+      // page refresh never loses queued writes. Runs before connect().
+      (async () => {
+        try {
+          offlineQueue = await idb.load();
+          renderQueue();
+          if (offlineQueue.length)
+            log(`restored ${offlineQueue.length} queued writes from IndexedDB (reload-survived)`, "ok");
+        } catch (e) { log("IndexedDB unavailable: " + e.message, "err"); }
+      })();
+
+      connect();
+      log("dev console ready");
+    </script>
+  </body>
+</html>

@@ -1,0 +1,39 @@
+# Rust
+/target
+**/target
+*.rs.bk
+Cargo.lock.orig
+
+# Node / TS
+node_modules
+dist
+build
+*.tsbuildinfo
+.turbo
+.next
+out
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Postgres / data
+*.pgdata
+pgdata/
+docker-volumes/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Tooling scratch
+.playwright-mcp/

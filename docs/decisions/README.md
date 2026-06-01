@@ -1,0 +1,15 @@
+# Architecture Decision Records
+
+This directory records the significant decisions behind **Pulse** — a reactive, local-first application platform built on standard Postgres, a Rust sync engine (`pulse-server`), and a TypeScript SDK. Each ADR captures the context, the decision, the alternatives weighed, the consequences, and the testing approach for one area of the system. They are grounded in [`../ARCHITECTURE.md`](../ARCHITECTURE.md) (the design source of truth) and in the code as it actually stands; where the current implementation deviates from the spec (e.g. a Node/Bun worker standing in for the embedded-V8 runtime, engine-captured write-sets standing in for WAL CDC), the relevant ADR says so explicitly. Read them in order for the full narrative, or jump to the one covering the area you are touching.
+
+| Decision | Status | One-line |
+| --- | --- | --- |
+| [00. Pulse: a reactive platform on standard Postgres](00-product-vision-postgres.md) | Accepted | The product thesis: a reactive, end-to-end-typed DX without giving up Postgres, SQL, or data ownership. |
+| [01. Rust Engine + TS Handlers in a Node/Bun Worker (Embedded V8 Deferred)](01-rust-engine-ts-worker.md) | Accepted (deviation) | Q/M handlers run in a supervised Node/Bun worker that proxies db ops back to Rust; embedded V8 deferred to M4. |
+| [02. NDJSON stdio protocol; user console routed to stderr](02-stdio-ndjson-protocol.md) | Accepted | The engine↔worker wire protocol (NDJSON over stdio, two-level correlation) and the soak fix routing `console.*` to stderr. |
+| [03. Instrumented `ctx.db`, SQL Lowering, Text-Cast Binding, and Table-Qualified Ids](03-ctx-db-and-sql-lowering.md) | Accepted | `ctx.db` is an inert proxy; Rust is the sole SQL author, binds everything as text, and uses `table:uuid` self-describing ids. |
+| [04. Analytical Raw `ctx.sql` via `to_jsonb` Wrapping](04-analytical-raw-sql.md) | Accepted (partial) | Raw analytical SQL escape hatch wrapped in `to_jsonb` for dynamic decode; OLAP replica isolation deferred. |
+| [05. Reactivity — Engine-Captured Write-Sets + SSE (WAL/CDC Deferred)](05-reactivity-writeset-sse.md) | Accepted (deviation) | M2 invalidation from engine-captured write-sets matched table-level against read-sets and pushed over SSE; WAL CDC deferred. |
+| [06. oRPC-style contract + middleware, pure type inference (no codegen)](06-contract-middleware-inference.md) | Accepted | Dependency-free contract + immutable middleware + end-to-end inference; `Doc<T>` via augmentation to break the type cycle. |
+| [07. Local-first client: offline queue, optimistic overlay + rebase, persistence](07-local-first-client.md) | Accepted (partial) | Durable offline queue, optimistic overlay with replay-on-top rebase, and pluggable KV persistence — not yet wired into `createClient`. |
+| [08. TDD Red-Green-Refactor + Stress Testing Through Public Interfaces](08-tdd-and-stress.md) | Accepted | Vertical-slice TDD with tracer bullets; all behavior verified through `@pulse/client` against real Postgres; stress tests as correctness probes. |
