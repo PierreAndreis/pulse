@@ -5,7 +5,7 @@
   "description": "Pulse — a reactive, local-first application platform on Postgres (Rust engine + TypeScript SDK).",
   "packageManager": "pnpm@11.1.1",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "scripts": {
     "build": "pnpm -r --filter=./packages/* run build",

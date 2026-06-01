@@ -2,8 +2,6 @@
 //! `execute_op` (ApplyCollab) into a `bytea` field both survive the CRDT merge,
 //! and `GetCollab` reads the merged state back. Skips if Postgres is unreachable.
 
-use std::collections::HashMap;
-
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use pulse_sql::{connect, execute_op, introspect, DbOp, SchemaMeta};
 use sqlx::Executor;
