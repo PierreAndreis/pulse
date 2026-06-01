@@ -69,6 +69,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Packages export dist (import condition) to the worker; build it so the
+      # Bun worker can resolve @onveloz/pulse-* at runtime.
+      - name: Build packages
+        run: pnpm -r --filter='./packages/*' run build
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
