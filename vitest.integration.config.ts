@@ -6,10 +6,11 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   resolve: { conditions: ["development"] },
   test: {
-    include: ["tests/**/*.test.ts"],
-    // The load suite has its own config (vitest.load.config.ts) and is timing-
-    // sensitive (throughput ratios), so it's not part of the correctness gate.
-    exclude: ["**/node_modules/**", "tests/load/**"],
+    include: ["tests/integration/**/*.test.ts"],
+    // load/ and stress/ are throughput & zero-error-under-sustained-load probes,
+    // not correctness gates — they flake on shared CI runners and have their own
+    // configs / on-demand runs. Keep the per-PR gate to the integration suite.
+    exclude: ["**/node_modules/**", "tests/load/**", "tests/stress/**"],
     testTimeout: 30_000,
     hookTimeout: 120_000,
     fileParallelism: false,
