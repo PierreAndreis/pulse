@@ -114,13 +114,26 @@ impl InMemoryReactor {
     /// Re-execute the given subscriptions and push any changed result, stamped
     /// with `commit_lsn`. Shared by precise (`apply_change_set`) and coarse
     /// (`invalidate_all`) invalidation.
+    ///
+    /// The expensive part of each re-exec (a worker round-trip + Postgres query)
+    /// runs CONCURRENTLY across the dirty set — a single write can fan out to many
+    /// subscriptions, and running them serially would make the tail of the wave
+    /// wait behind every prior round-trip. The cheap, state-touching follow-up
+    /// (`record_value` + `send`) is applied per-sub as each result arrives.
     async fn reexec_and_push(&self, dirty: Vec<Subscription>, commit_lsn: Lsn) {
+        let mut set = tokio::task::JoinSet::new();
         for sub in dirty {
-            match self
-                .reexec
-                .exec(sub.path.clone(), sub.input.clone(), sub.headers.clone())
-                .await
-            {
+            let reexec = self.reexec.clone();
+            set.spawn(async move {
+                let result = reexec
+                    .exec(sub.path.clone(), sub.input.clone(), sub.headers.clone())
+                    .await;
+                (sub, result)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let Ok((sub, result)) = joined else { continue }; // task panic → skip
+            match result {
                 Ok(value) => {
                     if !self.record_value(&sub.client_id, &sub.sub, &value).await {
                         continue; // unchanged result → no redundant push
@@ -306,6 +319,56 @@ mod tests {
         assert!(
             rx_b.try_recv().is_err(),
             "channel-B client received nothing"
+        );
+    }
+
+    /// Re-executor that blocks until N calls are concurrently in flight (a
+    /// barrier). If the reactor re-executes serially, the first call waits on the
+    /// barrier forever and the others never start → the whole apply_change_set
+    /// hangs. Parallel re-exec lets all N rendezvous and complete.
+    struct BarrierReExec {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+    #[async_trait]
+    impl ReExecutor for BarrierReExec {
+        async fn exec(
+            &self,
+            _path: Vec<String>,
+            input: Value,
+            _headers: HashMap<String, String>,
+        ) -> Result<Value, String> {
+            self.barrier.wait().await; // only releases once all N are here
+            Ok(input)
+        }
+    }
+
+    /// Matching subscriptions must re-execute concurrently, not one-at-a-time —
+    /// otherwise a fan-out wave's tail waits behind every prior worker round-trip.
+    #[tokio::test]
+    async fn matching_subs_reexecute_in_parallel() {
+        const N: usize = 8;
+        let reactor = InMemoryReactor::new(Arc::new(BarrierReExec {
+            barrier: Arc::new(tokio::sync::Barrier::new(N)),
+        }));
+
+        // N subscriptions on the SAME channel — one change fans out to all N.
+        for i in 0..N {
+            reactor.register_client(format!("c{i}")).await;
+            sub(&reactor, &format!("c{i}"), "A").await;
+        }
+
+        let applied = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reactor.apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            }),
+        )
+        .await;
+
+        assert!(
+            applied.is_ok(),
+            "re-exec must run in parallel; serial execution deadlocks on the barrier"
         );
     }
 }
