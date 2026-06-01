@@ -93,13 +93,21 @@ impl InMemoryReactor {
     }
 
     /// Assign the next per-client seq and enqueue a push. False if disconnected.
+    ///
+    /// The bounded-channel `send().await` is performed OUTSIDE the clients lock:
+    /// we bump the seq and clone the sender under the lock, then release it before
+    /// awaiting. Otherwise one stalled consumer (a full buffer) would park while
+    /// holding the global lock and wedge every other client's push + register/
+    /// remove — head-of-line blocking the whole reactor on the slowest browser.
     async fn send(&self, client_id: &str, sub: &str, value: &Value, commit_lsn: Lsn) -> bool {
-        let mut clients = self.clients.lock().await;
-        let Some(client) = clients.get_mut(client_id) else {
-            return false;
+        let (tx, id) = {
+            let mut clients = self.clients.lock().await;
+            let Some(client) = clients.get_mut(client_id) else {
+                return false;
+            };
+            client.seq += 1;
+            (client.tx.clone(), client.seq)
         };
-        client.seq += 1;
-        let id = client.seq;
         let body = json!({
             "sub": sub,
             "id": id.to_string(),
@@ -108,7 +116,7 @@ impl InMemoryReactor {
             "data": value,
         })
         .to_string();
-        client.tx.send(SsePush { id, body }).await.is_ok()
+        tx.send(SsePush { id, body }).await.is_ok()
     }
 
     /// Re-execute the given subscriptions and push any changed result, stamped
@@ -369,6 +377,66 @@ mod tests {
         assert!(
             applied.is_ok(),
             "re-exec must run in parallel; serial execution deadlocks on the barrier"
+        );
+    }
+
+    /// A re-executor that returns a unique value each call (so every push goes
+    /// through), used to drive many pushes.
+    struct UniqueReExec {
+        n: AtomicUsize,
+    }
+    #[async_trait]
+    impl ReExecutor for UniqueReExec {
+        async fn exec(
+            &self,
+            _path: Vec<String>,
+            _input: Value,
+            _headers: HashMap<String, String>,
+        ) -> Result<Value, String> {
+            Ok(json!({ "n": self.n.fetch_add(1, Ordering::SeqCst) }))
+        }
+    }
+
+    /// A client whose SSE buffer is full (a stalled/slow browser) must not hold
+    /// the global clients lock. If `send` awaits the bounded channel WHILE holding
+    /// that lock, a full buffer parks every other client lookup — including
+    /// register/remove — wedging the whole reactor on one slow consumer.
+    #[tokio::test]
+    async fn a_stalled_client_does_not_hold_the_clients_lock() {
+        let reactor = Arc::new(InMemoryReactor::new(Arc::new(UniqueReExec {
+            n: AtomicUsize::new(0),
+        })));
+        // "slow" never drains its receiver; keep rx alive so the channel stays open.
+        let _rx_slow = reactor.register_client("slow".into()).await;
+
+        // Spawn a flood of pushes to "slow". The channel cap is 256, so after it
+        // fills, the next push parks inside send().await.
+        let r2 = reactor.clone();
+        tokio::spawn(async move {
+            for _ in 0..512 {
+                r2.push(
+                    "slow",
+                    "messages.list::A",
+                    &json!({}),
+                    pulse_core::Lsn::ZERO,
+                )
+                .await;
+            }
+        });
+        // Let the flood fill the buffer and park.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Another operation that needs the clients lock must still complete fast.
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reactor.register_client("other".into()),
+        )
+        .await;
+
+        assert!(
+            ok.is_ok(),
+            "register_client wedged behind a stalled client's push — the clients \
+             lock must not be held across the channel send().await"
         );
     }
 }
