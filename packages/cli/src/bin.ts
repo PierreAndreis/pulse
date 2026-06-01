@@ -6,6 +6,7 @@ import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
 import { buildEngineEnv, resolveEngineBin } from "./dev.js";
+import { scaffoldApp } from "./scaffold.js";
 import {
   diffSchema,
   parseLiveColumns,
@@ -26,6 +27,8 @@ interface PgClient {
 
 const HELP = `pulse <command>
 
+  new <name>                 scaffold a fully-configured Pulse app (schema,
+                             contract, handlers, Vite client, Docker Postgres)
   gen <schema.ts> [out.ts]   generate the Doc/Id data model from a schema
                              (default out: <schemaDir>/_generated/dataModel.ts)
   migrate <schema.ts> [--out file.sql]
@@ -117,6 +120,28 @@ async function main(): Promise<void> {
     case "--help":
       process.stdout.write(HELP);
       return;
+
+    case "new": {
+      const name = args[0];
+      if (!name || name.startsWith("-")) throw new Error("usage: pulse new <name>");
+      const dir = resolve(name);
+      const files = scaffoldApp(name);
+      for (const [rel, contents] of Object.entries(files)) {
+        const out = resolve(dir, rel);
+        await mkdir(dirname(out), { recursive: true });
+        await writeFile(out, contents, "utf8");
+      }
+      process.stdout.write(
+        `pulse: created ${name}/ (${Object.keys(files).length} files)\n\n` +
+          `  cd ${name}\n` +
+          `  pnpm install\n` +
+          `  pnpm db        # start Postgres\n` +
+          `  pnpm gen       # generate types\n` +
+          `  pnpm engine    # run the engine\n` +
+          `  pnpm dev       # start the app\n`,
+      );
+      return;
+    }
 
     case "gen": {
       const schemaPath = args[0];

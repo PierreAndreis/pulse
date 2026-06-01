@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pulse — framework reativo e offline-first sobre Postgres</title>
+    <meta
+      name="description"
+      content="Pulse: framework full-stack reativo e offline-first sobre Postgres padrão. Engine em Rust, SDK TypeScript tipado ponta a ponta."
+    />
+    <meta property="og:title" content="Pulse" />
+    <meta property="og:description" content="Reativo e offline-first. Sobre o seu Postgres." />
+    <meta property="og:image" content="./assets/og.png" />
+    <link rel="icon" href="./assets/pulse-logo.png" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <div class="title">
+        <h1>Pulse</h1>
+        <span class="tag">[alpha]</span>
+      </div>
+      <p class="tagline">Reativo e offline-first. Sobre o seu Postgres.</p>
+
+      <div class="cmd">
+        <code><span class="prompt">$ </span><span id="cmd-text">pnpm add @onveloz/pulse-client</span></code>
+        <button class="copy" id="copy" aria-label="Copiar">Copiar</button>
+      </div>
+
+      <div class="links">
+        <a href="./docs.html">Docs</a>
+        <a href="https://github.com/PierreAndreis/pulse">GitHub</a>
+      </div>
+    </main>
+
+    <script>
+      const btn = document.getElementById("copy");
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(document.getElementById("cmd-text").textContent);
+          btn.textContent = "Copiado";
+          btn.classList.add("done");
+          setTimeout(() => {
+            btn.textContent = "Copiar";
+            btn.classList.remove("done");
+          }, 1600);
+        } catch {
+          /* clipboard indisponível */
+        }
+      });
+    </script>
+  </body>
+</html>
