@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "MIT",
   "description": "Better Auth (JWT/JWKS) integration for Pulse — a verify-and-resolve middleware plus a client bearer helper.",
@@ -29,7 +29,10 @@
       }
     }
   },
-  "files": ["dist", "LICENSE"],
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "dependencies": {
     "jose": "^6.0.0"
   },
@@ -42,7 +45,9 @@
     "directory": "packages/auth"
   },
   "homepage": "https://github.com/PierreAndreis/pulse#readme",
-  "bugs": { "url": "https://github.com/PierreAndreis/pulse/issues" },
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
   "author": "Pierre Ortega",
   "devDependencies": {
     "@onveloz/pulse-server": "workspace:*",

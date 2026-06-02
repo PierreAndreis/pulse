@@ -32,6 +32,14 @@ describe("scaffoldApp", () => {
     expect(files["vite.config.ts"]).toContain("definePulseApp");
   });
 
+  it("allowlists the engine + esbuild install scripts for pnpm and bun", () => {
+    const pkg = JSON.parse(files["package.json"]!);
+    expect(pkg.pnpm.onlyBuiltDependencies).toContain("@onveloz/pulse-engine");
+    expect(pkg.pnpm.onlyBuiltDependencies).toContain("esbuild");
+    expect(pkg.trustedDependencies).toContain("@onveloz/pulse-engine");
+    expect(pkg.trustedDependencies).toContain("esbuild");
+  });
+
   it("uses the project name and sanitizes it for the DB", () => {
     const dirty = scaffoldApp("My Cool App!");
     expect(dirty["package.json"]).toContain('"name": "my-cool-app-"');

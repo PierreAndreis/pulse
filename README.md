@@ -72,6 +72,23 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
 
 ## Quick start
 
+Create a fully-configured app — schema, contract, handlers, a Vite client, and
+Docker Postgres — with one command:
+
+```bash
+npx @onveloz/pulse new my-app
+cd my-app
+pnpm install
+pnpm db        # start Postgres (docker compose up -d)
+pnpm gen       # generate the typed data model
+pnpm engine    # run the Rust engine
+pnpm dev       # start the app
+```
+
+### From this repo
+
+To hack on Pulse itself or run the bundled example:
+
 ```bash
 # 1. Install deps and start Postgres (logical replication enabled)
 pnpm install
@@ -90,6 +107,7 @@ pnpm pulse dev packages/examples-chat/src/app.ts
 ## The CLI
 
 ```
+pulse new <name>                          scaffold a fully-configured app
 pulse gen <schema.ts> [out.ts]            generate the Doc/Id data model
 pulse migrate <schema.ts> [--out f.sql]   idempotent DDL from a schema
 pulse migrate <schema.ts> --diff          diff schema vs the live DB → migration

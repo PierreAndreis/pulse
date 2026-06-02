@@ -32,17 +32,19 @@
       </div>
 
       <h2 id="inicio">Início rápido</h2>
-      <p>Suba o Postgres, defina um schema e rode a engine contra a sua aplicação.</p>
-      <pre><span class="tok-com"># 1. instale o SDK</span>
-pnpm add @onveloz/pulse-client @onveloz/pulse-react
+      <p>Um comando cria um app já configurado — schema, contract, handlers, client Vite e Postgres via Docker.</p>
+      <pre><span class="tok-com"># 1. crie um app Pulse já configurado</span>
+npx @onveloz/pulse new my-app
+cd my-app
+pnpm install
 
-<span class="tok-com"># 2. suba o Postgres (wal_level=logical) e aplique o schema</span>
-docker compose up -d
-pnpm pulse migrate app/schema.ts --out schema.sql
+<span class="tok-com"># 2. suba o Postgres (wal_level=logical) e gere os tipos</span>
+pnpm db        <span class="tok-com"># docker compose up -d</span>
+pnpm gen
 
-<span class="tok-com"># 3. gere os tipos e rode a engine</span>
-pnpm pulse gen app/schema.ts
-pnpm pulse dev app/app.ts   <span class="tok-com"># engine em http://127.0.0.1:8787</span></pre>
+<span class="tok-com"># 3. rode a engine e o app</span>
+pnpm engine    <span class="tok-com"># engine em http://127.0.0.1:8787</span>
+pnpm dev</pre>
       <p class="note">
         Pré-requisitos: Node 22+, pnpm, Docker (Postgres local). A engine em Rust é baixada
         automaticamente pelo <code>@onveloz/pulse-engine</code>; ou defina <code>PULSE_SERVER_BIN</code>.

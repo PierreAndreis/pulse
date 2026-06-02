@@ -66,6 +66,9 @@ importers:
       '@onveloz/pulse-engine':
         specifier: workspace:*
         version: link:../engine
+      '@onveloz/pulse-runtime-node':
+        specifier: workspace:*
+        version: link:../runtime-node
       '@onveloz/pulse-schema':
         specifier: workspace:*
         version: link:../schema
@@ -181,6 +184,12 @@ importers:
       vitest:
         specifier: ^3.0.0
         version: 3.2.4(@types/node@22.19.19)(lightningcss@1.32.0)
+
+  packages/pulse:
+    dependencies:
+      '@onveloz/pulse-cli':
+        specifier: workspace:*
+        version: link:../cli
 
   packages/react:
     dependencies:

@@ -44,6 +44,13 @@ export function scaffoldApp(name: string): Record<string, string> {
           typescript: "^5.9.3",
           vite: "^8.0.15",
         },
+        // pnpm v10+ and bun block dependency install scripts by default. The
+        // engine's postinstall downloads the matching Rust binary, and esbuild
+        // (via Vite) fetches its platform binary — both must be allowed to run.
+        pnpm: {
+          onlyBuiltDependencies: ["@onveloz/pulse-engine", "esbuild"],
+        },
+        trustedDependencies: ["@onveloz/pulse-engine", "esbuild"],
       },
       null,
       2,

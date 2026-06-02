@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema";
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
@@ -48,11 +49,17 @@ const HELP = `pulse <command>
                              ./pulse-dist).
 `;
 
-const WORKER_SCRIPT_REL = "packages/runtime-node/src/worker.ts";
-
 /** Repo root: two levels up from packages/cli/src. */
 function repoRoot(): string {
   return resolve(dirname(new URL(import.meta.url).pathname), "..", "..", "..");
+}
+
+/** Absolute path to the runtime-node worker entry, resolved via node module
+ *  resolution so it works both in the monorepo and when installed from npm
+ *  (where `@onveloz/pulse-runtime-node` is a sibling dependency of this CLI). */
+function workerScriptPath(): string {
+  const entry = fileURLToPath(import.meta.resolve("@onveloz/pulse-runtime-node"));
+  return resolve(dirname(entry), "worker.js");
 }
 
 function isSchema(v: unknown): v is AnySchema {
@@ -200,7 +207,7 @@ async function main(): Promise<void> {
         );
       const env = buildEngineEnv({
         appPath: resolve(appPath),
-        workerScript: resolve(root, WORKER_SCRIPT_REL),
+        workerScript: workerScriptPath(),
         port: flag(args, "--port"),
         databaseUrl: flag(args, "--database-url"),
         workerBin: flag(args, "--worker-bin"),
@@ -243,7 +250,7 @@ async function main(): Promise<void> {
         `: "\${DATABASE_URL:?set DATABASE_URL}"\n` +
         `psql "$DATABASE_URL" -f "$(dirname "$0")/schema.sql"\n` +
         `export PULSE_APP="${resolve(appPath)}"\n` +
-        `export PULSE_WORKER_SCRIPT="${resolve(root, WORKER_SCRIPT_REL)}"\n` +
+        `export PULSE_WORKER_SCRIPT="${workerScriptPath()}"\n` +
         `export PULSE_PORT="\${PULSE_PORT:-8787}"\n` +
         `exec "${bin ?? "./pulse-server"}"\n`;
       await writeFile(resolve(outDir, "run.sh"), run, { mode: 0o755 });

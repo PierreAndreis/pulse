@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-bundler",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "license": "MIT",
   "description": "Vite-based bundler preset for Pulse apps — definePulseApp() configures React, SSE-safe dev server, and SDK resolution in one line.",
@@ -29,7 +29,10 @@
       }
     }
   },
-  "files": ["dist", "LICENSE"],
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "vite": "^8.0.0",
     "@vitejs/plugin-react": "^6.0.0"
@@ -40,7 +43,9 @@
     "directory": "packages/bundler"
   },
   "homepage": "https://github.com/PierreAndreis/pulse#readme",
-  "bugs": { "url": "https://github.com/PierreAndreis/pulse/issues" },
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
   "author": "Pierre Ortega",
   "devDependencies": {
     "@onveloz/pulse-tsconfig": "workspace:*",

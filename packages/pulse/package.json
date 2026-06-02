@@ -1,0 +1,38 @@
+{
+  "name": "@onveloz/pulse",
+  "version": "0.1.1",
+  "type": "module",
+  "license": "MIT",
+  "description": "Create and run Pulse apps. `npx @onveloz/pulse new <name>` scaffolds a fully-configured, reactive offline-first app on Postgres.",
+  "bin": {
+    "pulse": "./bin.mjs"
+  },
+  "dependencies": {
+    "@onveloz/pulse-cli": "workspace:*"
+  },
+  "files": [
+    "bin.mjs",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pulse",
+    "create",
+    "scaffold",
+    "postgres",
+    "reactive",
+    "offline-first"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PierreAndreis/pulse.git",
+    "directory": "packages/pulse"
+  },
+  "homepage": "https://github.com/PierreAndreis/pulse#readme",
+  "bugs": {
+    "url": "https://github.com/PierreAndreis/pulse/issues"
+  },
+  "author": "Pierre Ortega"
+}
