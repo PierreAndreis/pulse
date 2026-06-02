@@ -1,12 +1,20 @@
 name: Release
 
-# Tag-driven: pushing v0.1.0 builds the engine for every target and attaches the
-# binaries + SHA256SUMS to the GitHub Release that @onveloz/pulse-engine downloads.
+# Tag-driven: pushing v0.1.0
+#   1. builds the engine for every target and attaches the binaries + SHA256SUMS
+#      to the GitHub Release that @onveloz/pulse-engine downloads, then
+#   2. bakes those exact checksums into the engine package and publishes every
+#      @onveloz/pulse-* package to npm with provenance.
+#
+# Required one-time setup:
+#   - NPM_TOKEN secret: an npm automation token with publish rights to @onveloz.
+#   - A "production" environment (Settings → Environments) with required
+#     reviewers, so a tag push cannot release without a human approval.
 on:
   push:
     tags: ["v*"]
 
-# Default read-only; only the release job that uploads assets gets write.
+# Default to read-only; each job opts into exactly what it needs.
 permissions:
   contents: read
 
@@ -67,27 +75,80 @@ jobs:
           path: out/pulse-server-${{ matrix.target }}
 
   release:
-    name: Publish GitHub Release
+    name: Release (GitHub + npm)
     needs: engine
     runs-on: ubuntu-latest
-    # Same required-reviewer gate as the npm publish; only this job can write.
+    # Required-reviewer gate: one human approval covers both the GitHub Release
+    # upload and the npm publish, which happen in this single job.
     environment: production
     permissions:
-      contents: write
+      contents: write # create the GitHub Release + upload binaries
+      id-token: write # OIDC, enables npm provenance attestation
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download engine binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+          pattern: engine-*
           merge-multiple: true
 
       - name: Checksums
         working-directory: artifacts
         run: sha256sum pulse-server-* > SHA256SUMS
 
-      - name: Create / update release
+      # Publish the GitHub Release FIRST so the npm package we publish next points
+      # at binaries that already exist (users can install immediately).
+      - name: Create / update GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             artifacts/pulse-server-*
             artifacts/SHA256SUMS
           fail_on_unmatched_files: true
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - run: pnpm install --frozen-lockfile
+
+      # Bake the engine's checksum trust root from the EXACT binaries just built,
+      # so the immutable npm tarball — not the mutable Release — is what verifies
+      # the download. Must run before build/publish so the file ships in the tarball.
+      - name: Bake engine checksums
+        run: node scripts/bake-engine-checksums.mjs artifacts
+
+      # Build first so a compile failure stops us before any publish (prepack also
+      # builds, but this fails fast across the whole workspace).
+      - name: Build packages
+        run: pnpm -r --filter='./packages/*' run build
+
+      # Defense-in-depth: refuse to publish if any non-private package version
+      # disagrees with the tag (the engine downloads binaries from the matching
+      # release tag, so a mismatch would ship a broken install).
+      - name: Assert package versions match tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          for p in packages/*/package.json; do
+            priv=$(node -p "require('./$p').private === true")
+            [ "$priv" = "true" ] && continue
+            v=$(node -p "require('./$p').version")
+            [ "$v" = "$TAG" ] || { echo "::error::$p is $v but tag is v$TAG"; exit 1; }
+          done
+
+      # Publish all non-private packages. pnpm rewrites workspace:* to real
+      # versions and applies each package's publishConfig. --no-git-checks is
+      # load-bearing for the detached-HEAD tag checkout; tag protection + the
+      # production environment gate are the real safeguards. --provenance emits a
+      # signed attestation tying each package to this repo + workflow run.
+      - name: Publish to npm
+        run: pnpm -r publish --access public --no-git-checks --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
