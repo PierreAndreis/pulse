@@ -27,6 +27,25 @@ importers:
         specifier: ^13.6.31
         version: 13.6.31
 
+  packages/auth:
+    dependencies:
+      jose:
+        specifier: ^6.0.0
+        version: 6.2.3
+    devDependencies:
+      '@onveloz/pulse-server':
+        specifier: workspace:*
+        version: link:../server
+      '@onveloz/pulse-tsconfig':
+        specifier: workspace:*
+        version: link:../tsconfig
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.19.19
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
   packages/bundler:
     devDependencies:
       '@onveloz/pulse-tsconfig':
@@ -1101,6 +1120,9 @@ packages:
 
   isomorphic.js@0.2.5:
     resolution: {integrity: sha512-PIeMbHqMt4DnUP3MA/Flc0HElYjMXArsw1qwJZcm9sqR8mq3l8NYizFMty0pWwE/tzIGH3EKK5+jes5mAr85yw==}
+
+  jose@6.2.3:
+    resolution: {integrity: sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw==}
 
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
@@ -2228,6 +2250,8 @@ snapshots:
   gensync@1.0.0-beta.2: {}
 
   isomorphic.js@0.2.5: {}
+
+  jose@6.2.3: {}
 
   js-tokens@4.0.0: {}
 

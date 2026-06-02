@@ -1,0 +1,53 @@
+{
+  "name": "@onveloz/pulse-auth",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Better Auth (JWT/JWKS) integration for Pulse — a verify-and-resolve middleware plus a client bearer helper.",
+  "exports": {
+    ".": {
+      "development": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": ["dist", "LICENSE"],
+  "dependencies": {
+    "jose": "^6.0.0"
+  },
+  "peerDependencies": {
+    "@onveloz/pulse-server": "workspace:^"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PierreAndreis/pulse.git",
+    "directory": "packages/auth"
+  },
+  "homepage": "https://github.com/PierreAndreis/pulse#readme",
+  "bugs": { "url": "https://github.com/PierreAndreis/pulse/issues" },
+  "author": "Pierre Ortega",
+  "devDependencies": {
+    "@onveloz/pulse-server": "workspace:*",
+    "@onveloz/pulse-tsconfig": "workspace:*",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3"
+  }
+}
