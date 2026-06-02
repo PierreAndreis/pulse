@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,6 +61,12 @@ function repoRoot(): string {
 function workerScriptPath(): string {
   const entry = fileURLToPath(import.meta.resolve("@onveloz/pulse-runtime-node"));
   return resolve(dirname(entry), "worker.js");
+}
+
+/** This CLI's own version, read from its package.json (dist/bin.js → ../package.json). */
+function cliVersion(): string {
+  const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+  return (JSON.parse(readFileSync(pkgPath, "utf8")) as { version: string }).version;
 }
 
 function isSchema(v: unknown): v is AnySchema {
@@ -132,7 +139,7 @@ async function main(): Promise<void> {
       const name = args[0];
       if (!name || name.startsWith("-")) throw new Error("usage: pulse new <name>");
       const dir = resolve(name);
-      const files = scaffoldApp(name);
+      const files = scaffoldApp(name, cliVersion());
       for (const [rel, contents] of Object.entries(files)) {
         const out = resolve(dir, rel);
         await mkdir(dirname(out), { recursive: true });

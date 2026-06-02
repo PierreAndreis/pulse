@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "license": "MIT",
   "description": "Create and run Pulse apps. `npx @onveloz/pulse new <name>` scaffolds a fully-configured, reactive offline-first app on Postgres.",

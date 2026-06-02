@@ -1,10 +1,11 @@
 // Generates a complete, ready-to-run Pulse app as an in-memory file map. Pure
 // (no fs) so it's unit-testable; bin.ts writes the map to disk.
 
-const PKG = "0.1.0";
-
-/** Produce the full set of files for a new Pulse app named `name`. */
-export function scaffoldApp(name: string): Record<string, string> {
+/** Produce the full set of files for a new Pulse app named `name`, pinning the
+ *  @onveloz/pulse-* deps to `version` (the CLI's own version, injected by
+ *  bin.ts) so a scaffolded app matches the CLI that generated it. */
+export function scaffoldApp(name: string, version: string): Record<string, string> {
+  const PKG = version;
   const safe = name.replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "pulse-app";
 
   const files: Record<string, string> = {};
@@ -44,13 +45,9 @@ export function scaffoldApp(name: string): Record<string, string> {
           typescript: "^5.9.3",
           vite: "^8.0.15",
         },
-        // pnpm v10+ and bun block dependency install scripts by default. The
-        // engine's postinstall downloads the matching Rust binary, and esbuild
-        // (via Vite) fetches its platform binary — both must be allowed to run.
-        pnpm: {
-          onlyBuiltDependencies: ["@onveloz/pulse-engine", "esbuild"],
-        },
-        trustedDependencies: ["@onveloz/pulse-engine", "esbuild"],
+        // No PM-specific install-script allowlist is needed: the engine has no
+        // postinstall — `pulse dev` downloads the binary on first run — so
+        // install is identical across npm, pnpm, yarn, and bun.
       },
       null,
       2,

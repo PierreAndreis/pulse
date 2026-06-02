@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-engine",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "license": "MIT",
   "description": "Downloads and resolves the Pulse reactivity engine (pulse-server) binary for the host platform.",
@@ -17,8 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepack": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "postinstall": "node ./postinstall.cjs"
+    "typecheck": "tsc --noEmit"
   },
   "publishConfig": {
     "access": "public",
@@ -32,7 +31,6 @@
   },
   "files": [
     "dist",
-    "postinstall.cjs",
     "LICENSE",
     "checksums.json"
   ],
