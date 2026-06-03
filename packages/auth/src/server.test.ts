@@ -99,4 +99,41 @@ describe("pulseAuth", () => {
     const { authed } = pulseAuth({ getKey, issuer: "https://right" });
     expect((await run(authed, `Bearer ${t}`)).error).toBe("UNAUTHORIZED");
   });
+
+  it("throws when neither jwksUrl nor getKey is configured", () => {
+    expect(() => pulseAuth({})).toThrow("pulseAuth: provide jwksUrl or getKey");
+  });
+
+  it("builds a remote JWKS getKey from jwksUrl without throwing", () => {
+    expect(() => pulseAuth({ jwksUrl: "https://provider.example/api/auth/jwks" })).not.toThrow();
+  });
+
+  it("rejects a token missing the sub claim", async () => {
+    // A validly-signed token with no subject must still be rejected.
+    const noSub = await new SignJWT({ email: "a@x.dev" })
+      .setProtectedHeader({ alg: "ES256" })
+      .setExpirationTime("1h")
+      .sign(privateKey);
+    const { authed } = pulseAuth({ getKey });
+    expect((await run(authed, `Bearer ${noSub}`)).error).toBe("UNAUTHORIZED");
+  });
+
+  it("awaits an async resolveUserId", async () => {
+    const { authed } = pulseAuth({
+      getKey,
+      resolveUserId: async (id) => `users:${id.subject}`,
+    });
+    const { ctx } = await run(authed, `Bearer ${await token({}, "abc")}`);
+    expect(ctx!.userId).toBe("users:abc");
+  });
+
+  it("propagates an error thrown by resolveUserId", async () => {
+    const { authed } = pulseAuth({
+      getKey,
+      resolveUserId: () => {
+        throw new Error("no such user");
+      },
+    });
+    expect((await run(authed, `Bearer ${await token()}`)).error).toBe("no such user");
+  });
 });

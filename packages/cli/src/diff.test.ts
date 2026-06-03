@@ -131,4 +131,63 @@ describe("diffSchema", () => {
     const d = diffSchema(liveUsers, baseSchema);
     expect(d.destructive).toEqual([]);
   });
+
+  it("treats float8/bool aliases as matching number/boolean (no spurious ALTER TYPE)", () => {
+    const schema = defineSchema({
+      t: defineTable({ n: v.number(), flag: v.boolean() }),
+    });
+    // _creation_time stays `bigint` (system col) — the int8↔bigint alias path is
+    // exercised here too: PG reports `int8`, the live DDL/normalizer treats it as
+    // `bigint`, so a matching bigint column shows no drift.
+    const live: LiveSchema = {
+      t: {
+        _id: { type: "uuid", notNull: true },
+        _creation_time: { type: "int8", notNull: true },
+        n: { type: "float8", notNull: true },
+        flag: { type: "bool", notNull: true },
+      },
+    };
+    const d = diffSchema(live, schema);
+    expect(isEmptyDiff(d)).toBe(true);
+    expect(d.alters).toEqual([]);
+  });
+
+  it("flags a nullable live column that the schema wants NOT NULL", () => {
+    const live: LiveSchema = {
+      users: {
+        ...liveUsers.users,
+        email: { type: "text", notNull: false }, // schema email is non-optional v.string()
+      },
+    };
+    const d = diffSchema(live, baseSchema, new Set(["users_by_email"]));
+    expect(d.alters.join("\n")).toContain("review: users.email should be NOT NULL");
+  });
+
+  it("skips the engine-managed _pulse_mutations table (not flagged destructive)", () => {
+    const live: LiveSchema = {
+      ...liveUsers,
+      _pulse_mutations: { _id: { type: "uuid", notNull: true } },
+    };
+    const d = diffSchema(live, baseSchema, new Set(["users_by_email"]));
+    expect(d.destructive).not.toContainEqual({ kind: "table", table: "_pulse_mutations" });
+    expect(d.destructive).toEqual([]);
+  });
+
+  it("renders all three sections with their headers when each is non-empty", () => {
+    const schema = defineSchema({
+      users: defineTable({ name: v.string(), email: v.string(), age: v.number() }),
+    });
+    const live: LiveSchema = {
+      users: { ...liveUsers.users, legacy: { type: "text", notNull: false } },
+      old_table: { _id: { type: "uuid", notNull: true } },
+    };
+    const d = diffSchema(live, schema);
+    expect(d.additive.length).toBeGreaterThan(0);
+    expect(d.alters.length).toBeGreaterThan(0);
+    expect(d.destructive.length).toBeGreaterThan(0);
+    const out = renderDiff(d);
+    expect(out).toContain("additive (safe to apply)");
+    expect(out).toContain("alters (review before applying)");
+    expect(out).toContain("destructive (auto-applied only when empty; else review)");
+  });
 });
