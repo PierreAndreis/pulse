@@ -70,6 +70,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 
+# Testing
+proptest = "1"
+
 [profile.dev]
 # Faster incremental builds during the heavy iteration phase.
 opt-level = 0

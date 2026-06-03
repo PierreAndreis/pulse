@@ -145,6 +145,8 @@ mod tests {
     use super::*;
     use crate::change::ChangeOp;
     use crate::lsn::Lsn;
+    use proptest::collection::{hash_set, vec};
+    use proptest::prelude::*;
 
     fn insert(table: &str, key: i64) -> Change {
         Change::point(
@@ -263,5 +265,276 @@ mod tests {
         };
         assert!(rs.matches_change(&after));
         assert!(!rs.matches_change(&before));
+    }
+
+    fn cond(field: &str, op: FilterOp, value: KeyValue) -> Filter {
+        Filter {
+            conds: vec![Cond {
+                field: field.to_string(),
+                op,
+                value,
+            }],
+        }
+    }
+
+    // ── Example-based: matcher correctness ────────────────────────────────
+
+    #[test]
+    fn delete_invalidates_filter_via_old_image() {
+        // A Delete carries only the pre-image. The only-old branch of the OR in
+        // `filter_matches` must still invalidate the channel the row left.
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            eq("channelId", KeyValue::Text("A".into())),
+        );
+        let deleted = Change {
+            op: ChangeOp::Delete,
+            new: None,
+            old: Some(row(&[("channelId", KeyValue::Text("A".into()))])),
+            ..insert("messages", 1)
+        };
+        assert!(rs.matches_change(&deleted));
+    }
+
+    #[test]
+    fn missing_field_matches_conservatively() {
+        // Filter on channelId but the new image omits it → the None-arm of
+        // `eval` returns true → conservative match (never miss an invalidation).
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            eq("channelId", KeyValue::Text("A".into())),
+        );
+        let no_channel = Change {
+            new: Some(row(&[("authorId", KeyValue::Int(7))])),
+            ..insert("messages", 1)
+        };
+        assert!(rs.matches_change(&no_channel));
+    }
+
+    #[test]
+    fn gt_is_exclusive_gte_inclusive() {
+        let mut rs = ReadSet::new();
+        rs.add_filter(TableId::new("t"), cond("n", FilterOp::Gte, KeyValue::Int(100)));
+        let at_100 = Change {
+            new: Some(row(&[("n", KeyValue::Int(100))])),
+            ..insert("t", 1)
+        };
+        let at_99 = Change {
+            new: Some(row(&[("n", KeyValue::Int(99))])),
+            ..insert("t", 2)
+        };
+        assert!(rs.matches_change(&at_100)); // Gte includes the bound
+        assert!(!rs.matches_change(&at_99));
+
+        let mut rs_gt = ReadSet::new();
+        rs_gt.add_filter(TableId::new("t"), cond("n", FilterOp::Gt, KeyValue::Int(100)));
+        let at_101 = Change {
+            new: Some(row(&[("n", KeyValue::Int(101))])),
+            ..insert("t", 3)
+        };
+        assert!(!rs_gt.matches_change(&at_100)); // Gt excludes the bound
+        assert!(rs_gt.matches_change(&at_101));
+
+        // Symmetric Lt / Lte.
+        let mut rs_lte = ReadSet::new();
+        rs_lte.add_filter(TableId::new("t"), cond("n", FilterOp::Lte, KeyValue::Int(100)));
+        assert!(rs_lte.matches_change(&at_100)); // Lte includes the bound
+        assert!(!rs_lte.matches_change(&at_101));
+
+        let mut rs_lt = ReadSet::new();
+        rs_lt.add_filter(TableId::new("t"), cond("n", FilterOp::Lt, KeyValue::Int(100)));
+        assert!(!rs_lt.matches_change(&at_100)); // Lt excludes the bound
+        assert!(rs_lt.matches_change(&at_99));
+    }
+
+    #[test]
+    fn cross_variant_order_never_matches() {
+        // Ordered ops across KeyValue variants → `order` returns None → no match.
+        let mut rs = ReadSet::new();
+        rs.add_filter(TableId::new("t"), cond("n", FilterOp::Gte, KeyValue::Int(100)));
+        let text_row = Change {
+            new: Some(row(&[("n", KeyValue::Text("x".into()))])),
+            ..insert("t", 1)
+        };
+        assert!(!rs.matches_change(&text_row));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn multi_cond_is_AND() {
+        // [channelId = A AND authorId = 7]: a partial match must NOT invalidate.
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            Filter {
+                conds: vec![
+                    Cond {
+                        field: "channelId".into(),
+                        op: FilterOp::Eq,
+                        value: KeyValue::Text("A".into()),
+                    },
+                    Cond {
+                        field: "authorId".into(),
+                        op: FilterOp::Eq,
+                        value: KeyValue::Int(7),
+                    },
+                ],
+            },
+        );
+        let only_channel = Change {
+            new: Some(row(&[
+                ("channelId", KeyValue::Text("A".into())),
+                ("authorId", KeyValue::Int(8)),
+            ])),
+            ..insert("messages", 1)
+        };
+        let both = Change {
+            new: Some(row(&[
+                ("channelId", KeyValue::Text("A".into())),
+                ("authorId", KeyValue::Int(7)),
+            ])),
+            ..insert("messages", 2)
+        };
+        assert!(!rs.matches_change(&only_channel));
+        assert!(rs.matches_change(&both));
+    }
+
+    #[test]
+    fn empty_changeset_matches_nothing() {
+        let mut rs = ReadSet::new();
+        rs.add_table(TableId::new("messages"));
+        let cs = ChangeSet::new(Lsn(1));
+        assert!(cs.is_empty());
+        assert!(!rs.matches(&cs));
+    }
+
+    // ── Property-based ────────────────────────────────────────────────────
+
+    fn kv_strategy() -> impl Strategy<Value = KeyValue> {
+        prop_oneof![
+            any::<i64>().prop_map(KeyValue::Int),
+            "[a-c]{0,3}".prop_map(KeyValue::Text),
+            any::<bool>().prop_map(KeyValue::Bool),
+            Just(KeyValue::Null),
+        ]
+    }
+
+    fn op_strategy() -> impl Strategy<Value = FilterOp> {
+        prop_oneof![
+            Just(FilterOp::Eq),
+            Just(FilterOp::Gt),
+            Just(FilterOp::Gte),
+            Just(FilterOp::Lt),
+            Just(FilterOp::Lte),
+        ]
+    }
+
+    fn field_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["f0".to_string(), "f1".to_string(), "f2".to_string()])
+    }
+
+    fn table_strategy() -> impl Strategy<Value = TableId> {
+        prop::sample::select(vec!["t0".to_string(), "t1".to_string(), "t2".to_string()])
+            .prop_map(TableId)
+    }
+
+    fn cond_strategy() -> impl Strategy<Value = Cond> {
+        (field_strategy(), op_strategy(), kv_strategy())
+            .prop_map(|(field, op, value)| Cond { field, op, value })
+    }
+
+    fn filter_strategy() -> impl Strategy<Value = Filter> {
+        vec(cond_strategy(), 0..3).prop_map(|conds| Filter { conds })
+    }
+
+    fn row_strategy() -> impl Strategy<Value = RowValues> {
+        vec((field_strategy(), kv_strategy()), 0..4)
+            .prop_map(|pairs| pairs.into_iter().collect())
+    }
+
+    fn opt_row_strategy() -> impl Strategy<Value = Option<RowValues>> {
+        prop::option::of(row_strategy())
+    }
+
+    fn change_strategy() -> impl Strategy<Value = Change> {
+        (
+            table_strategy(),
+            any::<i64>(),
+            prop_oneof![
+                Just(ChangeOp::Insert),
+                Just(ChangeOp::Update),
+                Just(ChangeOp::Delete)
+            ],
+            opt_row_strategy(),
+            opt_row_strategy(),
+        )
+            .prop_map(|(table, k, op, new, old)| Change {
+                table,
+                key: PrimaryKey::single(KeyValue::Int(k)),
+                op,
+                new,
+                old,
+            })
+    }
+
+    fn readset_strategy() -> impl Strategy<Value = ReadSet> {
+        (
+            hash_set(table_strategy(), 0..3),
+            vec((table_strategy(), vec(filter_strategy(), 0..3)), 0..3),
+        )
+            .prop_map(|(tables, filters)| {
+                let mut rs = ReadSet::new();
+                rs.tables = tables;
+                for (t, fs) in filters {
+                    for f in fs {
+                        rs.add_filter(t.clone(), f);
+                    }
+                }
+                rs
+            })
+    }
+
+    fn changeset_strategy() -> impl Strategy<Value = ChangeSet> {
+        vec(change_strategy(), 0..4).prop_map(|changes| ChangeSet {
+            commit_lsn: Lsn(0),
+            changes,
+        })
+    }
+
+    proptest! {
+        // P1: set-level matching is exactly the OR of per-change matching, and a
+        // table wildcard always invalidates a change on that table.
+        #[test]
+        fn p1_matches_is_any_over_changes(rs in readset_strategy(), cs in changeset_strategy()) {
+            let expected = cs.changes.iter().any(|c| rs.matches_change(c));
+            prop_assert_eq!(rs.matches(&cs), expected);
+
+            for c in &cs.changes {
+                if rs.tables.contains(&c.table) {
+                    prop_assert!(rs.matches_change(c));
+                }
+            }
+        }
+
+        // P3: `order` is antisymmetric within a variant, None across variants,
+        // consistent with Eq, and no value satisfies both Gt(x) and Lt(x).
+        #[test]
+        fn p3_order_is_well_behaved(a in kv_strategy(), b in kv_strategy()) {
+            match (a.order(&b), b.order(&a)) {
+                (Some(ab), Some(ba)) => prop_assert_eq!(ab, ba.reverse()),
+                (None, None) => {} // cross-variant (or two Nulls): symmetric None
+                _ => prop_assert!(false, "order not symmetric: {:?} {:?}", a, b),
+            }
+            // Consistent with Eq within a variant.
+            if let Some(ord) = a.order(&b) {
+                prop_assert_eq!(ord == Ordering::Equal, a == b);
+            }
+            // No value can be both > x and < x.
+            let gt = matches!(a.order(&b), Some(Ordering::Greater));
+            let lt = matches!(a.order(&b), Some(Ordering::Less));
+            prop_assert!(!(gt && lt));
+        }
     }
 }

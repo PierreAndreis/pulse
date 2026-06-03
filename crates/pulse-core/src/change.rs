@@ -122,3 +122,107 @@ impl ChangeSet {
         self.changes.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pairs: &[(&str, KeyValue)]) -> RowValues {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn key_value_serde_tag_content() {
+        // The {t, v} tag/content shape must be stable on the wire.
+        let v = KeyValue::Int(7);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "t": "Int", "v": 7 }));
+        let back: KeyValue = serde_json::from_value(json).unwrap();
+        assert_eq!(back, v);
+
+        // Null still carries a tag and round-trips.
+        let null = KeyValue::Null;
+        let json = serde_json::to_value(&null).unwrap();
+        assert_eq!(json, serde_json::json!({ "t": "Null" }));
+        let back: KeyValue = serde_json::from_value(json).unwrap();
+        assert_eq!(back, null);
+    }
+
+    #[test]
+    fn key_value_variants_round_trip() {
+        for v in [
+            KeyValue::Int(-42),
+            KeyValue::Text("hello".into()),
+            KeyValue::Uuid(uuid::Uuid::nil()),
+            KeyValue::Bool(true),
+            KeyValue::Null,
+        ] {
+            let s = serde_json::to_string(&v).unwrap();
+            let back: KeyValue = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn insert_change_round_trips_with_none_old() {
+        let c = Change {
+            new: Some(row(&[("channelId", KeyValue::Text("A".into()))])),
+            ..Change::point(
+                TableId::new("messages"),
+                PrimaryKey::single(KeyValue::Int(1)),
+                ChangeOp::Insert,
+            )
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Change = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+        assert!(back.old.is_none());
+    }
+
+    #[test]
+    fn delete_change_round_trips_with_none_new() {
+        let c = Change {
+            op: ChangeOp::Delete,
+            old: Some(row(&[("channelId", KeyValue::Text("A".into()))])),
+            ..Change::point(
+                TableId::new("messages"),
+                PrimaryKey::single(KeyValue::Int(1)),
+                ChangeOp::Delete,
+            )
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Change = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+        assert!(back.new.is_none());
+    }
+
+    #[test]
+    fn change_serde_default_fills_missing_images() {
+        // `#[serde(default)]` on new/old: a payload omitting them deserializes.
+        let json = serde_json::json!({
+            "table": "messages",
+            "key": [{ "t": "Int", "v": 5 }],
+            "op": "insert"
+        });
+        let c: Change = serde_json::from_value(json).unwrap();
+        assert!(c.new.is_none());
+        assert!(c.old.is_none());
+        assert_eq!(c.op, ChangeOp::Insert);
+    }
+
+    #[test]
+    fn change_set_round_trips() {
+        let mut cs = ChangeSet::new(Lsn(42));
+        cs.push(Change::point(
+            TableId::new("messages"),
+            PrimaryKey::single(KeyValue::Int(1)),
+            ChangeOp::Insert,
+        ));
+        let s = serde_json::to_string(&cs).unwrap();
+        let back: ChangeSet = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, cs);
+    }
+}

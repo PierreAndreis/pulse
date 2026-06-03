@@ -353,3 +353,150 @@ async fn unsubscribe(
         .await;
     StatusCode::OK
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::{HeaderName, HeaderValue};
+
+    #[test]
+    fn status_for_known_and_unknown() {
+        assert_eq!(status_for("UNAUTHORIZED"), StatusCode::UNAUTHORIZED);
+        assert_eq!(status_for("FORBIDDEN"), StatusCode::FORBIDDEN);
+        assert_eq!(status_for("NOT_FOUND"), StatusCode::NOT_FOUND);
+        assert_eq!(status_for("CONFLICT"), StatusCode::CONFLICT);
+        assert_eq!(status_for("RATE_LIMITED"), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status_for("BAD_REQUEST"), StatusCode::BAD_REQUEST);
+
+        // Anything not in the map falls through to 500.
+        assert_eq!(status_for("INTERNAL"), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_for("not_found"), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_for(""), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_for("WHATEVER"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn error_body_shape() {
+        let err = WorkerError {
+            code: "NOT_FOUND".to_string(),
+            data: json!({ "k": "v", "n": 1 }),
+            message: Some("nope".to_string()),
+        };
+        let body = error_body(&err);
+        assert_eq!(
+            body,
+            json!({
+                "error": {
+                    "code": "NOT_FOUND",
+                    "data": { "k": "v", "n": 1 },
+                    "message": "nope"
+                }
+            })
+        );
+
+        // message: None serializes to JSON null; arbitrary data passes through.
+        let err = WorkerError {
+            code: "BAD_REQUEST".to_string(),
+            data: json!([1, 2, 3]),
+            message: None,
+        };
+        let body = error_body(&err);
+        assert_eq!(body["error"]["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["error"]["data"], json!([1, 2, 3]));
+        assert_eq!(body["error"]["message"], Value::Null);
+    }
+
+    #[test]
+    fn collect_headers_skips_non_ascii() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-ok"),
+            HeaderValue::from_static("yes"),
+        );
+        // A value with bytes that to_str() (ASCII) rejects: it should be skipped.
+        headers.insert(
+            HeaderName::from_static("x-bad"),
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+
+        let out = collect_headers(&headers);
+        assert_eq!(out.get("x-ok").map(String::as_str), Some("yes"));
+        assert!(!out.contains_key("x-bad"), "non-ascii header must be dropped");
+    }
+
+    #[test]
+    fn collect_headers_duplicate_last_wins() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_static("x-dup"),
+            HeaderValue::from_static("first"),
+        );
+        headers.append(
+            HeaderName::from_static("x-dup"),
+            HeaderValue::from_static("second"),
+        );
+
+        let out = collect_headers(&headers);
+        // HashMap insert overwrites, iterating in order → last value wins.
+        assert_eq!(out.get("x-dup").map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn rpc_request_defaults() {
+        let req: RpcRequest = serde_json::from_value(json!({ "path": ["a"] })).unwrap();
+        assert_eq!(req.path, vec!["a".to_string()]);
+        assert_eq!(req.input, Value::Null);
+        assert_eq!(req.mutation_id, None);
+    }
+
+    #[test]
+    fn rpc_request_mutation_id_camel_case() {
+        let req: RpcRequest = serde_json::from_value(json!({
+            "path": ["a", "b"],
+            "input": { "x": 1 },
+            "mutationId": "m-123"
+        }))
+        .unwrap();
+        assert_eq!(req.path, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(req.input, json!({ "x": 1 }));
+        assert_eq!(req.mutation_id, Some("m-123".to_string()));
+    }
+
+    #[test]
+    fn rpc_request_path_must_be_array() {
+        let res: Result<RpcRequest, _> = serde_json::from_value(json!({ "path": "a" }));
+        assert!(res.is_err(), "non-array path must fail to deserialize");
+    }
+
+    #[test]
+    fn subscribe_req_defaults_and_camel_case() {
+        let req: SubscribeReq = serde_json::from_value(json!({
+            "clientId": "c1",
+            "sub": "s1",
+            "path": ["a"]
+        }))
+        .unwrap();
+        assert_eq!(req.client_id, "c1");
+        assert_eq!(req.sub, "s1");
+        assert_eq!(req.path, vec!["a".to_string()]);
+        // input defaults to Null.
+        assert_eq!(req.input, Value::Null);
+
+        // snake_case client_id is rejected (rename means only camelCase maps).
+        let res: Result<SubscribeReq, _> = serde_json::from_value(json!({
+            "client_id": "c1",
+            "sub": "s1",
+            "path": ["a"]
+        }));
+        assert!(res.is_err(), "client_id requires camelCase clientId");
+    }
+
+    #[test]
+    fn sync_query_camel_case() {
+        let q: SyncQuery = serde_json::from_value(json!({ "clientId": "c1" })).unwrap();
+        assert_eq!(q.client_id, "c1");
+
+        let res: Result<SyncQuery, _> = serde_json::from_value(json!({ "client_id": "c1" }));
+        assert!(res.is_err(), "clientId is required (camelCase)");
+    }
+}

@@ -57,3 +57,42 @@ impl fmt::Display for SubscriptionId {
         f.write_str(&self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procedure_kind_predicates() {
+        assert!(ProcedureKind::Reactive.is_reactive());
+        assert!(!ProcedureKind::Mutation.is_reactive());
+        assert!(!ProcedureKind::Analytical.is_reactive());
+        assert!(!ProcedureKind::Action.is_reactive());
+
+        assert!(ProcedureKind::Mutation.is_write());
+        assert!(!ProcedureKind::Reactive.is_write());
+        assert!(!ProcedureKind::Analytical.is_write());
+        assert!(!ProcedureKind::Action.is_write());
+
+        assert!(ProcedureKind::Reactive.is_deterministic());
+        assert!(ProcedureKind::Mutation.is_deterministic());
+        assert!(!ProcedureKind::Analytical.is_deterministic());
+        assert!(!ProcedureKind::Action.is_deterministic());
+    }
+
+    #[test]
+    fn procedure_kind_serde_lowercase() {
+        let json = serde_json::to_string(&ProcedureKind::Reactive).unwrap();
+        assert_eq!(json, "\"reactive\"");
+        let back: ProcedureKind = serde_json::from_str("\"mutation\"").unwrap();
+        assert_eq!(back, ProcedureKind::Mutation);
+    }
+
+    #[test]
+    fn procedure_path_display() {
+        let path = ProcedurePath::new(["messages", "list"]);
+        assert_eq!(path.to_string(), "messages.list");
+        let single = ProcedurePath::new(["health"]);
+        assert_eq!(single.to_string(), "health");
+    }
+}
