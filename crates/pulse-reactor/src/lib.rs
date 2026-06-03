@@ -40,12 +40,16 @@ pub struct Subscription {
 /// function runtime (e.g. `pulse-jsruntime::Worker`).
 #[async_trait]
 pub trait ReExecutor: Send + Sync {
+    /// Re-run a procedure, returning its result AND the fresh read-set captured
+    /// during that run. The reactor stores the new read-set so a query's
+    /// dependencies stay current as the data it reads changes (e.g. a join that
+    /// starts referencing a newly-inserted row).
     async fn exec(
         &self,
         path: Vec<String>,
         input: Value,
         headers: HashMap<String, String>,
-    ) -> Result<Value, String>;
+    ) -> Result<(Value, ReadSet), String>;
 }
 
 /// The reactor surface used by the HTTP layer.
@@ -142,8 +146,11 @@ impl InMemoryReactor {
         while let Some(joined) = set.join_next().await {
             let Ok((sub, result)) = joined else { continue }; // task panic → skip
             match result {
-                Ok(value) => {
-                    if !self.record_value(&sub.client_id, &sub.sub, &value).await {
+                Ok((value, read_set)) => {
+                    if !self
+                        .record_value(&sub.client_id, &sub.sub, &value, read_set)
+                        .await
+                    {
                         continue; // unchanged result → no redundant push
                     }
                     if !self
@@ -160,12 +167,20 @@ impl InMemoryReactor {
         }
     }
 
-    /// True if `value` differs from the subscription's last pushed value (and
-    /// records it). Skips byte-identical recomputations.
-    async fn record_value(&self, client_id: &str, sub: &str, value: &Value) -> bool {
+    /// Refresh the subscription's read-set from the latest run (so dependencies
+    /// track the data), and report whether `value` differs from the last pushed
+    /// value (recording it). Skips byte-identical recomputations.
+    async fn record_value(
+        &self,
+        client_id: &str,
+        sub: &str,
+        value: &Value,
+        read_set: ReadSet,
+    ) -> bool {
         let mut subs = self.subs.lock().await;
         match subs.get_mut(&sub_key(client_id, sub)) {
             Some(s) => {
+                s.read_set = read_set; // dependencies may have changed since last run
                 if s.last.as_ref() == Some(value) {
                     false
                 } else {
@@ -248,10 +263,13 @@ mod tests {
             _path: Vec<String>,
             _input: Value,
             _headers: HashMap<String, String>,
-        ) -> Result<Value, String> {
+        ) -> Result<(Value, ReadSet), String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // Return a fresh value each call so the diff never suppresses the push.
-            Ok(json!({ "n": self.calls.load(Ordering::SeqCst) }))
+            Ok((
+                json!({ "n": self.calls.load(Ordering::SeqCst) }),
+                ReadSet::new(),
+            ))
         }
     }
 
@@ -344,9 +362,9 @@ mod tests {
             _path: Vec<String>,
             input: Value,
             _headers: HashMap<String, String>,
-        ) -> Result<Value, String> {
+        ) -> Result<(Value, ReadSet), String> {
             self.barrier.wait().await; // only releases once all N are here
-            Ok(input)
+            Ok((input, ReadSet::new()))
         }
     }
 
@@ -392,8 +410,11 @@ mod tests {
             _path: Vec<String>,
             _input: Value,
             _headers: HashMap<String, String>,
-        ) -> Result<Value, String> {
-            Ok(json!({ "n": self.n.fetch_add(1, Ordering::SeqCst) }))
+        ) -> Result<(Value, ReadSet), String> {
+            Ok((
+                json!({ "n": self.n.fetch_add(1, Ordering::SeqCst) }),
+                ReadSet::new(),
+            ))
         }
     }
 

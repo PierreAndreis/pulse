@@ -28,6 +28,8 @@ export type {
   DatabaseWriter,
   QueryBuilder,
   IndexRangeBuilder,
+  FilterBuilder,
+  FilterCond,
   SqlTag,
   ActionRunner,
   KindContext,

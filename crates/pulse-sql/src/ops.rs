@@ -26,21 +26,36 @@ pub enum SqlError {
 #[serde(rename_all = "lowercase")]
 pub enum PredOp {
     Eq,
+    Neq,
     Gt,
     Gte,
     Lt,
     Lte,
+    Like,
+    Ilike,
+    IsNull,
+    IsNotNull,
 }
 
 impl PredOp {
     fn sql(self) -> &'static str {
         match self {
             PredOp::Eq => "=",
+            PredOp::Neq => "<>",
             PredOp::Gt => ">",
             PredOp::Gte => ">=",
             PredOp::Lt => "<",
             PredOp::Lte => "<=",
+            PredOp::Like => "LIKE",
+            PredOp::Ilike => "ILIKE",
+            PredOp::IsNull => "IS NULL",
+            PredOp::IsNotNull => "IS NOT NULL",
         }
+    }
+
+    /// Unary operators take no right-hand operand (no bind placeholder).
+    fn is_unary(self) -> bool {
+        matches!(self, PredOp::IsNull | PredOp::IsNotNull)
     }
 }
 
@@ -51,11 +66,31 @@ pub struct Predicate {
     pub value: Value,
 }
 
+/// A boolean filter expression tree from `.filter(q => ...)`: a leaf comparison,
+/// or `and`/`or` of sub-expressions. Lowered to a SQL `WHERE` clause and, for
+/// reactivity, to disjunctive normal form (an OR of AND-groups) that the read-set
+/// records as multiple `Filter`s — so `OR`/`IN` keep precise invalidation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum FilterExpr {
+    And { and: Vec<FilterExpr> },
+    Or { or: Vec<FilterExpr> },
+    Cmp(Predicate),
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Order {
     Asc,
     Desc,
+}
+
+/// One sort key. `field` defaults to `_creationTime` when absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderKey {
+    #[serde(default)]
+    pub field: Option<String>,
+    pub dir: Order,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -65,6 +100,29 @@ pub enum QueryMode {
     Collect,
     First,
     Unique,
+}
+
+/// A reactive aggregate over the query's filtered rows. `count` ignores `field`;
+/// `sum` requires a numeric one. Reactivity reuses the query's filter read-set:
+/// any change to a matching row re-runs and recomputes the scalar.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggFn {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Agg {
+    pub func: AggFn,
+    #[serde(default)]
+    pub field: Option<String>,
+    /// `count(distinct field)` when true (count only).
+    #[serde(default)]
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,10 +136,22 @@ pub enum DbOp {
         table: String,
         #[serde(default)]
         predicates: Vec<Predicate>,
+        /// Rich filter trees from `.filter(q => ...)` (supports and/or/in). ANDed
+        /// with `predicates`. Lowered to SQL + a DNF read-set for precise OR reactivity.
         #[serde(default)]
-        order: Option<Order>,
+        filters: Vec<FilterExpr>,
+        /// Sort keys (multi-column). Empty → unordered; each defaults to _creationTime.
+        #[serde(default, rename = "orderBy")]
+        order_by: Vec<OrderKey>,
         #[serde(default)]
         limit: Option<i64>,
+        /// Rows to skip for offset pagination (applied with `limit`).
+        #[serde(default)]
+        offset: Option<i64>,
+        /// When set, return a single aggregate scalar over the filtered rows
+        /// instead of the rows themselves (order/limit/offset are ignored).
+        #[serde(default)]
+        aggregate: Option<Agg>,
         mode: QueryMode,
     },
     Insert {
@@ -238,14 +308,105 @@ async fn fetch_rows(
     rows.iter().map(|r| row_to_json(r, t)).collect()
 }
 
-fn pred_op_to_filter(op: PredOp) -> FilterOp {
-    match op {
+/// Bind text params (same scheme as `fetch_rows`) and read a single i64 scalar
+/// (e.g. `count(*)`).
+async fn fetch_scalar_i64(
+    conn: &mut PgConnection,
+    sql: &str,
+    binds: &[Option<String>],
+) -> Result<i64, SqlError> {
+    let mut q = sqlx::query_scalar::<_, i64>(sql);
+    for b in binds {
+        q = q.bind(b.clone());
+    }
+    Ok(q.fetch_one(conn).await?)
+}
+
+/// Bind text params and read a single f64 scalar (e.g. `sum(field)` cast to double).
+async fn fetch_scalar_f64(
+    conn: &mut PgConnection,
+    sql: &str,
+    binds: &[Option<String>],
+) -> Result<f64, SqlError> {
+    let mut q = sqlx::query_scalar::<_, f64>(sql);
+    for b in binds {
+        q = q.bind(b.clone());
+    }
+    Ok(q.fetch_one(conn).await?)
+}
+
+/// Bind text params and read a single nullable f64 (e.g. `min`/`max`/`avg`, which
+/// are NULL over an empty set).
+async fn fetch_scalar_opt_f64(
+    conn: &mut PgConnection,
+    sql: &str,
+    binds: &[Option<String>],
+) -> Result<Option<f64>, SqlError> {
+    let mut q = sqlx::query_scalar::<_, Option<f64>>(sql);
+    for b in binds {
+        q = q.bind(b.clone());
+    }
+    Ok(q.fetch_one(conn).await?)
+}
+
+/// Render a filter expression tree to a parenthesized SQL boolean, pushing binds.
+fn render_expr(
+    e: &FilterExpr,
+    t: &Table,
+    binds: &mut Vec<Option<String>>,
+) -> Result<String, SqlError> {
+    match e {
+        FilterExpr::Cmp(p) => {
+            let col = column(t, &p.field)?;
+            if p.op.is_unary() {
+                return Ok(format!("{} {}", col.column, p.op.sql()));
+            }
+            binds.push(json_to_bind(&p.value, col));
+            Ok(format!(
+                "{} {} ${}::{}",
+                col.column,
+                p.op.sql(),
+                binds.len(),
+                col.type_class.cast()
+            ))
+        }
+        FilterExpr::And { and } => {
+            if and.is_empty() {
+                return Ok("true".to_string());
+            }
+            let parts = and
+                .iter()
+                .map(|c| render_expr(c, t, binds))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("({})", parts.join(" AND ")))
+        }
+        FilterExpr::Or { or } => {
+            if or.is_empty() {
+                return Ok("false".to_string());
+            }
+            let parts = or
+                .iter()
+                .map(|c| render_expr(c, t, binds))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("({})", parts.join(" OR ")))
+        }
+    }
+}
+
+/// Map a predicate op to its read-set matcher op. `None` for ops the matcher
+/// can't analyze precisely (`IS NULL`/`IS NOT NULL`) — the caller broadens.
+fn pred_op_to_filter(op: PredOp) -> Option<FilterOp> {
+    Some(match op {
         PredOp::Eq => FilterOp::Eq,
+        PredOp::Neq => FilterOp::Neq,
         PredOp::Gt => FilterOp::Gt,
         PredOp::Gte => FilterOp::Gte,
         PredOp::Lt => FilterOp::Lt,
         PredOp::Lte => FilterOp::Lte,
-    }
+        PredOp::Like => FilterOp::Like,
+        PredOp::Ilike => FilterOp::Ilike,
+        PredOp::IsNull | PredOp::IsNotNull => return None,
+    })
 }
 
 /// Coerce a JSON predicate value to a `KeyValue` for the column, decoding ids.
@@ -275,6 +436,90 @@ fn json_to_key_value(value: &Value, col: &Column) -> Option<KeyValue> {
     }
 }
 
+/// Cap on DNF size — a filter expanding past this falls back to a coarse
+/// table-level read rather than recording a huge OR of filters.
+const DNF_CAP: usize = 64;
+
+/// One coercible comparison as a single-conjunction DNF. An uncoercible value
+/// (null / float / jsonb) becomes the empty conjunction (`TRUE`): in an AND it
+/// drops out (broadening), in an OR it makes the branch match-all (→ coarse).
+fn cmp_dnf(t: &Table, field: &str, op: PredOp, value: &Value) -> Vec<Vec<Cond>> {
+    // Ops the matcher can't analyze (IS NULL / IS NOT NULL) → match-all term: in
+    // an AND it drops (still precise on siblings), in an OR it broadens to coarse.
+    let Some(fop) = pred_op_to_filter(op) else {
+        return vec![vec![]];
+    };
+    match t
+        .column_by_field(field)
+        .and_then(|col| json_to_key_value(value, col))
+    {
+        Some(v) => vec![vec![Cond {
+            field: field.to_string(),
+            op: fop,
+            value: v,
+        }]],
+        None => vec![vec![]],
+    }
+}
+
+/// AND two DNFs (distribute): cartesian product of their conjunctions.
+fn and_dnf(a: Vec<Vec<Cond>>, b: &[Vec<Cond>]) -> Option<Vec<Vec<Cond>>> {
+    let mut out = Vec::new();
+    for x in &a {
+        for y in b {
+            let mut conj = x.clone();
+            conj.extend(y.iter().cloned());
+            out.push(conj);
+            if out.len() > DNF_CAP {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// DNF of a filter expression. `None` if it would exceed {@link DNF_CAP}.
+fn expr_dnf(t: &Table, e: &FilterExpr) -> Option<Vec<Vec<Cond>>> {
+    match e {
+        FilterExpr::Cmp(p) => Some(cmp_dnf(t, &p.field, p.op, &p.value)),
+        FilterExpr::And { and } => {
+            let mut dnf = vec![Vec::new()];
+            for c in and {
+                dnf = and_dnf(dnf, &expr_dnf(t, c)?)?;
+            }
+            Some(dnf)
+        }
+        FilterExpr::Or { or } => {
+            let mut out = Vec::new();
+            for c in or {
+                for conj in expr_dnf(t, c)? {
+                    out.push(conj);
+                    if out.len() > DNF_CAP {
+                        return None;
+                    }
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// DNF for a whole query: `predicates` (flat AND) AND each `filters` tree.
+fn query_dnf(
+    t: &Table,
+    predicates: &[Predicate],
+    filters: &[FilterExpr],
+) -> Option<Vec<Vec<Cond>>> {
+    let mut dnf = vec![Vec::new()]; // TRUE
+    for p in predicates {
+        dnf = and_dnf(dnf, &cmp_dnf(t, &p.field, p.op, &p.value))?;
+    }
+    for f in filters {
+        dnf = and_dnf(dnf, &expr_dnf(t, f)?)?;
+    }
+    Some(dnf)
+}
+
 /// Fold the reads performed by `op` into `rs` (precise where analyzable, coarse
 /// table-wildcard otherwise — never a miss).
 pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
@@ -289,10 +534,11 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
         DbOp::Query {
             table: name,
             predicates,
+            filters,
             ..
         } => {
             let tid = TableId::new(name.clone());
-            if predicates.is_empty() {
+            if predicates.is_empty() && filters.is_empty() {
                 rs.add_table(tid); // full-table read
                 return;
             }
@@ -300,20 +546,18 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
                 rs.add_table(tid);
                 return;
             };
-            let mut conds = Vec::new();
-            for p in predicates {
-                if let Some(col) = t.column_by_field(&p.field) {
-                    if let Some(value) = json_to_key_value(&p.value, col) {
-                        conds.push(Cond {
-                            field: p.field.clone(),
-                            op: pred_op_to_filter(p.op),
-                            value,
-                        });
+            // Convert predicates + filter trees to DNF. Each conjunction becomes a
+            // precise `Filter` (an OR across them). An empty conjunction means
+            // "match anything" (uncoercible value), and `None` means it grew past
+            // the cap — both fall back to a coarse table read (never a miss).
+            match query_dnf(t, predicates, filters) {
+                Some(dnf) if !dnf.is_empty() && !dnf.iter().any(|c| c.is_empty()) => {
+                    for conds in dnf {
+                        rs.add_filter(tid.clone(), Filter { conds });
                     }
-                    // unbuildable cond dropped → filter broadens (still safe)
                 }
+                _ => rs.add_table(tid),
             }
-            rs.add_filter(tid, Filter { conds });
         }
         DbOp::Raw { .. } => {
             // Raw SQL reads are opaque → conservatively depend on every table.
@@ -459,37 +703,106 @@ pub async fn execute_op(
         DbOp::Query {
             table: name,
             predicates,
-            order,
+            filters,
+            order_by,
             limit,
+            offset,
+            aggregate,
             mode,
         } => {
             let t = table(catalog, name)?;
-            let mut sql = format!("SELECT {} FROM {}", t.select_list(), name);
-            let mut binds: Vec<Option<String>> = Vec::new();
 
-            if !predicates.is_empty() {
-                let mut clauses = Vec::new();
-                for p in predicates {
-                    let col = column(t, &p.field)?;
-                    binds.push(json_to_bind(&p.value, col));
-                    clauses.push(format!(
-                        "{} {} ${}::{}",
-                        col.column,
-                        p.op.sql(),
-                        binds.len(),
-                        col.type_class.cast()
-                    ));
+            // Shared WHERE clause + binds: flat `predicates` (from withIndex) AND
+            // the rich filter trees (from `.filter(q => ...)`, supports and/or/in).
+            let mut where_sql = String::new();
+            let mut binds: Vec<Option<String>> = Vec::new();
+            let mut clauses: Vec<String> = Vec::new();
+            for p in predicates {
+                let col = column(t, &p.field)?;
+                if p.op.is_unary() {
+                    clauses.push(format!("{} {}", col.column, p.op.sql()));
+                    continue;
                 }
-                sql.push_str(" WHERE ");
-                sql.push_str(&clauses.join(" AND "));
+                binds.push(json_to_bind(&p.value, col));
+                clauses.push(format!(
+                    "{} {} ${}::{}",
+                    col.column,
+                    p.op.sql(),
+                    binds.len(),
+                    col.type_class.cast()
+                ));
+            }
+            for f in filters {
+                clauses.push(render_expr(f, t, &mut binds)?);
+            }
+            if !clauses.is_empty() {
+                where_sql = format!(" WHERE {}", clauses.join(" AND "));
             }
 
-            if let Some(ord) = order {
-                let dir = match ord {
-                    Order::Asc => "ASC",
-                    Order::Desc => "DESC",
+            // Aggregate path: one scalar over the filtered rows. order/limit/offset
+            // don't apply. Reactivity is unchanged — `capture_reads` folds the same
+            // filters into the read-set, so a matching write recomputes it. count/sum
+            // are 0 over an empty set; min/max/avg are null.
+            if let Some(agg) = aggregate {
+                let value = match agg.func {
+                    AggFn::Count => {
+                        // count(distinct field) when requested, else count(*).
+                        let expr = match (agg.distinct, agg.field.as_deref()) {
+                            (true, Some(f)) => format!("count(distinct {})", column(t, f)?.column),
+                            _ => "count(*)".to_string(),
+                        };
+                        let sql = format!("SELECT {expr}::bigint FROM {name}{where_sql}");
+                        json!(fetch_scalar_i64(&mut *conn, &sql, &binds).await?)
+                    }
+                    AggFn::Sum => {
+                        let col = column(t, agg.field.as_deref().unwrap_or_default())?;
+                        let sql = format!(
+                            "SELECT coalesce(sum({}), 0)::double precision FROM {name}{where_sql}",
+                            col.column
+                        );
+                        json!(fetch_scalar_f64(&mut *conn, &sql, &binds).await?)
+                    }
+                    // min/max/avg are NULL over an empty set → returned as null.
+                    AggFn::Min | AggFn::Max | AggFn::Avg => {
+                        let f = match agg.func {
+                            AggFn::Min => "min",
+                            AggFn::Max => "max",
+                            _ => "avg",
+                        };
+                        let col = column(t, agg.field.as_deref().unwrap_or_default())?;
+                        let sql = format!(
+                            "SELECT {f}({})::double precision FROM {name}{where_sql}",
+                            col.column
+                        );
+                        match fetch_scalar_opt_f64(&mut *conn, &sql, &binds).await? {
+                            Some(n) => json!(n),
+                            None => Value::Null,
+                        }
+                    }
                 };
-                sql.push_str(&format!(" ORDER BY _creation_time {dir}"));
+                return Ok((value, None));
+            }
+
+            // Row path.
+            let mut sql = format!("SELECT {} FROM {}{}", t.select_list(), name, where_sql);
+
+            // Multi-column ORDER BY. Ordering doesn't change which rows are read,
+            // so the read-set / reactivity is unaffected. Each key resolves its
+            // field against the catalog, defaulting to creation time.
+            if !order_by.is_empty() {
+                let mut keys = Vec::new();
+                for k in order_by {
+                    let col = match &k.field {
+                        Some(field) => column(t, field)?.column.as_str(),
+                        None => "_creation_time",
+                    };
+                    let dir = match k.dir {
+                        Order::Asc => "ASC",
+                        Order::Desc => "DESC",
+                    };
+                    keys.push(format!("{col} {dir}"));
+                }
+                sql.push_str(&format!(" ORDER BY {}", keys.join(", ")));
             }
 
             match mode {
@@ -501,6 +814,14 @@ pub async fn execute_op(
                 QueryMode::First => sql.push_str(" LIMIT 1"),
                 QueryMode::Unique => sql.push_str(" LIMIT 2"),
                 QueryMode::Collect => {}
+            }
+
+            // Offset pagination (applied after LIMIT in SQL text; Postgres allows
+            // OFFSET with or without LIMIT). Only meaningful with a stable order.
+            if let Some(n) = offset {
+                if *n > 0 {
+                    sql.push_str(&format!(" OFFSET {n}"));
+                }
             }
 
             let rows = fetch_rows(&mut *conn, &sql, &binds, t).await?;

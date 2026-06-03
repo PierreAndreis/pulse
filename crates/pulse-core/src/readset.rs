@@ -27,10 +27,15 @@ pub struct IndexRange {
 #[serde(rename_all = "lowercase")]
 pub enum FilterOp {
     Eq,
+    Neq,
     Gt,
     Gte,
     Lt,
     Lte,
+    /// SQL `LIKE` (case-sensitive) — `%` = any run, `_` = one char.
+    Like,
+    /// SQL `ILIKE` (case-insensitive).
+    Ilike,
 }
 
 /// One analyzed predicate: `field <op> value`.
@@ -69,6 +74,7 @@ fn eval(cond: &Cond, row: &RowValues) -> bool {
         None => true,
         Some(v) => match cond.op {
             FilterOp::Eq => v == &cond.value,
+            FilterOp::Neq => v != &cond.value,
             FilterOp::Gt => matches!(v.order(&cond.value), Some(Ordering::Greater)),
             FilterOp::Gte => matches!(
                 v.order(&cond.value),
@@ -76,8 +82,47 @@ fn eval(cond: &Cond, row: &RowValues) -> bool {
             ),
             FilterOp::Lt => matches!(v.order(&cond.value), Some(Ordering::Less)),
             FilterOp::Lte => matches!(v.order(&cond.value), Some(Ordering::Less | Ordering::Equal)),
+            FilterOp::Like => like_match(v, &cond.value, false),
+            FilterOp::Ilike => like_match(v, &cond.value, true),
         },
     }
+}
+
+/// SQL `LIKE`/`ILIKE` match between two text values (`%` = any run incl. empty,
+/// `_` = exactly one char). Non-text values never match.
+fn like_match(value: &KeyValue, pattern: &KeyValue, case_insensitive: bool) -> bool {
+    let (KeyValue::Text(s), KeyValue::Text(p)) = (value, pattern) else {
+        return false;
+    };
+    if case_insensitive {
+        like_is_match(&s.to_lowercase(), &p.to_lowercase())
+    } else {
+        like_is_match(s, p)
+    }
+}
+
+/// SQL LIKE pattern match (no escape handling). DP over chars.
+fn like_is_match(s: &str, p: &str) -> bool {
+    let s: Vec<char> = s.chars().collect();
+    let p: Vec<char> = p.chars().collect();
+    let (n, m) = (s.len(), p.len());
+    let mut dp = vec![vec![false; m + 1]; n + 1];
+    dp[0][0] = true;
+    for j in 1..=m {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && s[i - 1] == c,
+            };
+        }
+    }
+    dp[n][m]
 }
 
 fn filter_matches(filter: &Filter, change: &Change) -> bool {
@@ -221,6 +266,121 @@ mod tests {
         };
         assert!(rs.matches_change(&into_a)); // same channel → match
         assert!(!rs.matches_change(&into_b)); // foreign channel → pruned
+    }
+
+    #[test]
+    fn neq_filter_prunes_equal_rows() {
+        // Read todos WHERE done <> false (i.e. the done ones).
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("todos"),
+            Filter {
+                conds: vec![Cond {
+                    field: "done".into(),
+                    op: FilterOp::Neq,
+                    value: KeyValue::Bool(false),
+                }],
+            },
+        );
+        let done = Change {
+            new: Some(row(&[("done", KeyValue::Bool(true))])),
+            ..insert("todos", 1)
+        };
+        let not_done = Change {
+            new: Some(row(&[("done", KeyValue::Bool(false))])),
+            ..insert("todos", 2)
+        };
+        assert!(rs.matches_change(&done)); // done=true ≠ false → in the result → match
+        assert!(!rs.matches_change(&not_done)); // done=false → excluded → pruned
+    }
+
+    #[test]
+    fn like_filter_matches_pattern_precisely() {
+        let mk = |op: FilterOp| {
+            let mut rs = ReadSet::new();
+            rs.add_filter(
+                TableId::new("todos"),
+                Filter {
+                    conds: vec![Cond {
+                        field: "title".into(),
+                        op,
+                        value: KeyValue::Text("%ppl%".into()),
+                    }],
+                },
+            );
+            rs
+        };
+        let title = |s: &str| Change {
+            new: Some(row(&[("title", KeyValue::Text(s.into()))])),
+            ..insert("todos", 1)
+        };
+        let rs = mk(FilterOp::Like);
+        assert!(rs.matches_change(&title("apple"))); // contains "ppl"
+        assert!(!rs.matches_change(&title("grape"))); // does not
+        assert!(!rs.matches_change(&title("APPLE"))); // case-sensitive LIKE
+        let ci = mk(FilterOp::Ilike);
+        assert!(ci.matches_change(&title("APPLE"))); // ILIKE is case-insensitive
+    }
+
+    #[test]
+    fn multi_cond_filter_requires_all_to_match() {
+        // done = false AND priority > 5 — a change must satisfy BOTH to invalidate.
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("todos"),
+            Filter {
+                conds: vec![
+                    Cond {
+                        field: "done".into(),
+                        op: FilterOp::Eq,
+                        value: KeyValue::Bool(false),
+                    },
+                    Cond {
+                        field: "priority".into(),
+                        op: FilterOp::Gt,
+                        value: KeyValue::Int(5),
+                    },
+                ],
+            },
+        );
+        let both = Change {
+            new: Some(row(&[
+                ("done", KeyValue::Bool(false)),
+                ("priority", KeyValue::Int(9)),
+            ])),
+            ..insert("todos", 1)
+        };
+        let only_one = Change {
+            new: Some(row(&[
+                ("done", KeyValue::Bool(false)),
+                ("priority", KeyValue::Int(3)),
+            ])),
+            ..insert("todos", 2)
+        };
+        assert!(rs.matches_change(&both)); // both conds hold → in result → match
+        assert!(!rs.matches_change(&only_one)); // priority fails → pruned
+    }
+
+    #[test]
+    fn neq_with_absent_field_matches_conservatively() {
+        // A change image that doesn't carry the filtered field must conservatively
+        // invalidate (never a missed update) rather than be wrongly pruned.
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("todos"),
+            Filter {
+                conds: vec![Cond {
+                    field: "done".into(),
+                    op: FilterOp::Neq,
+                    value: KeyValue::Bool(false),
+                }],
+            },
+        );
+        let absent = Change {
+            new: Some(row(&[("title", KeyValue::Text("x".into()))])),
+            ..insert("todos", 1)
+        };
+        assert!(rs.matches_change(&absent));
     }
 
     #[test]
