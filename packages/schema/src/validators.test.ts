@@ -48,4 +48,75 @@ describe("validators — parse", () => {
       optional: [],
     });
   });
+
+  it("any passes through any value and describes itself", () => {
+    const val = v.any();
+    const payload = { nested: [1, "two", null] };
+    expect(val.parse(payload)).toBe(payload);
+    expect(val.parse(42)).toBe(42);
+    expect(val.describe()).toEqual({ kind: "any" });
+  });
+
+  it("literal accepts the exact value, rejects others, and describes", () => {
+    const val = v.literal("admin");
+    expect(val.parse("admin")).toBe("admin");
+    expect(() => val.parse("member")).toThrow(ValidationError);
+    expect(val.describe()).toEqual({ kind: "literal", value: "admin" });
+  });
+
+  it("id accepts strings, rejects non-strings, and describes its table", () => {
+    const val = v.id("users");
+    expect(val.parse("u_123")).toBe("u_123");
+    expect(() => val.parse(123)).toThrow(ValidationError);
+    expect(val.describe()).toEqual({ kind: "id", table: "users" });
+  });
+
+  it("doc accepts objects, rejects non-objects, and describes its table", () => {
+    const val = v.doc("messages");
+    const row = { id: "m_1", body: "hi" };
+    expect(val.parse(row)).toBe(row);
+    expect(() => val.parse(null)).toThrow(ValidationError);
+    expect(() => val.parse("not-a-doc")).toThrow(ValidationError);
+    expect(val.describe()).toEqual({ kind: "doc", table: "messages" });
+  });
+
+  it("collab passes its opaque value through and describes itself", () => {
+    const val = v.collab();
+    const state = "base64state==";
+    expect(val.parse(state)).toBe(state);
+    expect(val.describe()).toEqual({ kind: "collab" });
+  });
+
+  it("optional yields undefined for missing values and delegates otherwise", () => {
+    const val = v.optional(v.number());
+    expect(val.parse(undefined)).toBeUndefined();
+    expect(val.parse(5)).toBe(5);
+    expect(val.optionality).toBe("optional");
+    expect(() => val.parse("nope")).toThrow(ValidationError);
+    expect(val.describe()).toEqual({ kind: "optional", inner: { kind: "number" } });
+  });
+
+  it("object rejects non-object inputs at the current path", () => {
+    const val = v.object({ a: v.string() });
+    for (const bad of [42, "str", null, [1, 2]]) {
+      try {
+        val.parse(bad);
+        throw new Error("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        expect((e as ValidationError).path).toEqual([]);
+      }
+    }
+  });
+
+  it("nested object reports the failing inner field path", () => {
+    const val = v.object({ user: v.object({ name: v.string() }) });
+    try {
+      val.parse({ user: { name: 99 } });
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      expect((e as ValidationError).path).toEqual(["user", "name"]);
+    }
+  });
 });

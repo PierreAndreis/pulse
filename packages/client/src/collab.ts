@@ -2,12 +2,12 @@ import * as Y from "yjs";
 import { rpcCall, type ClientOptions } from "./transport.js";
 
 /** Base64 <-> bytes (browser + node). */
-function toB64(bytes: Uint8Array): string {
+export function toB64(bytes: Uint8Array): string {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
   return typeof btoa !== "undefined" ? btoa(bin) : Buffer.from(bytes).toString("base64");
 }
-function fromB64(s: string): Uint8Array {
+export function fromB64(s: string): Uint8Array {
   if (typeof atob !== "undefined") {
     const bin = atob(s);
     const out = new Uint8Array(bin.length);

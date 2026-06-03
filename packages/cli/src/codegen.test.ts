@@ -58,6 +58,40 @@ describe("generateDataModel", () => {
   });
 });
 
+describe("tsType scalar + composite arms", () => {
+  const out = generateDataModel(
+    defineSchema({
+      things: defineTable({
+        flag: v.boolean(),
+        nothing: v.null(),
+        whatever: v.any(),
+        tags: v.array(v.string()),
+        kind: v.literal("x"),
+        meta: v.object({ a: v.string(), b: v.optional(v.number()) }),
+        rows: v.array(v.object({ a: v.string(), b: v.optional(v.number()) })),
+        owner: v.doc("users"),
+      }),
+    }),
+  );
+
+  it("maps boolean/null/any/array(string)/literal to precise TS types", () => {
+    expect(out).toContain("flag: boolean;");
+    expect(out).toContain("nothing: null;");
+    expect(out).toContain("whatever: unknown;");
+    expect(out).toContain("tags: string[];");
+    expect(out).toContain('kind: "x";');
+  });
+
+  it("renders object fields with optional members and recurses through arrays", () => {
+    expect(out).toContain("meta: { a: string; b?: number };");
+    expect(out).toContain("rows: { a: string; b?: number }[];");
+  });
+
+  it("maps v.doc to a Doc<...> reference", () => {
+    expect(out).toContain('owner: Doc<"users">;');
+  });
+});
+
 describe("generateDDL", () => {
   const ddl = generateDDL(schema);
 

@@ -24,3 +24,5 @@ uuid = { workspace = true }
 pulse-core = { workspace = true }
 yrs = "0.26"
 base64 = "0.22"
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }

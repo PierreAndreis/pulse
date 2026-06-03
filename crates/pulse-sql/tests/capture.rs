@@ -1,14 +1,23 @@
 //! DB-backed test: does `capture_reads` build a precise filter that prunes a
-//! foreign-channel change? Requires the dev Postgres (skips if unreachable).
+//! foreign-channel change, when driven by a catalog from the REAL `introspect`?
+//!
+//! The pure read-set logic is unit-tested in `src/ops.rs` against a hand-built
+//! catalog; this test exists to pin the `introspect` boundary — that the column
+//! shape `introspect` derives from Postgres feeds `capture_reads` correctly.
+//! It runs against an ephemeral Postgres container (see `common`) and seeds its
+//! own schema, so it is hermetic and skips entirely if Docker is unavailable.
+
+mod common;
 
 use std::collections::HashMap;
 
 use pulse_core::{Change, ChangeOp, KeyValue, PrimaryKey, ReadSet, TableId};
 use pulse_sql::{
-    capture_reads, connect, introspect, DbOp, FieldMeta, FilterExpr, PredOp, Predicate, QueryMode,
+    capture_reads, introspect, DbOp, FieldMeta, FilterExpr, PredOp, Predicate, QueryMode,
     SchemaMeta, TableSchema,
 };
 use serde_json::json;
+use sqlx::Executor;
 use uuid::Uuid;
 
 fn chat_schema() -> SchemaMeta {
@@ -51,12 +60,36 @@ fn change_into(channel: Uuid) -> Change {
     }
 }
 
+/// A pool against the ephemeral container, self-seeded with the chat tables
+/// `introspect` expects. Returns `None` (and the test skips) if Docker is down.
+/// The schema is created exactly once per binary — `CREATE TABLE IF NOT EXISTS`
+/// is not concurrency-safe, so the two tests must not race on it.
+async fn seeded_pool() -> Option<sqlx::PgPool> {
+    static SEEDED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    let pool = common::pool().await?;
+    SEEDED
+        .get_or_init(|| async {
+            for ddl in [
+                "create table if not exists channels (_id uuid primary key, _creation_time bigint not null default 0, name text)",
+                "create table if not exists users (_id uuid primary key, _creation_time bigint not null default 0, name text)",
+                "create table if not exists messages (\
+                    _id uuid primary key default gen_random_uuid(),\
+                    _creation_time bigint not null default 0,\
+                    channel_id uuid,\
+                    author_id uuid,\
+                    body text)",
+            ] {
+                pool.execute(ddl).await.expect("seed ddl");
+            }
+        })
+        .await;
+    Some(pool)
+}
+
 #[tokio::test]
 async fn capture_reads_prunes_foreign_channel() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    let Ok(pool) = connect(&url, 2).await else {
-        eprintln!("skipping: no Postgres at {url}");
+    let Some(pool) = seeded_pool().await else {
+        eprintln!("skipping: no Postgres");
         return;
     };
     let catalog = introspect(&pool, &chat_schema()).await.expect("introspect");
@@ -85,18 +118,6 @@ async fn capture_reads_prunes_foreign_channel() {
     let mut rs = ReadSet::new();
     capture_reads(&op, &catalog, &mut rs);
 
-    std::fs::write(
-        "/tmp/pulse_cap.txt",
-        format!(
-            "tables={:?}\nfilters={:?}\nmatch_a={}\nmatch_b={}\n",
-            rs.tables,
-            rs.filters,
-            rs.matches_change(&change_into(a)),
-            rs.matches_change(&change_into(b)),
-        ),
-    )
-    .ok();
-
     // It must be a precise filter, NOT a coarse table read.
     assert!(
         rs.tables.is_empty(),
@@ -120,10 +141,8 @@ async fn capture_reads_prunes_foreign_channel() {
 
 #[tokio::test]
 async fn capture_reads_or_filter_matches_either_branch() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    let Ok(pool) = connect(&url, 2).await else {
-        eprintln!("skipping: no Postgres at {url}");
+    let Some(pool) = seeded_pool().await else {
+        eprintln!("skipping: no Postgres");
         return;
     };
     let catalog = introspect(&pool, &chat_schema()).await.expect("introspect");
@@ -176,10 +195,8 @@ async fn capture_reads_or_filter_matches_either_branch() {
 
 #[tokio::test]
 async fn capture_reads_not_filter_negates_precisely() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    let Ok(pool) = connect(&url, 2).await else {
-        eprintln!("skipping: no Postgres at {url}");
+    let Some(pool) = seeded_pool().await else {
+        eprintln!("skipping: no Postgres");
         return;
     };
     let catalog = introspect(&pool, &chat_schema()).await.expect("introspect");
@@ -224,9 +241,8 @@ async fn capture_reads_not_filter_negates_precisely() {
 
 #[tokio::test]
 async fn capture_reads_raw_matches_table_insert() {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    let Ok(pool) = connect(&url, 2).await else {
+    let Some(pool) = seeded_pool().await else {
+        eprintln!("skipping: no Postgres");
         return;
     };
     let catalog = introspect(&pool, &chat_schema()).await.expect("introspect");

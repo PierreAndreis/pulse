@@ -77,4 +77,21 @@ mod tests {
     fn rejects_garbage() {
         assert!("not-an-lsn".parse::<Lsn>().is_err());
     }
+
+    #[test]
+    fn display_parse_round_trip_for_arbitrary_values() {
+        for n in [0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+            let lsn = Lsn(n);
+            assert_eq!(lsn.to_string().parse::<Lsn>().unwrap(), lsn);
+        }
+    }
+
+    #[test]
+    fn serde_uses_textual_form() {
+        let lsn = Lsn((0x16u64 << 32) | 0xB374D848);
+        let json = serde_json::to_string(&lsn).unwrap();
+        assert_eq!(json, "\"16/B374D848\"");
+        let back: Lsn = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, lsn);
+    }
 }

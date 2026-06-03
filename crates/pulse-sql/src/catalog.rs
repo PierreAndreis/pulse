@@ -78,6 +78,29 @@ impl Table {
         self.by_column.get(column).map(|&i| &self.columns[i])
     }
 
+    /// Build a `Table` from columns in tests, computing the private `by_field` /
+    /// `by_column` indexes the same way introspection does. Test-only so `ops.rs`
+    /// can hand-build catalogs without a live Postgres.
+    #[cfg(test)]
+    pub(crate) fn from_columns(name: &str, columns: Vec<Column>) -> Self {
+        let by_field = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.field.clone(), i))
+            .collect();
+        let by_column = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.column.clone(), i))
+            .collect();
+        Table {
+            name: name.to_string(),
+            columns,
+            by_field,
+            by_column,
+        }
+    }
+
     /// `col::text AS "col"` for every column — read uniformly as text.
     pub fn select_list(&self) -> String {
         self.columns

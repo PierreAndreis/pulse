@@ -1190,3 +1190,349 @@ async fn update(
     });
     Ok((Value::Null, change))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Column, Table};
+    use std::collections::HashMap;
+
+    fn col(column: &str, field: &str, type_class: PgTypeClass, id_ref: Option<&str>) -> Column {
+        Column {
+            column: column.to_string(),
+            field: field.to_string(),
+            type_class,
+            nullable: true,
+            id_ref: id_ref.map(str::to_string),
+        }
+    }
+
+    /// `messages` with an `_id` and a `channelId` id-ref to `channels`.
+    fn messages_table() -> Table {
+        Table::from_columns(
+            "messages",
+            vec![
+                col("_id", "_id", PgTypeClass::Uuid, Some("messages")),
+                col(
+                    "channel_id",
+                    "channelId",
+                    PgTypeClass::Uuid,
+                    Some("channels"),
+                ),
+            ],
+        )
+    }
+
+    /// `channels` with just an `_id`.
+    fn channels_table() -> Table {
+        Table::from_columns(
+            "channels",
+            vec![col("_id", "_id", PgTypeClass::Uuid, Some("channels"))],
+        )
+    }
+
+    fn catalog_messages() -> Catalog {
+        let mut c = Catalog::default();
+        c.tables.insert("messages".to_string(), messages_table());
+        c
+    }
+
+    fn catalog_messages_channels() -> Catalog {
+        let mut c = Catalog::default();
+        c.tables.insert("messages".to_string(), messages_table());
+        c.tables.insert("channels".to_string(), channels_table());
+        c
+    }
+
+    const UUID_A: &str = "00000000-0000-0000-0000-000000000001";
+    const UUID_B: &str = "00000000-0000-0000-0000-0000000000bb";
+
+    fn uuid(s: &str) -> Uuid {
+        Uuid::parse_str(s).unwrap()
+    }
+
+    /// An insert change to `messages` whose new image sets `channelId`.
+    fn change_into(channel: Uuid) -> Change {
+        let mut new = HashMap::new();
+        new.insert("channelId".to_string(), KeyValue::Uuid(channel));
+        Change {
+            table: TableId::new("messages"),
+            key: PrimaryKey::single(KeyValue::Uuid(Uuid::nil())),
+            op: ChangeOp::Insert,
+            new: Some(new),
+            old: None,
+        }
+    }
+
+    fn eq_pred(field: &str, value: Value) -> Predicate {
+        Predicate {
+            field: field.to_string(),
+            op: PredOp::Eq,
+            value,
+        }
+    }
+
+    #[test]
+    fn query_with_id_pred_captures_filter() {
+        let catalog = catalog_messages();
+        let op = DbOp::Query {
+            table: "messages".to_string(),
+            predicates: vec![eq_pred("channelId", json!(format!("channels:{UUID_A}")))],
+            filters: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            aggregate: None,
+            group_by: None,
+            having: None,
+            mode: QueryMode::Collect,
+        };
+
+        let mut rs = ReadSet::new();
+        capture_reads(&op, &catalog, &mut rs);
+
+        // Precise filter, not a table-wildcard.
+        assert!(rs.tables.is_empty(), "expected no table-wildcard: {rs:?}");
+        let filters = rs
+            .filters
+            .get(&TableId::new("messages"))
+            .expect("messages filter present");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            filters[0].conds,
+            vec![Cond {
+                field: "channelId".to_string(),
+                op: FilterOp::Eq,
+                value: KeyValue::Uuid(uuid(UUID_A)),
+            }]
+        );
+
+        // The decoded uuid drives precise change matching.
+        assert!(
+            rs.matches_change(&change_into(uuid(UUID_A))),
+            "same-channel change must match"
+        );
+        assert!(
+            !rs.matches_change(&change_into(uuid(UUID_B))),
+            "foreign-channel change must be pruned"
+        );
+    }
+
+    #[test]
+    fn query_empty_predicates_is_table_wildcard() {
+        let catalog = catalog_messages();
+        let op = DbOp::Query {
+            table: "messages".to_string(),
+            predicates: vec![],
+            filters: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            aggregate: None,
+            group_by: None,
+            having: None,
+            mode: QueryMode::Collect,
+        };
+
+        let mut rs = ReadSet::new();
+        capture_reads(&op, &catalog, &mut rs);
+
+        assert!(rs.tables.contains(&TableId::new("messages")));
+        assert!(rs.filters.is_empty(), "no precise filter for full scan");
+    }
+
+    #[test]
+    fn query_float_predicate_dropped_broadens() {
+        // A table with a float column alongside the id column.
+        let t = Table::from_columns(
+            "messages",
+            vec![
+                col(
+                    "channel_id",
+                    "channelId",
+                    PgTypeClass::Uuid,
+                    Some("channels"),
+                ),
+                col("score", "score", PgTypeClass::Float8, None),
+            ],
+        );
+        let mut catalog = Catalog::default();
+        catalog.tables.insert("messages".to_string(), t);
+
+        let op = DbOp::Query {
+            table: "messages".to_string(),
+            predicates: vec![
+                eq_pred("channelId", json!(format!("channels:{UUID_A}"))),
+                eq_pred("score", json!(1.5)),
+            ],
+            filters: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            aggregate: None,
+            group_by: None,
+            having: None,
+            mode: QueryMode::Collect,
+        };
+
+        let mut rs = ReadSet::new();
+        capture_reads(&op, &catalog, &mut rs);
+
+        let filters = rs
+            .filters
+            .get(&TableId::new("messages"))
+            .expect("filter still present");
+        // The float cond is dropped (json_to_key_value → None); only channelId remains.
+        assert_eq!(filters[0].conds.len(), 1, "float cond dropped: {filters:?}");
+        assert_eq!(filters[0].conds[0].field, "channelId");
+    }
+
+    #[test]
+    fn raw_depends_on_every_table() {
+        let catalog = catalog_messages_channels();
+        let op = DbOp::Raw {
+            sql: "SELECT count(*) FROM messages".to_string(),
+            params: vec![],
+        };
+
+        let mut rs = ReadSet::new();
+        capture_reads(&op, &catalog, &mut rs);
+
+        assert!(rs.tables.contains(&TableId::new("messages")));
+        assert!(rs.tables.contains(&TableId::new("channels")));
+        assert!(
+            rs.matches_change(&change_into(Uuid::nil())),
+            "raw read must match an insert to messages"
+        );
+    }
+
+    #[test]
+    fn get_valid_uuid_is_key_invalid_is_table() {
+        let catalog = catalog_messages();
+
+        // Valid table-qualified id → key-level read.
+        let mut rs = ReadSet::new();
+        capture_reads(
+            &DbOp::Get {
+                table: "messages".to_string(),
+                id: format!("messages:{UUID_A}"),
+            },
+            &catalog,
+            &mut rs,
+        );
+        let keys = rs.keys.get(&TableId::new("messages")).expect("key present");
+        assert!(keys.contains(&PrimaryKey::single(KeyValue::Uuid(uuid(UUID_A)))));
+        assert!(rs.tables.is_empty(), "valid id is key, not table");
+
+        // Non-uuid id → coarse table read.
+        let mut rs2 = ReadSet::new();
+        capture_reads(
+            &DbOp::Get {
+                table: "messages".to_string(),
+                id: "not-a-uuid".to_string(),
+            },
+            &catalog,
+            &mut rs2,
+        );
+        assert!(rs2.tables.contains(&TableId::new("messages")));
+        assert!(rs2.keys.is_empty(), "invalid id falls back to table");
+    }
+
+    #[test]
+    fn write_ops_capture_nothing() {
+        let catalog = catalog_messages();
+        let mut value = Map::new();
+        value.insert("channelId".to_string(), json!(format!("channels:{UUID_A}")));
+
+        let mut fields = Map::new();
+        fields.insert("channelId".to_string(), json!(format!("channels:{UUID_B}")));
+
+        let ops = vec![
+            DbOp::Insert {
+                table: "messages".to_string(),
+                value: value.clone(),
+            },
+            DbOp::Patch {
+                table: "messages".to_string(),
+                id: format!("messages:{UUID_A}"),
+                fields: fields.clone(),
+            },
+            DbOp::Delete {
+                table: "messages".to_string(),
+                id: format!("messages:{UUID_A}"),
+            },
+        ];
+
+        for op in &ops {
+            let mut rs = ReadSet::new();
+            capture_reads(op, &catalog, &mut rs);
+            assert!(rs.tables.is_empty(), "write captured a table: {op:?}");
+            assert!(rs.filters.is_empty(), "write captured a filter: {op:?}");
+            assert!(rs.keys.is_empty(), "write captured a key: {op:?}");
+        }
+    }
+
+    #[test]
+    fn json_to_key_value_coercions() {
+        // id_ref string → Uuid (table-qualified decoded).
+        let id_col = col(
+            "channel_id",
+            "channelId",
+            PgTypeClass::Uuid,
+            Some("channels"),
+        );
+        assert_eq!(
+            json_to_key_value(&json!(format!("channels:{UUID_A}")), &id_col),
+            Some(KeyValue::Uuid(uuid(UUID_A)))
+        );
+
+        // Int8 from a numeric JSON value.
+        let int_col = col("n", "n", PgTypeClass::Int8, None);
+        assert_eq!(
+            json_to_key_value(&json!(42), &int_col),
+            Some(KeyValue::Int(42))
+        );
+        // Int8 string-fallback.
+        assert_eq!(
+            json_to_key_value(&json!("42"), &int_col),
+            Some(KeyValue::Int(42))
+        );
+
+        // Float8 → None (unorderable in the matcher, safely dropped).
+        let float_col = col("f", "f", PgTypeClass::Float8, None);
+        assert_eq!(json_to_key_value(&json!(1.5), &float_col), None);
+
+        // Null → None regardless of column.
+        assert_eq!(json_to_key_value(&Value::Null, &int_col), None);
+    }
+
+    #[test]
+    fn dbop_serde_lowercase_kind_and_access() {
+        // Lowercase `kind` tag deserializes the variant.
+        let op: DbOp = serde_json::from_value(json!({
+            "kind": "query",
+            "table": "messages",
+            "mode": "collect",
+        }))
+        .expect("query deserializes");
+        assert!(matches!(op, DbOp::Query { .. }));
+        // Read op → access reports the table, not a write.
+        assert_eq!(op.access(), Some(("messages", false)));
+
+        let insert: DbOp = serde_json::from_value(json!({
+            "kind": "insert",
+            "table": "messages",
+            "value": {},
+        }))
+        .expect("insert deserializes");
+        assert_eq!(insert.access(), Some(("messages", true)));
+
+        // Raw is opaque → no access table.
+        let raw: DbOp = serde_json::from_value(json!({
+            "kind": "raw",
+            "sql": "SELECT 1",
+        }))
+        .expect("raw deserializes");
+        assert_eq!(raw.access(), None);
+    }
+}

@@ -528,4 +528,153 @@ mod tests {
              lock must not be held across the channel send().await"
         );
     }
+
+    /// Re-executor that ALWAYS returns the same fixed value, regardless of how
+    /// many times it runs. Unlike `CountingReExec` (fresh value each call), this
+    /// lets the redundant-push suppression branch in `record_value` actually fire.
+    struct ConstReExec {
+        calls: AtomicUsize,
+        // Returned (refreshed) on every re-exec so the subscription keeps matching
+        // across applies; only the value stays constant — which is what exercises
+        // the redundant-push suppression branch.
+        read_set: ReadSet,
+    }
+    #[async_trait]
+    impl ReExecutor for ConstReExec {
+        async fn exec(
+            &self,
+            _path: Vec<String>,
+            _input: Value,
+            _headers: HashMap<String, String>,
+        ) -> Result<(Value, ReadSet), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok((json!({ "fixed": true }), self.read_set.clone()))
+        }
+    }
+
+    /// A re-exec that yields a byte-identical result to the last pushed value must
+    /// be suppressed: the first apply pushes, an identical second apply pushes
+    /// nothing.
+    #[tokio::test]
+    async fn unchanged_result_suppresses_push() {
+        let reexec = Arc::new(ConstReExec {
+            calls: AtomicUsize::new(0),
+            read_set: channel_filter("A"),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+
+        let mut rx_a = reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await;
+
+        // First change → re-exec runs, value is new (last was None) → pushes.
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
+            .await;
+        assert!(rx_a.try_recv().is_ok(), "first apply pushes");
+
+        // Second identical change → re-exec runs again and returns the SAME value,
+        // so record_value returns false and no push is enqueued.
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
+            .await;
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            2,
+            "re-exec runs on both applies"
+        );
+        assert!(
+            rx_a.try_recv().is_err(),
+            "identical second result is suppressed — no redundant push"
+        );
+    }
+
+    /// A multi-row transaction (several changes into the same channel) must
+    /// re-run a matching subscription at most once, with exactly one resulting
+    /// push.
+    #[tokio::test]
+    async fn multi_row_tx_reexecutes_sub_once() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+
+        let mut rx_a = reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await;
+
+        // Three changes, all into channel A, in one ChangeSet.
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A"), insert_into("A"), insert_into("A")],
+            })
+            .await;
+
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            1,
+            "a multi-row tx re-runs the matching sub exactly once"
+        );
+        assert!(rx_a.try_recv().is_ok(), "exactly one push arrives");
+        assert!(rx_a.try_recv().is_err(), "and no second push");
+    }
+
+    /// `invalidate_all` re-evaluates every subscription regardless of read-set
+    /// and stamps pushes with `Lsn::ZERO`.
+    #[tokio::test]
+    async fn invalidate_all_reexecutes_every_sub() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+
+        let mut rx_a = reactor.register_client("a".into()).await;
+        let mut rx_b = reactor.register_client("b".into()).await;
+        sub(&reactor, "a", "A").await;
+        sub(&reactor, "b", "B").await;
+
+        reactor.invalidate_all().await;
+
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            2,
+            "every subscription is re-evaluated"
+        );
+        let push_a = rx_a.try_recv().expect("client A received a push");
+        let push_b = rx_b.try_recv().expect("client B received a push");
+        assert!(
+            push_a.body.contains("\"commitLsn\":\"0/0\""),
+            "invalidate_all stamps Lsn::ZERO"
+        );
+        assert!(
+            push_b.body.contains("\"commitLsn\":\"0/0\""),
+            "invalidate_all stamps Lsn::ZERO"
+        );
+    }
+
+    /// `record_value` for a subscription that no longer exists returns false and
+    /// does not panic (the sub was removed between match and the per-result
+    /// follow-up).
+    #[tokio::test]
+    async fn record_value_for_unknown_sub_is_false() {
+        let reactor = InMemoryReactor::new(Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        }));
+
+        let recorded = reactor
+            .record_value(
+                "nobody",
+                "messages.list::ghost",
+                &json!({ "x": 1 }),
+                ReadSet::new(),
+            )
+            .await;
+
+        assert!(!recorded, "recording for an unknown sub is false");
+    }
 }

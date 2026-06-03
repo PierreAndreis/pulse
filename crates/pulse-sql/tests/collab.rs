@@ -1,18 +1,16 @@
 //! DB-backed test for the collab SQL ops: two Yjs updates applied through
 //! `execute_op` (ApplyCollab) into a `bytea` field both survive the CRDT merge,
-//! and `GetCollab` reads the merged state back. Skips if Postgres is unreachable.
+//! and `GetCollab` reads the merged state back. Runs against an ephemeral
+//! Postgres container; skips if Docker is unavailable.
+
+mod common;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use pulse_sql::{connect, execute_op, introspect, DbOp, SchemaMeta};
+use common::pool;
+use pulse_sql::{execute_op, introspect, DbOp, SchemaMeta};
 use sqlx::Executor;
 use yrs::updates::decoder::Decode;
 use yrs::{GetString, ReadTxn, Text, Transact, Update};
-
-async fn pool() -> Option<sqlx::PgPool> {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    connect(&url, 4).await.ok()
-}
 
 /// A Yjs update inserting `text` at index 0 of root text "body", from empty.
 fn insert_update(text: &str) -> Vec<u8> {
