@@ -7,14 +7,14 @@
 //! [`Reactor::apply_change_set`] entry point — the seam a future WAL/CDC consumer
 //! (or a cross-node bus) plugs into without a second matching path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use pulse_core::{ChangeSet, Lsn, ReadSet};
+use pulse_core::{ChangeSet, Lsn, ReadSet, TableId};
 
 /// One server→client SSE event: a monotonic per-client `id` (for `Last-Event-ID`
 /// resume) and the JSON body.
@@ -78,12 +78,97 @@ fn sub_key(client_id: &str, sub: &str) -> String {
     format!("{client_id}\u{0}{sub}")
 }
 
-/// In-process reactor: dashmap-free `Mutex<HashMap>` registry plus an injected
-/// re-executor. Single-node; the `Reactor` trait is the seam for a distributed
-/// implementation later.
+/// The subscription registry plus a coarse table→subscriptions index. The index
+/// lets `apply_change_set` consider only the subscriptions that reference a table
+/// the change actually touched, instead of scanning every subscription — so
+/// matching cost scales with the number of subs on the affected tables, not the
+/// global subscription count. The precise `ReadSet::matches` still runs on each
+/// candidate, so the index never changes *which* subs match, only how few we test.
+#[derive(Default)]
+struct Registry {
+    subs: HashMap<String, Subscription>,
+    by_table: HashMap<TableId, HashSet<String>>,
+}
+
+impl Registry {
+    fn index(&mut self, key: &str, rs: &ReadSet) {
+        for t in rs.referenced_tables() {
+            self.by_table.entry(t).or_default().insert(key.to_string());
+        }
+    }
+
+    fn deindex(&mut self, key: &str, rs: &ReadSet) {
+        for t in rs.referenced_tables() {
+            if let Some(set) = self.by_table.get_mut(&t) {
+                set.remove(key);
+                if set.is_empty() {
+                    self.by_table.remove(&t);
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, key: String, sub: Subscription) {
+        if let Some(old) = self.subs.get(&key) {
+            let old_rs = old.read_set.clone();
+            self.deindex(&key, &old_rs);
+        }
+        self.index(&key, &sub.read_set);
+        self.subs.insert(key, sub);
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(old) = self.subs.remove(key) {
+            self.deindex(key, &old.read_set);
+        }
+    }
+
+    /// Replace a subscription's read-set, reindexing if the set of referenced
+    /// tables changed (a re-exec can shift dependencies — e.g. a join that begins
+    /// reading a newly-inserted row's table). Missing this would let a later
+    /// change to the new table be silently skipped for this subscription.
+    fn set_read_set(&mut self, key: &str, rs: ReadSet) {
+        let changed = match self.subs.get(key) {
+            Some(s) => s.read_set.referenced_tables() != rs.referenced_tables(),
+            None => return,
+        };
+        if changed {
+            let old = self.subs[key].read_set.clone();
+            self.deindex(key, &old);
+            self.index(key, &rs);
+        }
+        if let Some(s) = self.subs.get_mut(key) {
+            s.read_set = rs;
+        }
+    }
+
+    /// Subscriptions referencing any of `tables` (deduplicated), cloned for
+    /// lock-free re-execution. This is the index lookup that replaces a full scan.
+    fn candidates(&self, tables: &HashSet<TableId>) -> Vec<Subscription> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out = Vec::new();
+        for t in tables {
+            let Some(keys) = self.by_table.get(t) else {
+                continue;
+            };
+            for k in keys {
+                if seen.insert(k.as_str()) {
+                    if let Some(s) = self.subs.get(k) {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// In-process reactor: a `Mutex<Registry>` (subscriptions + table index) plus an
+/// injected re-executor. Single-node; the `Reactor` trait is the seam for a
+/// distributed implementation later.
 pub struct InMemoryReactor {
     clients: Mutex<HashMap<String, Client>>,
-    subs: Mutex<HashMap<String, Subscription>>,
+    reg: Mutex<Registry>,
     reexec: Arc<dyn ReExecutor>,
 }
 
@@ -91,7 +176,7 @@ impl InMemoryReactor {
     pub fn new(reexec: Arc<dyn ReExecutor>) -> Self {
         InMemoryReactor {
             clients: Mutex::new(HashMap::new()),
-            subs: Mutex::new(HashMap::new()),
+            reg: Mutex::new(Registry::default()),
             reexec,
         }
     }
@@ -193,6 +278,20 @@ impl InMemoryReactor {
         json!({ "p": path, "i": input, "h": hs }).to_string()
     }
 
+    /// Test-only: the matching half of `apply_change_set` in isolation (index
+    /// lookup + precise `matches`), without re-exec/push side effects. Returns how
+    /// many subscriptions a change set invalidates — used to benchmark the hot path.
+    #[cfg(test)]
+    async fn count_matches(&self, change_set: &ChangeSet) -> usize {
+        let changed: HashSet<TableId> =
+            change_set.changes.iter().map(|c| c.table.clone()).collect();
+        let reg = self.reg.lock().await;
+        reg.candidates(&changed)
+            .into_iter()
+            .filter(|s| s.read_set.matches(change_set))
+            .count()
+    }
+
     /// Refresh the subscription's read-set from the latest run (so dependencies
     /// track the data), and report whether `value` differs from the last pushed
     /// value (recording it). Skips byte-identical recomputations.
@@ -203,10 +302,12 @@ impl InMemoryReactor {
         value: &Value,
         read_set: ReadSet,
     ) -> bool {
-        let mut subs = self.subs.lock().await;
-        match subs.get_mut(&sub_key(client_id, sub)) {
+        let key = sub_key(client_id, sub);
+        let mut reg = self.reg.lock().await;
+        // Dependencies may have shifted since the last run → reindex if so.
+        reg.set_read_set(&key, read_set);
+        match reg.subs.get_mut(&key) {
             Some(s) => {
-                s.read_set = read_set; // dependencies may have changed since last run
                 if s.last.as_ref() == Some(value) {
                     false
                 } else {
@@ -232,19 +333,25 @@ impl Reactor for InMemoryReactor {
 
     async fn remove_client(&self, client_id: &str) {
         self.clients.lock().await.remove(client_id);
-        self.subs
-            .lock()
-            .await
-            .retain(|_, s| s.client_id != client_id);
+        let mut reg = self.reg.lock().await;
+        let keys: Vec<String> = reg
+            .subs
+            .iter()
+            .filter(|(_, s)| s.client_id == client_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            reg.remove(&k);
+        }
     }
 
     async fn add_subscription(&self, sub: Subscription) {
         let key = sub_key(&sub.client_id, &sub.sub);
-        self.subs.lock().await.insert(key, sub);
+        self.reg.lock().await.insert(key, sub);
     }
 
     async fn remove_subscription(&self, client_id: &str, sub: &str) {
-        self.subs.lock().await.remove(&sub_key(client_id, sub));
+        self.reg.lock().await.remove(&sub_key(client_id, sub));
     }
 
     async fn push(&self, client_id: &str, sub: &str, value: &Value, commit_lsn: Lsn) -> bool {
@@ -252,19 +359,23 @@ impl Reactor for InMemoryReactor {
     }
 
     async fn apply_change_set(&self, change_set: ChangeSet) {
-        // Match (dedup: a multi-row tx re-runs each sub at most once).
+        // Only subscriptions referencing a table this change touched can match, so
+        // the index narrows the candidate set first; the precise `matches` then
+        // runs on those (dedup: a multi-row tx re-runs each sub at most once).
+        let changed: HashSet<TableId> =
+            change_set.changes.iter().map(|c| c.table.clone()).collect();
         let dirty: Vec<Subscription> = {
-            let subs = self.subs.lock().await;
-            subs.values()
+            let reg = self.reg.lock().await;
+            reg.candidates(&changed)
+                .into_iter()
                 .filter(|s| s.read_set.matches(&change_set))
-                .cloned()
                 .collect()
         };
         self.reexec_and_push(dirty, change_set.commit_lsn).await;
     }
 
     async fn invalidate_all(&self) {
-        let all: Vec<Subscription> = self.subs.lock().await.values().cloned().collect();
+        let all: Vec<Subscription> = self.reg.lock().await.subs.values().cloned().collect();
         self.reexec_and_push(all, Lsn::ZERO).await;
     }
 }
@@ -676,5 +787,159 @@ mod tests {
             .await;
 
         assert!(!recorded, "recording for an unknown sub is false");
+    }
+
+    /// A re-executor that re-points the subscription's read-set at a *different*
+    /// table (`users`) on first run — simulating a dynamic dependency shift (e.g.
+    /// a join that begins reading a new table).
+    struct RemapReExec {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl ReExecutor for RemapReExec {
+        async fn exec(
+            &self,
+            _path: Vec<String>,
+            _input: Value,
+            _headers: HashMap<String, String>,
+        ) -> Result<(Value, ReadSet), String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut rs = ReadSet::new();
+            rs.add_table(TableId::new("users")); // now depends on `users`, not `messages`
+            Ok((json!({ "n": n }), rs))
+        }
+    }
+
+    fn insert_on(table: &str) -> Change {
+        Change {
+            table: TableId::new(table),
+            key: PrimaryKey::single(KeyValue::Int(1)),
+            op: ChangeOp::Insert,
+            new: Some(HashMap::new()),
+            old: None,
+        }
+    }
+
+    /// The table index must follow a read-set that shifts at runtime: after a
+    /// re-exec re-points a sub from `messages` to `users`, a later change to
+    /// `users` must invalidate it, and a change to `messages` must no longer.
+    #[tokio::test]
+    async fn read_set_change_reindexes_the_subscription() {
+        let reexec = Arc::new(RemapReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await; // initial read-set references `messages`
+
+        // A change to `messages` matches → re-exec → read-set re-points to `users`.
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
+            .await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+        assert!(rx.try_recv().is_ok());
+
+        // Now a change to `users` must invalidate it (proves the index gained `users`).
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_on("users")],
+            })
+            .await;
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            2,
+            "a change to the newly-referenced table must re-exec"
+        );
+
+        // …and a change to `messages` must NOT (proves the index dropped `messages`).
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
+            .await;
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            2,
+            "a change to the no-longer-referenced table must be pruned"
+        );
+    }
+
+    /// Register `hot` subs on the changed table and `idle` subs on an unrelated
+    /// table, all on one client.
+    async fn seed_subs(reactor: &InMemoryReactor, hot: usize, idle: usize) {
+        reactor.register_client("c".into()).await;
+        for i in 0..hot {
+            sub(reactor, "c", &format!("HOT{i}")).await; // read-set references `messages`
+        }
+        for i in 0..idle {
+            let mut rs = ReadSet::new();
+            rs.add_table(TableId::new("other"));
+            reactor
+                .add_subscription(Subscription {
+                    client_id: "c".into(),
+                    sub: format!("other::{i}"),
+                    path: vec!["other".into()],
+                    input: json!({ "i": i }),
+                    headers: HashMap::new(),
+                    read_set: rs,
+                    last: None,
+                })
+                .await;
+        }
+    }
+
+    /// Benchmark: matching cost scales with subscriptions on the *changed* table,
+    /// not the global subscription count. With the index, piling on idle subs (on
+    /// other tables) leaves a change's matching cost flat; the pre-index full scan
+    /// was O(total subs).
+    ///   cargo test -p pulse-reactor --release -- --ignored --nocapture bench_matching
+    #[tokio::test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    async fn bench_matching_scales_with_changed_table() {
+        use std::time::Instant;
+
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let cs = ChangeSet {
+            commit_lsn: pulse_core::Lsn::ZERO,
+            changes: vec![insert_into("HOT0")],
+        };
+        const ITERS: usize = 2_000;
+
+        // Fixed small hot set, growing idle set → cost should stay flat.
+        println!("-- 10 hot subs, growing idle set (matching should stay flat) --");
+        for &idle in &[0usize, 1_000, 10_000, 100_000] {
+            let reactor = InMemoryReactor::new(reexec.clone());
+            seed_subs(&reactor, 10, idle).await;
+            let start = Instant::now();
+            let mut hits = 0;
+            for _ in 0..ITERS {
+                hits = reactor.count_matches(&cs).await;
+            }
+            let per = start.elapsed().as_nanos() as f64 / ITERS as f64;
+            println!(
+                "  idle={idle:>7} total={:>7}  match={per:>8.0} ns/change  (matched={hits})",
+                idle + 10
+            );
+        }
+
+        // Growing hot set → cost should scale with it (this is the real work).
+        println!("-- growing hot set, no idle (matching scales with the hot table) --");
+        for &hot in &[1usize, 100, 1_000, 10_000] {
+            let reactor = InMemoryReactor::new(reexec.clone());
+            seed_subs(&reactor, hot, 0).await;
+            let start = Instant::now();
+            for _ in 0..ITERS {
+                reactor.count_matches(&cs).await;
+            }
+            let per = start.elapsed().as_nanos() as f64 / ITERS as f64;
+            println!("  hot={hot:>7}  match={per:>8.0} ns/change");
+        }
     }
 }
