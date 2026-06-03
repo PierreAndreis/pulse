@@ -50,6 +50,8 @@ export const DEMO_USER = "users:00000000-0000-0000-0000-000000000010";
 export interface Harness {
   client: Client<typeof contract>;
   baseUrl: string;
+  /** OS pid of the engine process (for RSS / memory measurement). */
+  pid: number | undefined;
   /** Build another client against the same engine with a chosen bearer token (null → no auth). */
   makeClient(token: string | null): Client<typeof contract>;
   stop(): Promise<void>;
@@ -177,6 +179,7 @@ export async function startEngine(opts: StartOptions = {}): Promise<Harness> {
   return {
     client,
     baseUrl,
+    pid: child.pid,
     makeClient,
     async stop() {
       if (child.exitCode === null) {
