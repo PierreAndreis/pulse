@@ -1,14 +1,11 @@
 //! Decisive isolation test: does a pooled transaction actually run at
 //! SERIALIZABLE, and does a concurrent read-modify-write raise 40001?
-//! Skips if Postgres is unreachable.
+//! Runs against an ephemeral Postgres container; skips if Docker is unavailable.
 
+mod common;
+
+use common::pool;
 use sqlx::{Executor, Row};
-
-async fn pool() -> Option<sqlx::PgPool> {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
-    pulse_sql::connect(&url, 8).await.ok()
-}
 
 #[tokio::test]
 async fn pooled_tx_is_serializable() {
