@@ -86,13 +86,14 @@ export interface QueryBuilder<T extends string> {
   first(): Promise<Doc<T> | null>;
   /** Exactly one; rejects if more than one matches. */
   unique(): Promise<Doc<T> | null>;
-  /** Count the matching rows. Reactive: any write to a row matching this query's
-   *  filters re-runs and recomputes the count (filter-level invalidation). */
-  count(): Promise<number>;
+  /** Count matching rows (`count(*)`), or non-null values of `field` if given.
+   *  Reactive: any write to a row matching this query's filters recomputes it. */
+  count(field?: keyof Doc<T> & string): Promise<number>;
   /** Count distinct values of a field over the matching rows. Reactive. */
   countDistinct(field: keyof Doc<T> & string): Promise<number>;
-  /** Sum a numeric field over the matching rows. Reactive, like {@link count}. */
-  sum(field: NumericKeys<T>): Promise<number>;
+  /** Sum a numeric field over the matching rows (null over an empty/all-null set,
+   *  per SQL). Reactive, like {@link count}. */
+  sum(field: NumericKeys<T>): Promise<number | null>;
   /** Min of a numeric field over the matching rows (null if none). Reactive. */
   min(field: NumericKeys<T>): Promise<number | null>;
   /** Max of a numeric field over the matching rows (null if none). Reactive. */

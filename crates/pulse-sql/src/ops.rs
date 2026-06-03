@@ -327,21 +327,8 @@ async fn fetch_scalar_i64(
     Ok(q.fetch_one(conn).await?)
 }
 
-/// Bind text params and read a single f64 scalar (e.g. `sum(field)` cast to double).
-async fn fetch_scalar_f64(
-    conn: &mut PgConnection,
-    sql: &str,
-    binds: &[Option<String>],
-) -> Result<f64, SqlError> {
-    let mut q = sqlx::query_scalar::<_, f64>(sql);
-    for b in binds {
-        q = q.bind(b.clone());
-    }
-    Ok(q.fetch_one(conn).await?)
-}
-
-/// Bind text params and read a single nullable f64 (e.g. `min`/`max`/`avg`, which
-/// are NULL over an empty set).
+/// Bind text params and read a single nullable f64 (e.g. `sum`/`min`/`max`/`avg`,
+/// which are NULL over an empty/all-NULL set).
 async fn fetch_scalar_opt_f64(
     conn: &mut PgConnection,
     sql: &str,
@@ -364,9 +351,11 @@ fn agg_sql(t: &Table, agg: &Agg) -> Result<String, SqlError> {
     Ok(match agg.func {
         AggFn::Count => match (agg.distinct, agg.field.as_deref()) {
             (true, Some(f)) => format!("count(distinct {})", column(t, f)?.column),
+            (false, Some(f)) => format!("count({})", column(t, f)?.column), // non-NULL count
             _ => "count(*)".to_string(),
         },
-        AggFn::Sum => format!("coalesce(sum({}), 0)", col(agg)?),
+        // sum/min/max/avg are NULL over an empty/all-NULL set (SQL standard).
+        AggFn::Sum => format!("sum({})", col(agg)?),
         AggFn::Min => format!("min({})", col(agg)?),
         AggFn::Max => format!("max({})", col(agg)?),
         AggFn::Avg => format!("avg({})", col(agg)?),
@@ -837,51 +826,29 @@ pub async fn execute_op(
 
             // Aggregate path: one scalar over the filtered rows. order/limit/offset
             // don't apply. Reactivity is unchanged — `capture_reads` folds the same
-            // filters into the read-set, so a matching write recomputes it. count/sum
-            // are 0 over an empty set; min/max/avg are null.
+            // filters into the read-set, so a matching write recomputes it. `count`
+            // is 0 over an empty set; sum/min/max/avg are NULL (SQL standard).
             if let Some(agg) = aggregate {
+                let expr = agg_sql(t, agg)?;
                 // Grouped aggregate: one {key, value} row per group. Same filter
                 // read-set as the scalar path → filter-precise reactivity.
                 if let Some(gkey) = group_by {
                     let keycol = column(t, gkey)?;
                     let sql = format!(
-                        "SELECT {0}::text, ({1})::double precision FROM {name}{where_sql} GROUP BY {0}",
+                        "SELECT {0}::text, ({expr})::double precision FROM {name}{where_sql} GROUP BY {0}",
                         keycol.column,
-                        agg_sql(t, agg)?,
                     );
                     let rows = fetch_grouped(&mut *conn, &sql, &binds, keycol).await?;
                     return Ok((Value::Array(rows), None));
                 }
                 let value = match agg.func {
                     AggFn::Count => {
-                        // count(distinct field) when requested, else count(*).
-                        let expr = match (agg.distinct, agg.field.as_deref()) {
-                            (true, Some(f)) => format!("count(distinct {})", column(t, f)?.column),
-                            _ => "count(*)".to_string(),
-                        };
                         let sql = format!("SELECT {expr}::bigint FROM {name}{where_sql}");
                         json!(fetch_scalar_i64(&mut *conn, &sql, &binds).await?)
                     }
-                    AggFn::Sum => {
-                        let col = column(t, agg.field.as_deref().unwrap_or_default())?;
-                        let sql = format!(
-                            "SELECT coalesce(sum({}), 0)::double precision FROM {name}{where_sql}",
-                            col.column
-                        );
-                        json!(fetch_scalar_f64(&mut *conn, &sql, &binds).await?)
-                    }
-                    // min/max/avg are NULL over an empty set → returned as null.
-                    AggFn::Min | AggFn::Max | AggFn::Avg => {
-                        let f = match agg.func {
-                            AggFn::Min => "min",
-                            AggFn::Max => "max",
-                            _ => "avg",
-                        };
-                        let col = column(t, agg.field.as_deref().unwrap_or_default())?;
-                        let sql = format!(
-                            "SELECT {f}({})::double precision FROM {name}{where_sql}",
-                            col.column
-                        );
+                    // sum/min/max/avg → NULL over an empty/all-NULL set.
+                    _ => {
+                        let sql = format!("SELECT {expr}::double precision FROM {name}{where_sql}");
                         match fetch_scalar_opt_f64(&mut *conn, &sql, &binds).await? {
                             Some(n) => json!(n),
                             None => Value::Null,

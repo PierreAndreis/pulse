@@ -57,7 +57,32 @@ export interface Harness {
   reset(): Promise<void>;
 }
 
+/** Run a SQL statement against the test database (psql; falls back to `docker
+ *  exec` into the local dev container when host psql isn't available). Used by
+ *  fixtures to create/truncate their own tables. */
+export async function applySql(sql: string): Promise<void> {
+  try {
+    await execFileAsync("psql", [DATABASE_URL, "-v", "ON_ERROR_STOP=1", "-c", sql]);
+  } catch {
+    await execFileAsync("docker", [
+      "exec",
+      PG_CONTAINER,
+      "psql",
+      "-U",
+      "pulse",
+      "-d",
+      "pulse",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-c",
+      sql,
+    ]);
+  }
+}
+
 export interface StartOptions {
+  /** App module the engine's worker loads (default: examples-chat). */
+  app?: string;
   /** Override OLTP pool size (used by pool-saturation stress tests). */
   oltpMaxConns?: number;
   /** Bearer token to send (null → omit auth header, to drive UNAUTHORIZED). */
@@ -115,7 +140,7 @@ export async function startEngine(opts: StartOptions = {}): Promise<Harness> {
       PULSE_PORT: String(port),
       PULSE_WORKER_BIN: process.env.PULSE_WORKER_BIN ?? "bun",
       PULSE_WORKER_SCRIPT: resolve(ROOT, "packages/runtime-node/src/worker.ts"),
-      PULSE_APP: resolve(ROOT, "packages/examples-chat/src/app.ts"),
+      PULSE_APP: opts.app ?? resolve(ROOT, "packages/examples-chat/src/app.ts"),
       PULSE_OLTP_MAX_CONNS: String(opts.oltpMaxConns ?? 10),
       ...(opts.maxTxAttempts !== undefined
         ? { PULSE_MAX_TX_ATTEMPTS: String(opts.maxTxAttempts) }

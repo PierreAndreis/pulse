@@ -130,7 +130,12 @@ function makeDb(requestId: string) {
       collect: () => call({ ...base(), mode: "collect" }),
       first: () => call({ ...base(), mode: "first" }),
       unique: () => call({ ...base(), mode: "unique" }),
-      count: () => call({ ...base(), aggregate: { func: "count" }, mode: "collect" }),
+      count: (field?: string) =>
+        call({
+          ...base(),
+          aggregate: { func: "count", ...(field !== undefined ? { field } : {}) },
+          mode: "collect",
+        }),
       countDistinct: (field: string) =>
         call({ ...base(), aggregate: { func: "count", field, distinct: true }, mode: "collect" }),
       sum: (field: string) =>
