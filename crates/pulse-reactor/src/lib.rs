@@ -36,6 +36,32 @@ pub struct Subscription {
     pub last: Option<Value>,
 }
 
+/// The minimal slice of a subscription needed to re-execute and push: identity +
+/// the (path, input, headers) that determine its result. Re-execution never reads
+/// `read_set` or `last` (the matcher already ran; `last` is re-read under lock in
+/// `record_value`), so the dirty set carries only these light fields — we don't
+/// clone the read-set or the retained last-value for every invalidated sub.
+#[derive(Clone)]
+struct ReExecJob {
+    client_id: String,
+    sub: String,
+    path: Vec<String>,
+    input: Value,
+    headers: HashMap<String, String>,
+}
+
+impl ReExecJob {
+    fn of(s: &Subscription) -> Self {
+        ReExecJob {
+            client_id: s.client_id.clone(),
+            sub: s.sub.clone(),
+            path: s.path.clone(),
+            input: s.input.clone(),
+            headers: s.headers.clone(),
+        }
+    }
+}
+
 /// Re-executes a procedure for invalidation. Implemented by the host over its
 /// function runtime (e.g. `pulse-jsruntime::Worker`).
 #[async_trait]
@@ -147,11 +173,11 @@ impl Registry {
         }
     }
 
-    /// Subscriptions referencing any of `tables` (deduplicated), cloned for
-    /// lock-free re-execution. This is the index lookup that replaces a full scan.
-    fn candidates(&self, tables: &HashSet<TableId>) -> Vec<Subscription> {
+    /// Visit each subscription referencing any of `tables`, once, calling `f` with
+    /// a reference. The index lookup that replaces a full scan; matching/cloning
+    /// decisions are left to the caller so we never clone subs we won't re-exec.
+    fn for_each_candidate(&self, tables: &HashSet<TableId>, mut f: impl FnMut(&Subscription)) {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut out = Vec::new();
         for t in tables {
             let Some(keys) = self.by_table.get(t) else {
                 continue;
@@ -159,12 +185,37 @@ impl Registry {
             for k in keys {
                 if seen.insert(k.as_str()) {
                     if let Some(s) = self.subs.get(k) {
-                        out.push(s.clone());
+                        f(s);
                     }
                 }
             }
         }
+    }
+
+    /// Re-exec jobs for subscriptions on `changed` whose read-set precisely
+    /// matches `cs` (the `apply_change_set` path). Only matches are cloned, and
+    /// only their light job fields — not the read-set or retained last-value.
+    fn matching_jobs(&self, changed: &HashSet<TableId>, cs: &ChangeSet) -> Vec<ReExecJob> {
+        let mut out = Vec::new();
+        self.for_each_candidate(changed, |s| {
+            if s.read_set.matches(cs) {
+                out.push(ReExecJob::of(s));
+            }
+        });
         out
+    }
+
+    /// Re-exec jobs for every subscription on `tables`, no row-level matching (the
+    /// coarse table-scoped invalidation path).
+    fn table_jobs(&self, tables: &HashSet<TableId>) -> Vec<ReExecJob> {
+        let mut out = Vec::new();
+        self.for_each_candidate(tables, |s| out.push(ReExecJob::of(s)));
+        out
+    }
+
+    /// Re-exec jobs for every subscription (the global-resync path).
+    fn all_jobs(&self) -> Vec<ReExecJob> {
+        self.subs.values().map(ReExecJob::of).collect()
     }
 }
 
@@ -222,14 +273,14 @@ impl InMemoryReactor {
     /// subscriptions, and running them serially would make the tail of the wave
     /// wait behind every prior round-trip. The cheap, state-touching follow-up
     /// (`record_value` + `send`) is applied per-sub as each result arrives.
-    async fn reexec_and_push(&self, dirty: Vec<Subscription>, commit_lsn: Lsn) {
+    async fn reexec_and_push(&self, dirty: Vec<ReExecJob>, commit_lsn: Lsn) {
         // Coalesce subscriptions that would compute the identical result (same
         // path + input + headers) into one re-execution, fanning the result to
         // every subscriber. A reactive query is a deterministic function of those
         // inputs at a given commit, so this is exact — and it collapses N tabs of
         // the same view (or many clients on the same public query) from N worker
         // round-trips + N Postgres queries down to one.
-        let mut groups: HashMap<String, Vec<Subscription>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<ReExecJob>> = HashMap::new();
         for sub in dirty {
             let key = Self::dedup_key_of(&sub.path, &sub.input, &sub.headers);
             groups.entry(key).or_default().push(sub);
@@ -291,10 +342,7 @@ impl InMemoryReactor {
         let changed: HashSet<TableId> =
             change_set.changes.iter().map(|c| c.table.clone()).collect();
         let reg = self.reg.lock().await;
-        reg.candidates(&changed)
-            .into_iter()
-            .filter(|s| s.read_set.matches(change_set))
-            .count()
+        reg.matching_jobs(&changed, change_set).len()
     }
 
     /// Refresh the subscription's read-set from the latest run (so dependencies
@@ -369,12 +417,9 @@ impl Reactor for InMemoryReactor {
         // runs on those (dedup: a multi-row tx re-runs each sub at most once).
         let changed: HashSet<TableId> =
             change_set.changes.iter().map(|c| c.table.clone()).collect();
-        let dirty: Vec<Subscription> = {
+        let dirty = {
             let reg = self.reg.lock().await;
-            reg.candidates(&changed)
-                .into_iter()
-                .filter(|s| s.read_set.matches(&change_set))
-                .collect()
+            reg.matching_jobs(&changed, &change_set)
         };
         self.reexec_and_push(dirty, change_set.commit_lsn).await;
     }
@@ -382,12 +427,12 @@ impl Reactor for InMemoryReactor {
     async fn invalidate_tables(&self, tables: HashSet<TableId>) {
         // Re-exec every subscription on the affected tables (no row-level matching —
         // we don't have the rows). The index makes this scoped to those tables.
-        let dirty: Vec<Subscription> = self.reg.lock().await.candidates(&tables);
+        let dirty = self.reg.lock().await.table_jobs(&tables);
         self.reexec_and_push(dirty, Lsn::ZERO).await;
     }
 
     async fn invalidate_all(&self) {
-        let all: Vec<Subscription> = self.reg.lock().await.subs.values().cloned().collect();
+        let all = self.reg.lock().await.all_jobs();
         self.reexec_and_push(all, Lsn::ZERO).await;
     }
 }
