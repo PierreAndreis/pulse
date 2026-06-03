@@ -133,38 +133,64 @@ impl InMemoryReactor {
     /// wait behind every prior round-trip. The cheap, state-touching follow-up
     /// (`record_value` + `send`) is applied per-sub as each result arrives.
     async fn reexec_and_push(&self, dirty: Vec<Subscription>, commit_lsn: Lsn) {
-        let mut set = tokio::task::JoinSet::new();
+        // Coalesce subscriptions that would compute the identical result (same
+        // path + input + headers) into one re-execution, fanning the result to
+        // every subscriber. A reactive query is a deterministic function of those
+        // inputs at a given commit, so this is exact — and it collapses N tabs of
+        // the same view (or many clients on the same public query) from N worker
+        // round-trips + N Postgres queries down to one.
+        let mut groups: HashMap<String, Vec<Subscription>> = HashMap::new();
         for sub in dirty {
+            let key = Self::dedup_key_of(&sub.path, &sub.input, &sub.headers);
+            groups.entry(key).or_default().push(sub);
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for (_key, subs) in groups {
             let reexec = self.reexec.clone();
+            let (path, input, headers) = (
+                subs[0].path.clone(),
+                subs[0].input.clone(),
+                subs[0].headers.clone(),
+            );
             set.spawn(async move {
-                let result = reexec
-                    .exec(sub.path.clone(), sub.input.clone(), sub.headers.clone())
-                    .await;
-                (sub, result)
+                let result = reexec.exec(path, input, headers).await;
+                (subs, result)
             });
         }
         while let Some(joined) = set.join_next().await {
-            let Ok((sub, result)) = joined else { continue }; // task panic → skip
+            let Ok((subs, result)) = joined else { continue }; // task panic → skip
             match result {
                 Ok((value, read_set)) => {
-                    if !self
-                        .record_value(&sub.client_id, &sub.sub, &value, read_set)
-                        .await
-                    {
-                        continue; // unchanged result → no redundant push
-                    }
-                    if !self
-                        .send(&sub.client_id, &sub.sub, &value, commit_lsn)
-                        .await
-                    {
-                        self.remove_client(&sub.client_id).await;
+                    for sub in subs {
+                        if !self
+                            .record_value(&sub.client_id, &sub.sub, &value, read_set.clone())
+                            .await
+                        {
+                            continue; // unchanged for this subscriber → no redundant push
+                        }
+                        if !self
+                            .send(&sub.client_id, &sub.sub, &value, commit_lsn)
+                            .await
+                        {
+                            self.remove_client(&sub.client_id).await;
+                        }
                     }
                 }
                 Err(code) => {
-                    tracing::warn!("re-exec of subscription {} failed: {}", sub.sub, code);
+                    let label = subs.first().map(|s| s.sub.as_str()).unwrap_or("?");
+                    tracing::warn!("re-exec of subscription {} failed: {}", label, code);
                 }
             }
         }
+    }
+
+    /// Canonical key grouping subscriptions whose result must be identical: same
+    /// procedure path, input, and headers (auth). Headers are sorted so order
+    /// doesn't matter.
+    fn dedup_key_of(path: &[String], input: &Value, headers: &HashMap<String, String>) -> String {
+        let mut hs: Vec<(&String, &String)> = headers.iter().collect();
+        hs.sort();
+        json!({ "p": path, "i": input, "h": hs }).to_string()
     }
 
     /// Refresh the subscription's read-set from the latest run (so dependencies
@@ -368,6 +394,43 @@ mod tests {
         }
     }
 
+    /// Many clients on the SAME query (same path+input+headers) must share ONE
+    /// re-execution, not one per client — the fix for per-client fan-out cost.
+    #[tokio::test]
+    async fn identical_subscriptions_share_one_reexec() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+
+        let mut rxs = Vec::new();
+        for c in ["a", "b", "c"] {
+            rxs.push(reactor.register_client(c.into()).await);
+            sub(&reactor, c, "A").await; // identical path + input + headers
+        }
+
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: pulse_core::Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
+            .await;
+
+        // One execution shared across all three subscribers …
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            1,
+            "identical subs must coalesce"
+        );
+        // … and every subscriber still receives its push.
+        for rx in &mut rxs {
+            assert!(
+                rx.try_recv().is_ok(),
+                "each subscriber must get the fanned-out result"
+            );
+        }
+    }
+
     /// Matching subscriptions must re-execute concurrently, not one-at-a-time —
     /// otherwise a fan-out wave's tail waits behind every prior worker round-trip.
     #[tokio::test]
@@ -377,17 +440,21 @@ mod tests {
             barrier: Arc::new(tokio::sync::Barrier::new(N)),
         }));
 
-        // N subscriptions on the SAME channel — one change fans out to all N.
+        // N subscriptions on DISTINCT channels — a change per channel fans out to
+        // N *distinct* re-execs (identical subs would coalesce into one, so they
+        // must differ to exercise parallelism).
+        let mut changes = Vec::new();
         for i in 0..N {
             reactor.register_client(format!("c{i}")).await;
-            sub(&reactor, &format!("c{i}"), "A").await;
+            sub(&reactor, &format!("c{i}"), &format!("A{i}")).await;
+            changes.push(insert_into(&format!("A{i}")));
         }
 
         let applied = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             reactor.apply_change_set(ChangeSet {
                 commit_lsn: pulse_core::Lsn::ZERO,
-                changes: vec![insert_into("A")],
+                changes,
             }),
         )
         .await;
