@@ -255,9 +255,11 @@ mod tests {
     #[test]
     fn delete_survives_concurrent_edit() {
         // Shared starting state with two words present.
-        let base =
-            apply_update(&empty_state(), &insert_update(&empty_state(), "DELETEME-keep", 0))
-                .unwrap();
+        let base = apply_update(
+            &empty_state(),
+            &insert_update(&empty_state(), "DELETEME-keep", 0),
+        )
+        .unwrap();
 
         // Client X (offline) deletes the leading "DELETEME-" (8 chars at index 0).
         let delete_update = {
@@ -279,15 +281,24 @@ mod tests {
         let insert_at_end = insert_update(&base, " inserted", 13);
 
         // Merge both onto base, in both orders — must converge and honor delete.
-        let forward =
-            apply_update(&apply_update(&base, &delete_update).unwrap(), &insert_at_end).unwrap();
-        let backward =
-            apply_update(&apply_update(&base, &insert_at_end).unwrap(), &delete_update).unwrap();
+        let forward = apply_update(
+            &apply_update(&base, &delete_update).unwrap(),
+            &insert_at_end,
+        )
+        .unwrap();
+        let backward = apply_update(
+            &apply_update(&base, &insert_at_end).unwrap(),
+            &delete_update,
+        )
+        .unwrap();
 
         let body = read_body(&forward);
         assert!(!body.contains("DELETEME"), "delete lost: {body:?}");
         assert!(body.contains("keep"), "surviving text lost: {body:?}");
-        assert!(body.contains("inserted"), "concurrent insert lost: {body:?}");
+        assert!(
+            body.contains("inserted"),
+            "concurrent insert lost: {body:?}"
+        );
         assert_eq!(read_body(&forward), read_body(&backward));
     }
 }

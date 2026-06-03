@@ -421,7 +421,10 @@ mod tests {
 
         let out = collect_headers(&headers);
         assert_eq!(out.get("x-ok").map(String::as_str), Some("yes"));
-        assert!(!out.contains_key("x-bad"), "non-ascii header must be dropped");
+        assert!(
+            !out.contains_key("x-bad"),
+            "non-ascii header must be dropped"
+        );
     }
 
     #[test]

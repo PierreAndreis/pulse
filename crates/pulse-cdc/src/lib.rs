@@ -257,11 +257,18 @@ mod tests {
             data: big.clone(),
         })
         .unwrap();
-        assert!(full.len() > MAX_PAYLOAD, "fixture not large enough: {}", full.len());
+        assert!(
+            full.len() > MAX_PAYLOAD,
+            "fixture not large enough: {}",
+            full.len()
+        );
 
         let encoded = encode_payload("n1", &big).unwrap();
         assert!(encoded.len() <= MAX_PAYLOAD);
-        assert!(encoded.contains("\"kind\":\"resync\""), "json was: {encoded}");
+        assert!(
+            encoded.contains("\"kind\":\"resync\""),
+            "json was: {encoded}"
+        );
 
         // And it decodes back to a Resync wire carrying the origin.
         let back: Wire = serde_json::from_str(&encoded).unwrap();

@@ -542,7 +542,10 @@ mod tests {
     #[test]
     fn gt_is_exclusive_gte_inclusive() {
         let mut rs = ReadSet::new();
-        rs.add_filter(TableId::new("t"), cond("n", FilterOp::Gte, KeyValue::Int(100)));
+        rs.add_filter(
+            TableId::new("t"),
+            cond("n", FilterOp::Gte, KeyValue::Int(100)),
+        );
         let at_100 = Change {
             new: Some(row(&[("n", KeyValue::Int(100))])),
             ..insert("t", 1)
@@ -555,7 +558,10 @@ mod tests {
         assert!(!rs.matches_change(&at_99));
 
         let mut rs_gt = ReadSet::new();
-        rs_gt.add_filter(TableId::new("t"), cond("n", FilterOp::Gt, KeyValue::Int(100)));
+        rs_gt.add_filter(
+            TableId::new("t"),
+            cond("n", FilterOp::Gt, KeyValue::Int(100)),
+        );
         let at_101 = Change {
             new: Some(row(&[("n", KeyValue::Int(101))])),
             ..insert("t", 3)
@@ -565,12 +571,18 @@ mod tests {
 
         // Symmetric Lt / Lte.
         let mut rs_lte = ReadSet::new();
-        rs_lte.add_filter(TableId::new("t"), cond("n", FilterOp::Lte, KeyValue::Int(100)));
+        rs_lte.add_filter(
+            TableId::new("t"),
+            cond("n", FilterOp::Lte, KeyValue::Int(100)),
+        );
         assert!(rs_lte.matches_change(&at_100)); // Lte includes the bound
         assert!(!rs_lte.matches_change(&at_101));
 
         let mut rs_lt = ReadSet::new();
-        rs_lt.add_filter(TableId::new("t"), cond("n", FilterOp::Lt, KeyValue::Int(100)));
+        rs_lt.add_filter(
+            TableId::new("t"),
+            cond("n", FilterOp::Lt, KeyValue::Int(100)),
+        );
         assert!(!rs_lt.matches_change(&at_100)); // Lt excludes the bound
         assert!(rs_lt.matches_change(&at_99));
     }
@@ -579,7 +591,10 @@ mod tests {
     fn cross_variant_order_never_matches() {
         // Ordered ops across KeyValue variants → `order` returns None → no match.
         let mut rs = ReadSet::new();
-        rs.add_filter(TableId::new("t"), cond("n", FilterOp::Gte, KeyValue::Int(100)));
+        rs.add_filter(
+            TableId::new("t"),
+            cond("n", FilterOp::Gte, KeyValue::Int(100)),
+        );
         let text_row = Change {
             new: Some(row(&[("n", KeyValue::Text("x".into()))])),
             ..insert("t", 1)
@@ -668,8 +683,11 @@ mod tests {
     }
 
     fn cond_strategy() -> impl Strategy<Value = Cond> {
-        (field_strategy(), op_strategy(), kv_strategy())
-            .prop_map(|(field, op, value)| Cond { field, op, value })
+        (field_strategy(), op_strategy(), kv_strategy()).prop_map(|(field, op, value)| Cond {
+            field,
+            op,
+            value,
+        })
     }
 
     fn filter_strategy() -> impl Strategy<Value = Filter> {
@@ -677,8 +695,7 @@ mod tests {
     }
 
     fn row_strategy() -> impl Strategy<Value = RowValues> {
-        vec((field_strategy(), kv_strategy()), 0..4)
-            .prop_map(|pairs| pairs.into_iter().collect())
+        vec((field_strategy(), kv_strategy()), 0..4).prop_map(|pairs| pairs.into_iter().collect())
     }
 
     fn opt_row_strategy() -> impl Strategy<Value = Option<RowValues>> {
@@ -958,7 +975,10 @@ mod tests {
         };
 
         // count(): read_cols empty → value-only update is pruned (returns false fast).
-        bench("count() [pruned]", Filter::with_read_cols(conds.clone(), vec![]));
+        bench(
+            "count() [pruned]",
+            Filter::with_read_cols(conds.clone(), vec![]),
+        );
         // full-doc query: read_cols None → must invalidate on every matching update.
         bench("full-doc [re-runs]", Filter::new(conds));
     }

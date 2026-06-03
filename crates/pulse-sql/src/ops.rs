@@ -1213,7 +1213,12 @@ mod tests {
             "messages",
             vec![
                 col("_id", "_id", PgTypeClass::Uuid, Some("messages")),
-                col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels")),
+                col(
+                    "channel_id",
+                    "channelId",
+                    PgTypeClass::Uuid,
+                    Some("channels"),
+                ),
             ],
         )
     }
@@ -1272,10 +1277,7 @@ mod tests {
         let catalog = catalog_messages();
         let op = DbOp::Query {
             table: "messages".to_string(),
-            predicates: vec![eq_pred(
-                "channelId",
-                json!(format!("channels:{UUID_A}")),
-            )],
+            predicates: vec![eq_pred("channelId", json!(format!("channels:{UUID_A}")))],
             filters: vec![],
             order_by: vec![],
             limit: None,
@@ -1345,7 +1347,12 @@ mod tests {
         let t = Table::from_columns(
             "messages",
             vec![
-                col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels")),
+                col(
+                    "channel_id",
+                    "channelId",
+                    PgTypeClass::Uuid,
+                    Some("channels"),
+                ),
                 col("score", "score", PgTypeClass::Float8, None),
             ],
         );
@@ -1413,10 +1420,7 @@ mod tests {
             &catalog,
             &mut rs,
         );
-        let keys = rs
-            .keys
-            .get(&TableId::new("messages"))
-            .expect("key present");
+        let keys = rs.keys.get(&TableId::new("messages")).expect("key present");
         assert!(keys.contains(&PrimaryKey::single(KeyValue::Uuid(uuid(UUID_A)))));
         assert!(rs.tables.is_empty(), "valid id is key, not table");
 
@@ -1471,7 +1475,12 @@ mod tests {
     #[test]
     fn json_to_key_value_coercions() {
         // id_ref string → Uuid (table-qualified decoded).
-        let id_col = col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels"));
+        let id_col = col(
+            "channel_id",
+            "channelId",
+            PgTypeClass::Uuid,
+            Some("channels"),
+        );
         assert_eq!(
             json_to_key_value(&json!(format!("channels:{UUID_A}")), &id_col),
             Some(KeyValue::Uuid(uuid(UUID_A)))

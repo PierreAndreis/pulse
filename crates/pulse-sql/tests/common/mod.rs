@@ -24,7 +24,9 @@ async fn url() -> Option<&'static str> {
         // Keep the container alive for the whole test process; the testcontainers
         // reaper cleans it up once the process exits.
         std::mem::forget(node);
-        Some(format!("postgres://postgres:postgres@{host}:{port}/postgres"))
+        Some(format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
     })
     .await
     .as_deref()

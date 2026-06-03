@@ -667,7 +667,12 @@ mod tests {
         }));
 
         let recorded = reactor
-            .record_value("nobody", "messages.list::ghost", &json!({ "x": 1 }), ReadSet::new())
+            .record_value(
+                "nobody",
+                "messages.list::ghost",
+                &json!({ "x": 1 }),
+                ReadSet::new(),
+            )
             .await;
 
         assert!(!recorded, "recording for an unknown sub is false");
