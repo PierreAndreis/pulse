@@ -66,4 +66,62 @@ describe("scaffoldApp", () => {
     expect(files["app/contract.ts"]).toContain("todos:");
     expect(files["app/todos.ts"]).toContain('os.todos.list.handler');
   });
+
+  it("minimal template omits the todos demo and leaves a clean slate", () => {
+    const min = scaffoldApp("my-app", "0.1.2", { template: "minimal" });
+    expect(min["app/todos.ts"]).toBeUndefined();
+    expect(min["app/contract.ts"]).toContain("export const contract = {}");
+    expect(min["app/schema.ts"]).toContain("defineSchema({");
+    expect(min["src/App.tsx"]).not.toContain("pulse.todos");
+  });
+
+  it("phrases the README's commands for the chosen package manager", () => {
+    const npm = scaffoldApp("my-app", "0.1.2", { pm: "npm" });
+    expect(npm["README.md"]).toContain("npm run dev");
+    expect(npm["README.md"]).toContain("npm install");
+    const pnpm = scaffoldApp("my-app", "0.1.2", { pm: "pnpm" });
+    expect(pnpm["README.md"]).toContain("pnpm dev");
+  });
+
+  it("ships ambient Vite types so `import.meta.env` typechecks", () => {
+    expect(files["src/vite-env.d.ts"]).toContain('reference types="vite/client"');
+  });
+
+  describe("with auth", () => {
+    const a = scaffoldApp("my-app", "9.9.9", { auth: true });
+
+    it("adds the Better Auth server, verify middleware, and client wiring", () => {
+      expect(a["app/auth.ts"]).toContain("betterAuth(");
+      expect(a["app/auth.ts"]).toContain("jwt()");
+      expect(a["app/authed.ts"]).toContain("pulseAuth({ jwksUrl })");
+      expect(a["src/auth-client.ts"]).toContain("jwtClient()");
+      expect(a["src/client.ts"]).toContain("bearerAuth(");
+      expect(a["vite.config.ts"]).toContain("toNodeHandler(auth)");
+    });
+
+    it("isolates Better Auth's tables in a separate `auth` schema", () => {
+      expect(a["db/init.sql"]).toContain("create schema if not exists auth");
+      expect(a["docker-compose.yml"]).toContain("/docker-entrypoint-initdb.d/init.sql");
+      // Better Auth migrates its own tables — they are NOT in the Pulse schema.
+      expect(a["app/schema.ts"]).not.toContain("sessions:");
+    });
+
+    it("pins the auth deps and adds the migrate script", () => {
+      const pkg = JSON.parse(a["package.json"]!);
+      expect(pkg.dependencies["@onveloz/pulse-auth"]).toBe("^9.9.9");
+      expect(pkg.dependencies["better-auth"]).toBeDefined();
+      expect(pkg.scripts["auth:migrate"]).toContain("@better-auth/cli");
+    });
+
+    it("scopes todos to the signed-in user via authed handlers", () => {
+      expect(a["app/schema.ts"]).toContain("ownerId: v.string()");
+      expect(a["app/todos.ts"]).toContain("os.todos.list.use(authed)");
+      expect(a["app/todos.ts"]).toContain("ctx.userId");
+    });
+
+    it("ignores real env files but ships an example", () => {
+      expect(a[".env.example"]).toContain("BETTER_AUTH_SECRET");
+      expect(a[".gitignore"]).toContain(".env");
+    });
+  });
 });

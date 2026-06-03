@@ -12,9 +12,10 @@
     "prepack": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@onveloz/pulse-schema": "workspace:*",
+    "@clack/prompts": "^1.5.0",
     "@onveloz/pulse-engine": "workspace:*",
     "@onveloz/pulse-runtime-node": "workspace:*",
+    "@onveloz/pulse-schema": "workspace:*",
     "pg": "^8.0.0"
   },
   "devDependencies": {

@@ -1,11 +1,32 @@
 // Generates a complete, ready-to-run Pulse app as an in-memory file map. Pure
 // (no fs) so it's unit-testable; bin.ts writes the map to disk.
 
+import { installCmd, runCmd, type PackageManager } from "./pm.js";
+
+/** Which starter to lay down: a working todos demo, or a clean slate. */
+export type Template = "todos" | "minimal";
+
+export interface ScaffoldOptions {
+  /** Package manager to phrase the README's run commands for. Default: pnpm. */
+  pm?: PackageManager;
+  /** Starter template. Default: todos. */
+  template?: Template;
+  /** Wire Better Auth (sign-in/up + JWT-protected handlers). Default: false. */
+  auth?: boolean;
+}
+
 /** Produce the full set of files for a new Pulse app named `name`, pinning the
  *  @onveloz/pulse-* deps to `version` (the CLI's own version, injected by
  *  bin.ts) so a scaffolded app matches the CLI that generated it. */
-export function scaffoldApp(name: string, version: string): Record<string, string> {
+export function scaffoldApp(
+  name: string,
+  version: string,
+  opts: ScaffoldOptions = {},
+): Record<string, string> {
   const PKG = version;
+  const pm = opts.pm ?? "pnpm";
+  const template = opts.template ?? "todos";
+  const auth = opts.auth ?? false;
   const safe = name.replace(/[^a-z0-9-]/gi, "-").toLowerCase() || "pulse-app";
 
   const files: Record<string, string> = {};
@@ -113,7 +134,8 @@ export default definePulseApp();
 </html>
 `;
 
-  files["app/schema.ts"] = `import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
+  if (template === "todos") {
+    files["app/schema.ts"] = `import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
 
 export default defineSchema({
   todos: defineTable({
@@ -123,7 +145,7 @@ export default defineSchema({
 });
 `;
 
-  files["app/contract.ts"] = `import { oc } from "@onveloz/pulse-contract";
+    files["app/contract.ts"] = `import { oc } from "@onveloz/pulse-contract";
 import { v } from "@onveloz/pulse-schema";
 
 export const contract = {
@@ -135,7 +157,7 @@ export const contract = {
 };
 `;
 
-  files["app/todos.ts"] = `import { implement } from "@onveloz/pulse-server";
+    files["app/todos.ts"] = `import { implement } from "@onveloz/pulse-server";
 import { contract } from "./contract.js";
 import "./_generated/dataModel.js";
 
@@ -159,9 +181,34 @@ export const toggle = os.todos.toggle.handler(async ({ ctx, input }) => {
 });
 `;
 
-  files["app/app.ts"] = `export { default as schema } from "./schema.js";
+    files["app/app.ts"] = `export { default as schema } from "./schema.js";
 export * as todos from "./todos.js";
 `;
+  } else {
+    // minimal: a clean slate — one empty table to codegen against, an empty
+    // contract, and no handlers. Add tables to the schema, surface them in the
+    // contract, and write a handlers module that `implement(contract)`s them.
+    files["app/schema.ts"] = `import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
+
+export default defineSchema({
+  // Add your first table, e.g.
+  // messages: defineTable({ body: v.string() }),
+});
+`;
+
+    files["app/contract.ts"] = `import type { oc } from "@onveloz/pulse-contract";
+
+// Describe your queries + mutations here, e.g.
+//   messages: {
+//     list: oc.reactive().output(v.array(v.doc("messages"))),
+//   }
+export const contract = {};
+`;
+
+    files["app/app.ts"] = `export { default as schema } from "./schema.js";
+// Re-export your handler modules here, e.g. \`export * as messages from "./messages.js";\`
+`;
+  }
 
   files["src/client.ts"] = `import { createClient } from "@onveloz/pulse-client";
 import type { contract } from "../app/contract.js";
@@ -171,6 +218,9 @@ export const pulse = createClient<typeof contract>({
   headers: () => ({ authorization: "Bearer demo" }),
 });
 `;
+
+  // Ambient Vite types so `import.meta.env` typechecks in a standalone app.
+  files["src/vite-env.d.ts"] = `/// <reference types="vite/client" />\n`;
 
   files["src/main.tsx"] = `import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -183,7 +233,22 @@ createRoot(document.getElementById("root")!).render(
 );
 `;
 
-  files["src/App.tsx"] = `import { useEffect, useState } from "react";
+  if (template === "minimal") {
+    files["src/App.tsx"] = `export function App() {
+  return (
+    <main style={{ maxWidth: 520, margin: "60px auto", fontFamily: "system-ui" }}>
+      <h1>${safe}</h1>
+      <p>
+        Your Pulse app is running. Add a table in <code>app/schema.ts</code>,
+        describe it in <code>app/contract.ts</code>, write its handlers, then
+        subscribe with <code>pulse</code> from <code>src/client.ts</code>.
+      </p>
+    </main>
+  );
+}
+`;
+  } else {
+    files["src/App.tsx"] = `import { useEffect, useState } from "react";
 import type { Doc } from "@onveloz/pulse-schema";
 import { pulse } from "./client.js";
 
@@ -193,7 +258,7 @@ export function App() {
   const [todos, setTodos] = useState<Todo[]>([]);
   const [title, setTitle] = useState("");
 
-  useEffect(() => pulse.todos.list.subscribe(undefined, (t) => setTodos(t as Todo[])), []);
+  useEffect(() => pulse.todos.list.subscribe({}, (t) => setTodos(t as Todo[])), []);
 
   async function add() {
     if (!title.trim()) return;
@@ -235,24 +300,31 @@ export function App() {
   );
 }
 `;
+  }
 
+  const dev = runCmd(pm, "dev");
+  const editLine =
+    template === "todos"
+      ? "Edit `app/schema.ts`, `app/contract.ts`, and `app/todos.ts` to build your app.\n" +
+        "`src/App.tsx` shows reactive subscribe + optimistic offline-safe mutate."
+      : "Add a table in `app/schema.ts`, describe it in `app/contract.ts`, write its\n" +
+        "handlers, and re-export them from `app/app.ts`. `src/client.ts` is your typed client.";
   files["README.md"] = `# ${safe}
 
 A Pulse app — reactive + offline-first on standard Postgres.
 
 \`\`\`bash
-pnpm install
-pnpm db          # start Postgres (Docker)
-pnpm dev         # codegen + schema sync + engine (:8787) + Vite (:5273)
+${installCmd(pm)}
+${runCmd(pm, "db")}          # start Postgres (Docker)
+${dev}         # codegen + schema sync + engine (:8787) + Vite (:5273)
 \`\`\`
 
-\`pnpm dev\` runs everything: it generates the typed data model, syncs your
+\`${dev}\` runs everything: it generates the typed data model, syncs your
 schema to the database (safe additive changes auto-apply; risky/destructive ones
 are printed for review via \`pulse migrate app/schema.ts --diff\`), starts the
 Pulse engine, and launches Vite alongside it.
 
-Edit \`app/schema.ts\`, \`app/contract.ts\`, and \`app/todos.ts\` to build your app.
-\`src/App.tsx\` shows reactive subscribe + optimistic offline-safe mutate.
+${editLine}
 `;
 
   files[".gitignore"] = `node_modules
@@ -263,5 +335,360 @@ app/_generated
 .DS_Store
 `;
 
+  if (auth) applyAuth(files, { safe, PKG, pm, template });
+
   return files;
+}
+
+/**
+ * Layer Better Auth onto the generated file map. Design decisions:
+ *
+ *  - **Better Auth owns its tables in a separate `auth` Postgres schema.** Pulse
+ *    tables are hard-wired to `_id`/`_creation_time`, which is incompatible with
+ *    Better Auth's `id`/`createdAt` shape — so we let Better Auth migrate its own
+ *    tables, isolated in the `auth` schema (seeded by a docker init script) so
+ *    `pulse dev`'s `public`-scoped schema sync never sees or drops them.
+ *  - **The issuer runs inside the Vite dev server.** A tiny Vite plugin mounts
+ *    Better Auth's node handler at `/api/auth/*`; its `jwt()` plugin exposes a
+ *    JWKS at `/api/auth/jwks`. `@onveloz/pulse-auth`'s `pulseAuth({ jwksUrl })`
+ *    verifies bearer tokens against it inside the worker, exposing `ctx.userId`.
+ *  - **App tables key off `ctx.userId`** (the verified JWT subject) — the Convex
+ *    model — rather than a foreign key into Better Auth's tables.
+ */
+function applyAuth(
+  files: Record<string, string>,
+  o: { safe: string; PKG: string; pm: PackageManager; template: Template },
+): void {
+  const { safe, PKG, pm, template } = o;
+
+  // 1. package.json: auth deps + a migrate script that creates Better Auth's tables.
+  const pkg = JSON.parse(files["package.json"]!) as {
+    dependencies: Record<string, string>;
+    devDependencies: Record<string, string>;
+    scripts: Record<string, string>;
+  };
+  pkg.dependencies["@onveloz/pulse-auth"] = `^${PKG}`;
+  pkg.dependencies["better-auth"] = "^1.6.14";
+  pkg.dependencies["pg"] = "^8.13.0";
+  pkg.devDependencies["@types/pg"] = "^8.11.0";
+  // Creates Better Auth's tables in the `auth` schema. Re-run after changing auth plugins.
+  pkg.scripts["auth:migrate"] = "npx @better-auth/cli@latest migrate --config app/auth.ts -y";
+  files["package.json"] = JSON.stringify(pkg, null, 2) + "\n";
+
+  // 2. Seed the `auth` schema on first DB init so Better Auth's migrate has a home.
+  files["db/init.sql"] = `-- Better Auth owns its tables here, isolated from Pulse's \`public\` schema so
+-- \`pulse dev\` never introspects (or drops) them. Runs once, on first DB init.
+create schema if not exists auth;
+`;
+  files["docker-compose.yml"] = files["docker-compose.yml"]!.replace(
+    /(\n    ports: \["54329:5432"\])/,
+    `$1\n    volumes:\n      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro`,
+  );
+
+  // 3. The Better Auth server: email/password + the jwt plugin (JWKS issuer).
+  files["app/auth.ts"] = `import { betterAuth } from "better-auth";
+import { jwt } from "better-auth/plugins";
+import { Pool } from "pg";
+
+const databaseUrl =
+  process.env.DATABASE_URL ?? "postgres://pulse:pulse@127.0.0.1:54329/pulse";
+
+// Better Auth keeps its tables in the \`auth\` schema (see db/init.sql) so Pulse's
+// schema sync — which only manages \`public\` — never touches them.
+const pool = new Pool({ connectionString: databaseUrl, options: "-c search_path=auth,public" });
+
+export const auth = betterAuth({
+  database: pool,
+  baseURL: process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:5273",
+  // Set BETTER_AUTH_SECRET in .env for anything but local dev (see .env.example).
+  secret: process.env.BETTER_AUTH_SECRET ?? "pulse-dev-secret-change-in-production-0001",
+  emailAndPassword: { enabled: true },
+  // The jwt plugin issues signed JWTs + exposes a JWKS at /api/auth/jwks, which
+  // the Pulse worker verifies bearer tokens against.
+  plugins: [jwt()],
+  trustedOrigins: ["http://127.0.0.1:5273", "http://localhost:5273"],
+});
+`;
+
+  // 4. The verify side: pulseAuth checks the bearer JWT against the JWKS, then
+  //    every \`.use(authed)\` handler gets \`ctx.userId\` (the token subject).
+  files["app/authed.ts"] = `import { pulseAuth } from "@onveloz/pulse-auth";
+
+// In dev the issuer is the Vite-hosted Better Auth server; point this at your
+// deployed auth origin's JWKS in production.
+const jwksUrl = process.env.PULSE_JWKS_URL ?? "http://127.0.0.1:5273/api/auth/jwks";
+
+export const { authed } = pulseAuth({ jwksUrl });
+`;
+
+  // 5. Host the Better Auth handler inside the Vite dev server at /api/auth/*.
+  files["vite.config.ts"] = `import { definePulseApp } from "@onveloz/pulse-bundler";
+import { toNodeHandler } from "better-auth/node";
+import { auth } from "./app/auth.js";
+
+// Mount Better Auth's routes on the dev server, so /api/auth/* (sign-in, sign-up,
+// and the JWKS the worker verifies against) is served from the same origin as the app.
+export default definePulseApp({
+  vite: {
+    plugins: [
+      {
+        name: "pulse-better-auth",
+        configureServer(server) {
+          const handler = toNodeHandler(auth);
+          server.middlewares.use((req, res, next) => {
+            if (req.url?.startsWith("/api/auth")) {
+              handler(req, res);
+              return;
+            }
+            next();
+          });
+        },
+      },
+    ],
+  },
+});
+`;
+
+  // 6. The Better Auth browser client (React) + the jwt client plugin so we can
+  //    mint a bearer token for the Pulse client.
+  files["src/auth-client.ts"] = `import { createAuthClient } from "better-auth/react";
+import { jwtClient } from "better-auth/client/plugins";
+
+export const authClient = createAuthClient({
+  baseURL: "http://127.0.0.1:5273",
+  plugins: [jwtClient()],
+});
+`;
+
+  // 7. Attach a fresh bearer token (from Better Auth) to every Pulse request.
+  files["src/client.ts"] = `import { createClient } from "@onveloz/pulse-client";
+import { bearerAuth } from "@onveloz/pulse-auth";
+import type { contract } from "../app/contract.js";
+import { authClient } from "./auth-client.js";
+
+export const pulse = createClient<typeof contract>({
+  url: import.meta.env.VITE_PULSE_ENGINE_URL ?? "http://127.0.0.1:8787",
+  // Called per request: returns the current JWT (null when signed out).
+  headers: bearerAuth(async () => {
+    const { data } = await authClient.token();
+    return data?.token ?? null;
+  }),
+});
+`;
+
+  // 8. Auth-scoped data: todos belong to the signed-in user (\`ownerId\`).
+  if (template === "todos") {
+    files["app/schema.ts"] = `import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
+
+export default defineSchema({
+  todos: defineTable({
+    ownerId: v.string(), // the signed-in user's id (JWT subject)
+    title: v.string(),
+    done: v.boolean(),
+  }),
+});
+`;
+
+    files["app/todos.ts"] = `import { implement } from "@onveloz/pulse-server";
+import { contract } from "./contract.js";
+import { authed } from "./authed.js";
+import "./_generated/dataModel.js";
+
+const os = implement(contract);
+
+// Every handler runs behind \`authed\`, so \`ctx.userId\` is the verified caller.
+export const list = os.todos.list.use(authed).handler(async ({ ctx }) => {
+  const all = await ctx.db.query("todos").collect();
+  return all.filter((t) => t.ownerId === ctx.userId);
+});
+
+export const add = os.todos.add.use(authed).handler(async ({ ctx, input }) => {
+  const id = await ctx.db.insert("todos", {
+    ownerId: ctx.userId,
+    title: input.title,
+    done: false,
+  });
+  const doc = await ctx.db.get(id);
+  if (!doc) throw new Error("insert failed");
+  return doc;
+});
+
+export const toggle = os.todos.toggle.use(authed).handler(async ({ ctx, input, errors }) => {
+  const doc = await ctx.db.get(input.id);
+  if (!doc || doc.ownerId !== ctx.userId) throw errors.NOT_FOUND();
+  await ctx.db.patch(input.id, { done: !doc.done });
+  return null;
+});
+`;
+  }
+
+  // 9. The UI: a sign-in / sign-up gate around the app.
+  files["src/App.tsx"] = authApp(safe, template);
+
+  // 10. .env.example + ignore real env files.
+  files[".env.example"] = `# Generate a real secret for anything but local dev: \`openssl rand -base64 32\`
+BETTER_AUTH_SECRET=pulse-dev-secret-change-in-production-0001
+BETTER_AUTH_URL=http://127.0.0.1:5273
+DATABASE_URL=postgres://pulse:pulse@127.0.0.1:54329/pulse
+`;
+  files[".gitignore"] = files[".gitignore"]! + ".env\n.env.local\n";
+
+  // 11. README: the extra migrate step + how auth is wired.
+  const install = installCmd(pm);
+  files["README.md"] = `# ${safe}
+
+A Pulse app — reactive + offline-first on standard Postgres, with Better Auth.
+
+\`\`\`bash
+${install}
+${runCmd(pm, "db")}            # start Postgres (Docker)
+${runCmd(pm, "auth:migrate")}  # create Better Auth's tables (auth schema)
+${runCmd(pm, "dev")}           # engine (:8787) + Vite (:5273), all of it
+\`\`\`
+
+Open http://127.0.0.1:5273, create an account, and you're in.
+
+## How auth is wired
+
+- \`app/auth.ts\` — the Better Auth server (email/password + a \`jwt()\` plugin that
+  exposes a JWKS at \`/api/auth/jwks\`). It runs inside the Vite dev server
+  (\`vite.config.ts\`) and keeps its tables in a separate \`auth\` Postgres schema.
+- \`app/authed.ts\` — \`pulseAuth({ jwksUrl })\` verifies the bearer JWT in the
+  worker; every handler that does \`.use(authed)\` gets \`ctx.userId\`.
+- \`src/auth-client.ts\` / \`src/client.ts\` — the browser signs in via Better Auth
+  and attaches a fresh JWT to every Pulse request with \`bearerAuth\`.
+- \`app/todos.ts\` — todos are scoped to the signed-in user via \`ownerId\`.
+
+In production, host \`app/auth.ts\` behind a real server, set \`BETTER_AUTH_SECRET\`
++ \`BETTER_AUTH_URL\` (see \`.env.example\`), and point \`PULSE_JWKS_URL\` at its JWKS.
+`;
+}
+
+/** The sign-in/up gated App. For the todos template the authed area is the todo
+ *  list; for minimal it's a welcome panel. */
+function authApp(safe: string, template: Template): string {
+  const authedArea =
+    template === "todos"
+      ? `<Todos />`
+      : `<p>You're signed in. Build your app from <code>app/schema.ts</code>.</p>`;
+
+  const todosComponent =
+    template === "todos"
+      ? `import type { Doc } from "@onveloz/pulse-schema";
+
+type Todo = Doc<"todos">;
+
+function Todos() {
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [title, setTitle] = useState("");
+
+  useEffect(() => pulse.todos.list.subscribe({}, (t) => setTodos(t as Todo[])), []);
+
+  async function add() {
+    if (!title.trim()) return;
+    const text = title;
+    setTitle("");
+    await pulse.todos.add.call({ title: text });
+  }
+
+  return (
+    <>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={title}
+          placeholder="New todo…"
+          onChange={(e) => setTitle(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && add()}
+          style={{ flex: 1, padding: 8 }}
+        />
+        <button onClick={add}>Add</button>
+      </div>
+      <ul>
+        {todos.map((t) => (
+          <li
+            key={t._id}
+            onClick={() => pulse.todos.toggle.call({ id: t._id })}
+            style={{ textDecoration: t.done ? "line-through" : "none", cursor: "pointer" }}
+          >
+            {t.title}
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+`
+      : "";
+
+  return `import { useEffect, useState } from "react";
+import { authClient } from "./auth-client.js";
+import { pulse } from "./client.js";
+
+${todosComponent}function Auth() {
+  const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    const res =
+      mode === "sign-up"
+        ? await authClient.signUp.email({ name, email, password })
+        : await authClient.signIn.email({ email, password });
+    if (res.error) setError(res.error.message ?? "Something went wrong");
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      <h2>{mode === "sign-up" ? "Create an account" : "Sign in"}</h2>
+      {mode === "sign-up" && (
+        <input placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8 }} />
+      )}
+      <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} style={{ padding: 8 }} />
+      <input
+        placeholder="Password"
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && submit()}
+        style={{ padding: 8 }}
+      />
+      <button onClick={submit}>{mode === "sign-up" ? "Sign up" : "Sign in"}</button>
+      {error && <p style={{ color: "crimson" }}>{error}</p>}
+      <button
+        onClick={() => setMode(mode === "sign-up" ? "sign-in" : "sign-up")}
+        style={{ background: "none", border: "none", color: "#555", cursor: "pointer" }}
+      >
+        {mode === "sign-up" ? "Have an account? Sign in" : "Need an account? Sign up"}
+      </button>
+    </div>
+  );
+}
+
+export function App() {
+  const { data: session, isPending } = authClient.useSession();
+
+  return (
+    <main style={{ maxWidth: 520, margin: "60px auto", fontFamily: "system-ui" }}>
+      <h1>${safe}</h1>
+      {isPending ? (
+        <p>Loading…</p>
+      ) : session ? (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>{session.user.email}</span>
+            <button onClick={() => authClient.signOut()}>Sign out</button>
+          </div>
+          ${authedArea}
+        </>
+      ) : (
+        <Auth />
+      )}
+    </main>
+  );
+}
+`;
 }

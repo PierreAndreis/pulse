@@ -8,7 +8,7 @@ import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
 import { buildEngineEnv, resolveEngineBin } from "./dev.js";
-import { scaffoldApp } from "./scaffold.js";
+import { runNew } from "./new.js";
 import {
   diffSchema,
   dropStatement,
@@ -31,8 +31,17 @@ interface PgClient {
 
 const HELP = `pulse <command>
 
-  new <name>                 scaffold a fully-configured Pulse app (schema,
-                             contract, handlers, Vite client, Docker Postgres)
+  new [name] [options]       scaffold a fully-configured Pulse app (schema,
+                             contract, handlers, Vite client, Docker Postgres).
+                             Interactive by default; prompts for the name,
+                             package manager, and starter. Options:
+                               --pm pnpm|npm|yarn|bun   package manager
+                               --template todos|minimal  starter
+                               --[no-]auth               wire Better Auth
+                               --[no-]install            install deps
+                               --[no-]db                 start Postgres
+                               --[no-]git                git init
+                               -y, --yes                 accept all defaults
   gen <schema.ts> [out.ts]   generate the Doc/Id data model from a schema
                              (default out: <schemaDir>/_generated/dataModel.ts)
   migrate <schema.ts> [--out file.sql]
@@ -217,25 +226,9 @@ async function main(): Promise<void> {
       process.stdout.write(HELP);
       return;
 
-    case "new": {
-      const name = args[0];
-      if (!name || name.startsWith("-")) throw new Error("usage: pulse new <name>");
-      const dir = resolve(name);
-      const files = scaffoldApp(name, cliVersion());
-      for (const [rel, contents] of Object.entries(files)) {
-        const out = resolve(dir, rel);
-        await mkdir(dirname(out), { recursive: true });
-        await writeFile(out, contents, "utf8");
-      }
-      process.stdout.write(
-        `pulse: created ${name}/ (${Object.keys(files).length} files)\n\n` +
-          `  cd ${name}\n` +
-          `  pnpm install\n` +
-          `  pnpm db        # start Postgres (Docker)\n` +
-          `  pnpm dev       # codegen + schema sync + engine + Vite — all of it\n`,
-      );
+    case "new":
+      await runNew(args, cliVersion());
       return;
-    }
 
     case "gen": {
       const schemaPath = args[0];
