@@ -27,6 +27,16 @@ describe("scaffoldApp", () => {
     }
   });
 
+  it("ships a deployable Dockerfile (engine + bun worker) on a glibc-compatible base", () => {
+    expect(Object.keys(files)).toContain("Dockerfile");
+    expect(Object.keys(files)).toContain(".dockerignore");
+    // Base must satisfy the prebuilt engine's glibc 2.39 floor.
+    expect(files["Dockerfile"]).toContain("node:22-trixie-slim");
+    expect(files["Dockerfile"]).toContain("oven/bun");
+    expect(files["Dockerfile"]).toContain("npx pulse gen app/schema.ts");
+    expect(files[".dockerignore"]).toContain("node_modules");
+  });
+
   it("ships agent house-rules; CLAUDE.md imports AGENTS.md", () => {
     expect(files["AGENTS.md"]).toContain("agent instructions");
     expect(files["AGENTS.md"]).toContain("app/contract.ts");

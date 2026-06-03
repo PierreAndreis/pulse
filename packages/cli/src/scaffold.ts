@@ -332,6 +332,56 @@ ${editLine}
   files["AGENTS.md"] = agentsDoc(safe, template, auth, pm);
   files["CLAUDE.md"] = `# ${safe}\n\nThis project's agent instructions live in AGENTS.md — read it before changing files.\n\n@AGENTS.md\n`;
 
+  // Deployment: the Pulse backend (engine + the bun worker that runs handlers).
+  // Tested end-to-end (build → run against Postgres → authed/unauthed RPC).
+  files["Dockerfile"] = `# syntax=docker/dockerfile:1
+
+# The Pulse backend: the engine + the bun worker that runs your app's handlers.
+# Serves the API (:8787). Pair it with your \`vite build\` frontend, hosted
+# statically and pointed at this server's public URL via VITE_PULSE_ENGINE_URL.
+# Requires a Postgres reachable at DATABASE_URL.
+#
+# Debian trixie (glibc 2.41): the prebuilt engine binary is built on glibc 2.39,
+# so an older base (e.g. bookworm / glibc 2.36) fails with "GLIBC_2.39 not found".
+FROM node:22-trixie-slim
+
+# bun runs the worker — it executes your app's TypeScript directly.
+COPY --from=oven/bun:1 /usr/local/bin/bun /usr/local/bin/bun
+
+WORKDIR /app
+
+# Install deps first (better layer caching). Includes the Pulse CLI + engine,
+# which are devDependencies, so install everything.
+COPY package.json ./
+RUN npm install --no-audit --no-fund
+
+# App source.
+COPY . .
+
+# Generate the typed data model the handlers import, then bake the engine binary
+# for this platform into the image so startup needs no network.
+RUN npx pulse gen app/schema.ts \\
+ && node -e "import('@onveloz/pulse-engine').then(m=>m.ensureEngine()).then(p=>{if(!p){console.error('no prebuilt engine for this platform');process.exit(1)}console.log('cached engine:',p)})"
+
+ENV PULSE_PORT=8787 PULSE_WORKER_BIN=bun
+EXPOSE 8787
+
+# \`pulse dev\` without --start = codegen + safe schema sync (additive changes
+# auto-apply; destructive ones are refused) + run the engine and worker. Provide
+# DATABASE_URL at runtime${auth ? " (and PULSE_JWKS_URL pointing at your hosted Better Auth issuer)" : ""}.
+CMD ["npx", "pulse", "dev", "app/app.ts"]
+`;
+  files[".dockerignore"] = `node_modules
+dist
+app/_generated
+schema.sql
+.env
+.env.local
+.git
+*.log
+.DS_Store
+`;
+
   files[".gitignore"] = `node_modules
 dist
 schema.sql
@@ -771,6 +821,10 @@ feature by declaring a **schema**, describing a typed **contract**, implementing
 
 ## Deploy
 
-- \`pulse deploy app/app.ts\` builds a self-contained release bundle (schema DDL + a run script).
+- \`Dockerfile\` builds the Pulse backend (engine + bun worker). Run it with a
+  \`DATABASE_URL\`${auth ? " and \`PULSE_JWKS_URL\` (your hosted Better Auth issuer)" : ""}; it serves the API on :8787.
+- The frontend is separate: \`${runCmd(pm, "build")}\` produces static assets — host
+  them anywhere and set \`VITE_PULSE_ENGINE_URL\` to the backend's public URL.
+- \`pulse deploy app/app.ts\` also emits a self-contained bundle (schema DDL + run script).
 `;
 }
