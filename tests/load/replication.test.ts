@@ -15,7 +15,7 @@ import { startEngine, applySql, type Harness } from "../integration/harness.js";
 import { generateDDL } from "../../packages/cli/src/ddl.js";
 import ormSchema from "../integration/fixtures/orm/schema.js";
 import type { contract } from "../integration/fixtures/orm/contract.js";
-import { summarize, fmt } from "./metrics.js";
+import { summarize, fmt, runLoad } from "./metrics.js";
 
 const execFileAsync = promisify(execFile);
 const APP = resolve(process.cwd(), "tests/integration/fixtures/orm/app.ts");
@@ -136,6 +136,39 @@ describe("replication: cross-node push latency (LISTEN/NOTIFY bus)", () => {
         }
         expect(wrote).toBe(true);
         await waitFor(() => (seen.at(-1) ?? 0) >= base + 2, 20_000);
+      } finally {
+        unsub();
+      }
+    },
+    120_000,
+  );
+});
+
+describe("replication: write throughput with the bus active", () => {
+  test(
+    "sustained concurrent writes on A keep flowing and reach B",
+    async () => {
+      // A subscriber on B so every write also fans out cross-node (publish + NOTIFY
+      // + remote re-exec are all exercised, not just the local commit path).
+      let lastSeen = 0;
+      const unsub = cb.w.activeCount.subscribe({}, (n) => {
+        lastSeen = n as number;
+      });
+      try {
+        await waitFor(() => lastSeen >= 0);
+        const base = lastSeen;
+
+        const W = 400;
+        const { latencies, errors, wallMs } = await runLoad(W, 32, (i) =>
+          ca.w.addWidget.call({ name: `t${i}`, qty: 1, active: true }),
+        );
+        const s = summarize(latencies, errors, wallMs);
+        // eslint-disable-next-line no-console
+        console.log("\n" + fmt("writes on A (c=32, bus on)", s));
+
+        expect(s.errors).toBe(0);
+        // All writes durably landed and propagated to B's cross-node count.
+        await waitFor(() => lastSeen >= base + W, 30_000);
       } finally {
         unsub();
       }
