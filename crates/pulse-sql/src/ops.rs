@@ -75,6 +75,7 @@ pub struct Predicate {
 pub enum FilterExpr {
     And { and: Vec<FilterExpr> },
     Or { or: Vec<FilterExpr> },
+    Not { not: Box<FilterExpr> },
     Cmp(Predicate),
 }
 
@@ -435,6 +436,7 @@ fn render_expr(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", parts.join(" OR ")))
         }
+        FilterExpr::Not { not } => Ok(format!("NOT ({})", render_expr(not, t, binds)?)),
     }
 }
 
@@ -523,6 +525,22 @@ fn and_dnf(a: Vec<Vec<Cond>>, b: &[Vec<Cond>]) -> Option<Vec<Vec<Cond>>> {
     Some(out)
 }
 
+/// The negation of a comparison op, or `None` when it can't be flipped precisely
+/// (`LIKE`/`ILIKE` — `NOT LIKE` has no read-set matcher op, so it broadens).
+fn flip_op(op: PredOp) -> Option<PredOp> {
+    Some(match op {
+        PredOp::Eq => PredOp::Neq,
+        PredOp::Neq => PredOp::Eq,
+        PredOp::Gt => PredOp::Lte,
+        PredOp::Gte => PredOp::Lt,
+        PredOp::Lt => PredOp::Gte,
+        PredOp::Lte => PredOp::Gt,
+        PredOp::IsNull => PredOp::IsNotNull,
+        PredOp::IsNotNull => PredOp::IsNull,
+        PredOp::Like | PredOp::Ilike => return None,
+    })
+}
+
 /// DNF of a filter expression. `None` if it would exceed {@link DNF_CAP}.
 fn expr_dnf(t: &Table, e: &FilterExpr) -> Option<Vec<Vec<Cond>>> {
     match e {
@@ -546,6 +564,38 @@ fn expr_dnf(t: &Table, e: &FilterExpr) -> Option<Vec<Vec<Cond>>> {
             }
             Some(out)
         }
+        FilterExpr::Not { not } => negate_dnf(t, not),
+    }
+}
+
+/// DNF of `NOT(e)`, pushing the negation to the leaves via De Morgan so OR/AND/NOT
+/// all keep precise (flip-able) read-set filters.
+fn negate_dnf(t: &Table, e: &FilterExpr) -> Option<Vec<Vec<Cond>>> {
+    match e {
+        FilterExpr::Cmp(p) => Some(match flip_op(p.op) {
+            Some(op) => cmp_dnf(t, &p.field, op, &p.value),
+            None => vec![vec![]], // un-negatable leaf → match-all (coarse)
+        }),
+        // NOT(a AND b ...) = (NOT a) OR (NOT b) ...
+        FilterExpr::And { and } => {
+            let mut out = Vec::new();
+            for c in and {
+                out.extend(negate_dnf(t, c)?);
+                if out.len() > DNF_CAP {
+                    return None;
+                }
+            }
+            Some(out)
+        }
+        // NOT(a OR b ...) = (NOT a) AND (NOT b) ...
+        FilterExpr::Or { or } => {
+            let mut dnf = vec![Vec::new()];
+            for c in or {
+                dnf = and_dnf(dnf, &negate_dnf(t, c)?)?;
+            }
+            Some(dnf)
+        }
+        FilterExpr::Not { not } => expr_dnf(t, not), // double negation
     }
 }
 

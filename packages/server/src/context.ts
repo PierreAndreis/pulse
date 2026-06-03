@@ -60,6 +60,8 @@ export interface FilterBuilder<T extends string> {
   and(...conds: FilterCond[]): FilterCond;
   /** Any sub-condition holds — a real reactive OR (recorded as multiple filters). */
   or(...conds: FilterCond[]): FilterCond;
+  /** Negation. Pushed to leaves (De Morgan) for precise reactivity where possible. */
+  not(cond: FilterCond): FilterCond;
 }
 
 /** A reactive-safe, instrumented query over one table. Reads feed the read-set. */

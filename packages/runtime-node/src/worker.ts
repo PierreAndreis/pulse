@@ -96,6 +96,7 @@ function makeDb(requestId: string) {
       isNotNull: unary("isnotnull"),
       and: (...args: unknown[]) => ({ and: args }),
       or: (...args: unknown[]) => ({ or: args }),
+      not: (cond: unknown) => ({ not: cond }),
       in: (field: string, values: unknown[]) => ({
         or: (values ?? []).map((value) => ({ field, op: "eq", value })),
       }),

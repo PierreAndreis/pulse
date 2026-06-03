@@ -173,6 +173,53 @@ async fn capture_reads_or_filter_matches_either_branch() {
 }
 
 #[tokio::test]
+async fn capture_reads_not_filter_negates_precisely() {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());
+    let Ok(pool) = connect(&url, 2).await else {
+        eprintln!("skipping: no Postgres at {url}");
+        return;
+    };
+    let catalog = introspect(&pool, &chat_schema()).await.expect("introspect");
+    let a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let b = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
+
+    // .filter(q => q.not(q.eq(channelId, A))) → channelId <> A (precise via flip).
+    let op = DbOp::Query {
+        table: "messages".to_string(),
+        predicates: vec![],
+        filters: vec![FilterExpr::Not {
+            not: Box::new(FilterExpr::Cmp(Predicate {
+                field: "channelId".to_string(),
+                op: PredOp::Eq,
+                value: json!("channels:00000000-0000-0000-0000-000000000001"),
+            })),
+        }],
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        aggregate: None,
+        group_by: None,
+        mode: QueryMode::Collect,
+    };
+    let mut rs = ReadSet::new();
+    capture_reads(&op, &catalog, &mut rs);
+
+    assert!(
+        rs.tables.is_empty(),
+        "NOT(eq) should flip to a precise neq: {rs:?}"
+    );
+    assert!(
+        !rs.matches_change(&change_into(a)),
+        "channel A is excluded by NOT(=A)"
+    );
+    assert!(
+        rs.matches_change(&change_into(b)),
+        "channel B matches NOT(=A)"
+    );
+}
+
+#[tokio::test]
 async fn capture_reads_raw_matches_table_insert() {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://pulse:pulse@localhost:54329/pulse".to_string());

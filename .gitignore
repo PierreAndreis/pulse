@@ -38,3 +38,6 @@ pnpm-debug.log*
 # Tooling scratch
 .playwright-mcp/
 /packages/*/LICENSE
+
+# Claude Code transient worktrees
+.claude/worktrees/
