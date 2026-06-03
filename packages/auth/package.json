@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-auth",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "license": "MIT",
   "description": "Better Auth (JWT/JWKS) integration for Pulse — a verify-and-resolve middleware plus a client bearer helper.",

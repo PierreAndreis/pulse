@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-bundler",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "license": "MIT",
   "description": "Vite-based bundler preset for Pulse apps — definePulseApp() configures React, SSE-safe dev server, and SDK resolution in one line.",
