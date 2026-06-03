@@ -19,10 +19,21 @@ describe("scaffoldApp", () => {
       "src/main.tsx",
       "src/App.tsx",
       "README.md",
+      "AGENTS.md",
+      "CLAUDE.md",
       ".gitignore",
     ]) {
       expect(Object.keys(files)).toContain(f);
     }
+  });
+
+  it("ships agent house-rules; CLAUDE.md imports AGENTS.md", () => {
+    expect(files["AGENTS.md"]).toContain("agent instructions");
+    expect(files["AGENTS.md"]).toContain("app/contract.ts");
+    expect(files["AGENTS.md"]).toContain("subscribe({}, cb)");
+    expect(files["CLAUDE.md"]).toContain("@AGENTS.md");
+    // No auth section unless auth is wired.
+    expect(files["AGENTS.md"]).not.toContain("Better Auth is wired");
   });
 
   it("wires the @onveloz SDK deps + the bundler preset", () => {
@@ -122,6 +133,12 @@ describe("scaffoldApp", () => {
     it("ignores real env files but ships an example", () => {
       expect(a[".env.example"]).toContain("BETTER_AUTH_SECRET");
       expect(a[".gitignore"]).toContain(".env");
+    });
+
+    it("documents auth in AGENTS.md", () => {
+      expect(a["AGENTS.md"]).toContain("Better Auth is wired");
+      expect(a["AGENTS.md"]).toContain(".use(authed)");
+      expect(a["AGENTS.md"]).toContain("auth:migrate");
     });
   });
 });
