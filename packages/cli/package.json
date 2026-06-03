@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -14,7 +14,8 @@
   "dependencies": {
     "@onveloz/pulse-schema": "workspace:*",
     "@onveloz/pulse-engine": "workspace:*",
-    "@onveloz/pulse-runtime-node": "workspace:*"
+    "@onveloz/pulse-runtime-node": "workspace:*",
+    "pg": "^8.0.0"
   },
   "devDependencies": {
     "@onveloz/pulse-tsconfig": "workspace:*",
@@ -37,13 +38,5 @@
   "bugs": {
     "url": "https://github.com/PierreAndreis/pulse/issues"
   },
-  "author": "Pierre Ortega",
-  "peerDependencies": {
-    "pg": "^8.0.0"
-  },
-  "peerDependenciesMeta": {
-    "pg": {
-      "optional": true
-    }
-  }
+  "author": "Pierre Ortega"
 }

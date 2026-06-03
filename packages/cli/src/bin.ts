@@ -98,28 +98,79 @@ function has(args: string[], name: string): boolean {
 }
 
 /**
- * Diff the schema against the live database. Uses node-postgres if installed; we
- * import it dynamically (and ONLY here) so the common `gen`/`migrate` paths never
- * need a DB driver. This is the one justified inline import: the driver is an
- * optional, command-specific dependency, not a module-level one.
+ * Connect to Postgres via node-postgres. We import it dynamically (the ONE
+ * justified inline import in this CLI) so the no-DB paths (`gen`, `migrate`
+ * without `--diff`) never need a driver. Gives a clear hint if the DB is down.
  */
-async function migrateDiff(schema: AnySchema, databaseUrl: string): Promise<string> {
+async function connectPg(databaseUrl: string): Promise<PgClient> {
   let pg: { default: { Client: new (cfg: { connectionString: string }) => PgClient } };
   try {
     pg = (await import("pg" as string)) as typeof pg;
   } catch {
-    throw new Error(
-      "`pulse migrate --diff` needs the 'pg' package. Install it: `pnpm add pg` (or `npm i pg`).",
-    );
+    throw new Error("this needs the 'pg' package. Install it: `pnpm add pg` (or `npm i pg`).");
   }
   const client = new pg.default.Client({ connectionString: databaseUrl });
-  await client.connect();
   try {
-    const cols = await client.query(INTROSPECT_SQL);
-    const idx = await client.query(INTROSPECT_INDEXES_SQL);
-    const live = parseLiveColumns(cols.rows as InfoSchemaRow[]);
-    const liveIndexes = new Set<string>((idx.rows as { indexname: string }[]).map((r) => r.indexname));
+    await client.connect();
+  } catch (e) {
+    throw new Error(
+      `could not connect to Postgres at ${databaseUrl} — is it running? Try \`pnpm db\`. ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  return client;
+}
+
+/** Read the live database shape (columns + index names) for diffing. */
+async function introspect(
+  client: PgClient,
+): Promise<{ live: ReturnType<typeof parseLiveColumns>; liveIndexes: Set<string> }> {
+  const cols = await client.query(INTROSPECT_SQL);
+  const idx = await client.query(INTROSPECT_INDEXES_SQL);
+  const live = parseLiveColumns(cols.rows as InfoSchemaRow[]);
+  const liveIndexes = new Set<string>((idx.rows as { indexname: string }[]).map((r) => r.indexname));
+  return { live, liveIndexes };
+}
+
+/** Diff the schema against the live database and render an annotated migration. */
+async function migrateDiff(schema: AnySchema, databaseUrl: string): Promise<string> {
+  const client = await connectPg(databaseUrl);
+  try {
+    const { live, liveIndexes } = await introspect(client);
     return renderDiff(diffSchema(live, schema, liveIndexes));
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * Bring the database in line with the schema before the engine boots, the same
+ * way `convex dev` does: auto-apply only SAFE additive changes (new tables,
+ * `ADD COLUMN`, indexes), and never silently run risky alters (type/nullability
+ * changes that can fail or lose data) or destructive drops — those are printed
+ * for review via `pulse migrate --diff`.
+ */
+async function syncSchema(databaseUrl: string, schema: AnySchema): Promise<void> {
+  const client = await connectPg(databaseUrl);
+  try {
+    const { live, liveIndexes } = await introspect(client);
+    const diff = diffSchema(live, schema, liveIndexes);
+    for (const stmt of diff.additive) await client.query(stmt);
+
+    // `alters` entries that are real SQL (not `-- review:` notes) plus any
+    // destructive drops are changes we refuse to apply automatically.
+    const needsReview = diff.alters.filter((s) => !s.trimStart().startsWith("--"));
+    if (needsReview.length || diff.destructive.length) {
+      process.stdout.write(
+        `pulse: applied ${diff.additive.length} safe change(s); the following need review and were NOT applied:\n` +
+          renderDiff({ additive: [], alters: diff.alters, destructive: diff.destructive }) +
+          "Review with `pulse migrate --diff`, then apply manually.\n",
+      );
+    } else if (diff.additive.length) {
+      process.stdout.write(`pulse: schema synced (${diff.additive.length} change(s) applied)\n`);
+    } else {
+      process.stdout.write("pulse: schema up to date\n");
+    }
   } finally {
     await client.end();
   }
@@ -198,12 +249,29 @@ async function main(): Promise<void> {
     case "dev": {
       const appPath = args[0];
       if (!appPath || appPath.startsWith("-"))
-        throw new Error("usage: pulse dev <app.ts> [--port P] [--database-url URL]");
+        throw new Error(
+          "usage: pulse dev <app.ts> [--port P] [--database-url URL] [--start <cmd>] [--schema <path>]",
+        );
+      const resolvedApp = resolve(appPath);
+
+      // Load the schema directly (default: schema.ts next to the app) rather than
+      // the app module — the app re-exports its _generated types, which may not
+      // exist yet on a fresh project. The schema only needs the SDK to load.
+      const schemaPath = flag(args, "--schema") ?? resolve(dirname(resolvedApp), "schema.ts");
+      const schema = await loadSchema(schemaPath);
+
+      // 1. Codegen the typed data model the app + worker import (folds in `pulse gen`),
+      // so a fresh project's `import "./_generated/dataModel.js"` resolves on first run.
+      const genOut = resolve(dirname(resolvedApp), "_generated", "dataModel.ts");
+      await mkdir(dirname(genOut), { recursive: true });
+      await writeFile(genOut, generateDataModel(schema), "utf8");
+      process.stdout.write(`pulse: generated ${genOut}\n`);
+
+      // 2. Resolve the engine binary, downloading it on first run.
       const root = repoRoot();
       const { enginePathSync, ensureEngine } = await import("@onveloz/pulse-engine");
       let bin = resolveEngineBin(root, process.env, undefined, enginePathSync);
       if (!bin) {
-        // No local build and nothing cached → fetch the prebuilt engine.
         process.stdout.write("pulse: no engine found locally; downloading…\n");
         bin = await ensureEngine();
       }
@@ -212,29 +280,50 @@ async function main(): Promise<void> {
           "engine binary not found — no prebuilt engine for this platform. " +
             "Build it (`cargo build -p pulse-server`) and set PULSE_SERVER_BIN.",
         );
+
       const env = buildEngineEnv({
-        appPath: resolve(appPath),
+        appPath: resolvedApp,
         workerScript: workerScriptPath(),
         port: flag(args, "--port"),
         databaseUrl: flag(args, "--database-url"),
         workerBin: flag(args, "--worker-bin"),
       });
+
+      // 3. Sync the schema before boot: auto-apply safe additive changes (new
+      // tables/columns/indexes) and refuse to silently run risky or destructive
+      // ones (type changes, drops) — the same safety split Convex enforces.
+      await syncSchema(env.DATABASE_URL!, schema); // buildEngineEnv always sets it
+
+      // 4. Start the engine, plus an optional frontend via --start (e.g. vite), so
+      // a single `pulse dev` runs the whole stack. Either process exiting tears
+      // down the rest, and Ctrl-C stops both.
       process.stdout.write(`pulse: starting engine on :${env.PULSE_PORT} (app ${env.PULSE_APP})\n`);
-      const child = spawn(bin, [], { env, stdio: "inherit" });
-      // Forward termination so Ctrl-C cleanly stops the engine.
-      const stop = (sig: NodeJS.Signals) => child.kill(sig);
-      process.on("SIGINT", () => stop("SIGINT"));
-      process.on("SIGTERM", () => stop("SIGTERM"));
+      const children = [spawn(bin, [], { env, stdio: "inherit" })];
+      const startCmd = flag(args, "--start");
+      if (startCmd) children.push(spawn(startCmd, { shell: true, stdio: "inherit", env }));
+
+      let stopping = false;
+      const stopAll = (sig: NodeJS.Signals) => {
+        if (stopping) return;
+        stopping = true;
+        for (const c of children) c.kill(sig);
+      };
+      process.on("SIGINT", () => stopAll("SIGINT"));
+      process.on("SIGTERM", () => stopAll("SIGTERM"));
       await new Promise<void>((res) => {
-        child.on("exit", (code) => {
-          process.exitCode = code ?? 0;
-          res();
-        });
-        child.on("error", (err) => {
-          process.stderr.write(`pulse: failed to start engine: ${err.message}\n`);
-          process.exitCode = 1;
-          res();
-        });
+        let exited = 0;
+        for (const c of children) {
+          c.on("exit", (code) => {
+            if (code) process.exitCode = code;
+            stopAll("SIGTERM");
+            if (++exited >= children.length) res();
+          });
+          c.on("error", (err) => {
+            process.stderr.write(`pulse: ${err.message}\n`);
+            process.exitCode = 1;
+            stopAll("SIGTERM");
+          });
+        }
       });
       return;
     }

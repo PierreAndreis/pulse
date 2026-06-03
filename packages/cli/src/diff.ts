@@ -180,8 +180,11 @@ export function diffSchema(
     }
   }
 
-  // Tables in the DB but not the schema → destructive.
+  // Tables in the DB but not the schema → destructive. Skip engine-managed
+  // tables (the `_pulse*` namespace, e.g. `_pulse_mutations`) — they're never in
+  // the user's schema and must not be flagged for dropping on every sync.
   for (const liveTable of Object.keys(live)) {
+    if (liveTable.startsWith("_pulse")) continue;
     if (!(liveTable in described)) {
       destructive.push(`-- drop: drop table ${liveTable};`);
     }

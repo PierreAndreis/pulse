@@ -18,13 +18,12 @@ export function scaffoldApp(name: string, version: string): Record<string, strin
         private: true,
         type: "module",
         scripts: {
-          dev: "vite",
+          // One command runs the whole stack: codegen, schema sync, the engine,
+          // and Vite (via --start). Just `pnpm dev`.
+          dev: "pulse dev app/app.ts --start vite",
+          db: "docker compose up -d",
           build: "tsc && vite build",
           typecheck: "tsc --noEmit",
-          gen: "pulse gen app/schema.ts",
-          migrate: "pulse migrate app/schema.ts --out schema.sql",
-          engine: "pulse dev app/app.ts",
-          db: "docker compose up -d",
         },
         dependencies: {
           "@onveloz/pulse-client": `^${PKG}`,
@@ -90,7 +89,7 @@ export default definePulseApp();
     environment:
       POSTGRES_USER: pulse
       POSTGRES_PASSWORD: pulse
-      POSTGRES_DB: ${safe.replace(/-/g, "_")}
+      POSTGRES_DB: pulse
     command: ["postgres", "-c", "wal_level=logical"]
     ports: ["54329:5432"]
     healthcheck:
@@ -244,11 +243,13 @@ A Pulse app — reactive + offline-first on standard Postgres.
 \`\`\`bash
 pnpm install
 pnpm db          # start Postgres (Docker)
-pnpm gen         # generate Doc/Id types
-pnpm migrate && docker compose exec -T postgres psql -U pulse -d ${safe.replace(/-/g, "_")} < schema.sql
-pnpm engine      # run the Pulse engine on :8787
-pnpm dev         # Vite app on :5273
+pnpm dev         # codegen + schema sync + engine (:8787) + Vite (:5273)
 \`\`\`
+
+\`pnpm dev\` runs everything: it generates the typed data model, syncs your
+schema to the database (safe additive changes auto-apply; risky/destructive ones
+are printed for review via \`pulse migrate app/schema.ts --diff\`), starts the
+Pulse engine, and launches Vite alongside it.
 
 Edit \`app/schema.ts\`, \`app/contract.ts\`, and \`app/todos.ts\` to build your app.
 \`src/App.tsx\` shows reactive subscribe + optimistic offline-safe mutate.

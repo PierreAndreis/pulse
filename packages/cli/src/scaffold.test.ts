@@ -46,11 +46,19 @@ describe("scaffoldApp", () => {
     expect(pkg.devDependencies["@onveloz/pulse-cli"]).toBe("^9.9.9");
   });
 
-  it("uses the project name and sanitizes it for the DB", () => {
+  it("sanitizes the project name and aligns the DB with the CLI default", () => {
     const dirty = scaffoldApp("My Cool App!", "0.1.2");
     expect(dirty["package.json"]).toContain('"name": "my-cool-app-"');
-    // db name has dashes → underscores
-    expect(dirty["docker-compose.yml"]).toMatch(/POSTGRES_DB: my_cool_app_/);
+    expect(dirty["docker-compose.yml"]).toContain("container_name: my-cool-app--pg");
+    // DB name matches the CLI's default DATABASE_URL so `pulse dev` connects with
+    // zero config (no per-app DB name to keep in sync).
+    expect(dirty["docker-compose.yml"]).toContain("POSTGRES_DB: pulse");
+  });
+
+  it("uses a single `dev` command that runs the engine + frontend", () => {
+    const pkg = JSON.parse(files["package.json"]!);
+    expect(pkg.scripts.dev).toBe("pulse dev app/app.ts --start vite");
+    expect(pkg.scripts.db).toBe("docker compose up -d");
   });
 
   it("schema/contract/handlers reference the same table", () => {
