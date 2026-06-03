@@ -11,10 +11,12 @@ import { buildEngineEnv, resolveEngineBin } from "./dev.js";
 import { scaffoldApp } from "./scaffold.js";
 import {
   diffSchema,
+  dropStatement,
   parseLiveColumns,
   renderDiff,
   INTROSPECT_SQL,
   INTROSPECT_INDEXES_SQL,
+  type Drop,
   type InfoSchemaRow,
 } from "./diff.js";
 
@@ -155,25 +157,54 @@ async function syncSchema(databaseUrl: string, schema: AnySchema): Promise<void>
   try {
     const { live, liveIndexes } = await introspect(client);
     const diff = diffSchema(live, schema, liveIndexes);
-    for (const stmt of diff.additive) await client.query(stmt);
 
-    // `alters` entries that are real SQL (not `-- review:` notes) plus any
-    // destructive drops are changes we refuse to apply automatically.
-    const needsReview = diff.alters.filter((s) => !s.trimStart().startsWith("--"));
-    if (needsReview.length || diff.destructive.length) {
+    let applied = 0;
+    for (const stmt of diff.additive) {
+      await client.query(stmt);
+      applied++;
+    }
+
+    // Drops run only when they lose no data — an empty table or an all-NULL
+    // column. Anything holding data is refused and surfaced for review.
+    const refusedDrops: Drop[] = [];
+    for (const drop of diff.destructive) {
+      if (await dropLosesNoData(client, drop)) {
+        await client.query(dropStatement(drop));
+        applied++;
+      } else {
+        refusedDrops.push(drop);
+      }
+    }
+
+    // `alters` entries that are real SQL (not `-- review:` notes) plus any drops
+    // that still hold data are changes we refuse to apply automatically.
+    const riskyAlters = diff.alters.filter((s) => !s.trimStart().startsWith("--"));
+    if (riskyAlters.length || refusedDrops.length) {
       process.stdout.write(
-        `pulse: applied ${diff.additive.length} safe change(s); the following need review and were NOT applied:\n` +
-          renderDiff({ additive: [], alters: diff.alters, destructive: diff.destructive }) +
+        `pulse: applied ${applied} safe change(s); the following hold data and need review (NOT applied):\n` +
+          renderDiff({ additive: [], alters: diff.alters, destructive: refusedDrops }) +
           "Review with `pulse migrate --diff`, then apply manually.\n",
       );
-    } else if (diff.additive.length) {
-      process.stdout.write(`pulse: schema synced (${diff.additive.length} change(s) applied)\n`);
+    } else if (applied) {
+      process.stdout.write(`pulse: schema synced (${applied} change(s) applied)\n`);
     } else {
       process.stdout.write("pulse: schema up to date\n");
     }
   } finally {
     await client.end();
   }
+}
+
+/** True when dropping `drop` would lose nothing: an empty table, or a column
+ *  whose every value is NULL. Lets `pulse dev` clean up empties automatically
+ *  while never silently destroying data. */
+async function dropLosesNoData(client: PgClient, drop: Drop): Promise<boolean> {
+  const probe =
+    drop.kind === "table"
+      ? `SELECT EXISTS (SELECT 1 FROM ${drop.table} LIMIT 1) AS has`
+      : `SELECT EXISTS (SELECT 1 FROM ${drop.table} WHERE ${drop.column} IS NOT NULL LIMIT 1) AS has`;
+  const res = await client.query(probe);
+  return !(res.rows[0] as { has: boolean }).has;
 }
 
 async function main(): Promise<void> {
@@ -200,10 +231,8 @@ async function main(): Promise<void> {
         `pulse: created ${name}/ (${Object.keys(files).length} files)\n\n` +
           `  cd ${name}\n` +
           `  pnpm install\n` +
-          `  pnpm db        # start Postgres\n` +
-          `  pnpm gen       # generate types\n` +
-          `  pnpm engine    # run the engine\n` +
-          `  pnpm dev       # start the app\n`,
+          `  pnpm db        # start Postgres (Docker)\n` +
+          `  pnpm dev       # codegen + schema sync + engine + Vite — all of it\n`,
       );
       return;
     }

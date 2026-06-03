@@ -64,15 +64,30 @@ function normalizeType(t: string): string {
   return s;
 }
 
+/** A drop the database needs to match the schema: a whole table, or one column
+ *  of a table. Kept structured (not SQL) so the caller can check whether it
+ *  holds data before deciding to run it. */
+export type Drop =
+  | { kind: "table"; table: string }
+  | { kind: "column"; table: string; column: string };
+
+/** The executable SQL for a {@link Drop}. */
+export function dropStatement(d: Drop): string {
+  return d.kind === "table"
+    ? `drop table ${d.table};`
+    : `alter table ${d.table} drop column ${d.column};`;
+}
+
 export interface SchemaDiff {
   /** Safe, additive statements (new tables, new columns, new indexes). */
   additive: string[];
   /** Type/nullability changes — emitted as ALTERs, but flagged for review since
    *  a type change can fail or lose data on a non-empty table. */
   alters: string[];
-  /** Destructive operations (columns/tables present in the DB but not the
-   *  schema). NEVER auto-applied — emitted as commented-out SQL + warnings. */
-  destructive: string[];
+  /** Tables/columns in the DB but not the schema. Dropping them loses data, so
+   *  callers apply them only when empty (no rows / all-NULL column) and surface
+   *  the rest for manual review. */
+  destructive: Drop[];
 }
 
 /** True when there is nothing to apply. */
@@ -103,7 +118,7 @@ export function diffSchema(
   const described = schema.describe();
   const additive: string[] = [];
   const alters: string[] = [];
-  const destructive: string[] = [];
+  const destructive: Drop[] = [];
 
   const SYSTEM_COLS = new Set(["_id", "_creation_time"]);
 
@@ -165,7 +180,7 @@ export function diffSchema(
       for (const liveColName of Object.keys(liveTable)) {
         if (SYSTEM_COLS.has(liveColName)) continue;
         if (!desiredCols.has(liveColName)) {
-          destructive.push(`-- drop: alter table ${table} drop column ${liveColName};`);
+          destructive.push({ kind: "column", table, column: liveColName });
         }
       }
     }
@@ -186,7 +201,7 @@ export function diffSchema(
   for (const liveTable of Object.keys(live)) {
     if (liveTable.startsWith("_pulse")) continue;
     if (!(liveTable in described)) {
-      destructive.push(`-- drop: drop table ${liveTable};`);
+      destructive.push({ kind: "table", table: liveTable });
     }
   }
 
@@ -206,8 +221,8 @@ export function renderDiff(d: SchemaDiff): string {
     out.push(...d.alters);
   }
   if (d.destructive.length) {
-    out.push("\n-- ── destructive (NOT applied automatically — uncomment to run) ──");
-    out.push(...d.destructive);
+    out.push("\n-- ── destructive (auto-applied only when empty; else review) ──");
+    out.push(...d.destructive.map((x) => `-- drop: ${dropStatement(x)}`));
   }
   return out.join("\n") + "\n";
 }

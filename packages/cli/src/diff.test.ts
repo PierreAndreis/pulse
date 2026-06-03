@@ -113,17 +113,17 @@ describe("diffSchema", () => {
     expect(d.alters.join("\n")).toContain("alter table users alter column email drop not null");
   });
 
-  it("lists dropped columns and tables as destructive, never auto-applied", () => {
+  it("lists dropped columns and tables as structured destructive drops", () => {
     const live: LiveSchema = {
       users: { ...liveUsers.users, legacy: { type: "text", notNull: false } },
       old_table: { _id: { type: "uuid", notNull: true } },
     };
     const d = diffSchema(live, baseSchema);
-    expect(d.destructive.join("\n")).toContain("drop column legacy");
-    expect(d.destructive.join("\n")).toContain("drop table old_table");
-    // destructive is commented out in the rendered script
-    expect(renderDiff(d)).toContain("-- drop:");
-    expect(renderDiff(d)).toContain("NOT applied automatically");
+    expect(d.destructive).toContainEqual({ kind: "column", table: "users", column: "legacy" });
+    expect(d.destructive).toContainEqual({ kind: "table", table: "old_table" });
+    // rendered as commented-out drops for the migration script
+    expect(renderDiff(d)).toContain("-- drop: alter table users drop column legacy;");
+    expect(renderDiff(d)).toContain("-- drop: drop table old_table;");
   });
 
   it("never drops the engine-managed system columns", () => {
