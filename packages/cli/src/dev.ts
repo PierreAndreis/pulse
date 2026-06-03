@@ -1,6 +1,10 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
+/** The local-dev Postgres the scaffold's docker-compose serves. Used as the
+ *  default DATABASE_URL across commands so they work with zero config locally. */
+export const DEFAULT_DATABASE_URL = "postgres://pulse:pulse@localhost:54329/pulse";
+
 /** Resolve a pulse-server binary path WITHOUT downloading, in priority order:
  *  1. `PULSE_SERVER_BIN` override, 2. a monorepo `target/{release,debug}` build
  *  (dev), 3. an already-cached engine from `@onveloz/pulse-engine`.
@@ -40,7 +44,6 @@ export function buildEngineEnv(
   env.PULSE_WORKER_SCRIPT = opts.workerScript;
   env.PULSE_PORT = opts.port ?? ambient.PULSE_PORT ?? "8787";
   env.PULSE_WORKER_BIN = opts.workerBin ?? ambient.PULSE_WORKER_BIN ?? "bun";
-  env.DATABASE_URL =
-    opts.databaseUrl ?? ambient.DATABASE_URL ?? "postgres://pulse:pulse@localhost:54329/pulse";
+  env.DATABASE_URL = opts.databaseUrl ?? ambient.DATABASE_URL ?? DEFAULT_DATABASE_URL;
   return env;
 }

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema";
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
-import { buildEngineEnv, resolveEngineBin } from "./dev.js";
+import { buildEngineEnv, resolveEngineBin, DEFAULT_DATABASE_URL } from "./dev.js";
 import { runNew } from "./new.js";
 import {
   diffSchema,
@@ -44,14 +44,16 @@ const HELP = `pulse <command>
                                -y, --yes                 accept all defaults
   gen <schema.ts> [out.ts]   generate the Doc/Id data model from a schema
                              (default out: <schemaDir>/_generated/dataModel.ts)
-  migrate <schema.ts> [--out file.sql]
+  migrate [schema.ts] [--out file.sql]
                              generate idempotent DDL from a schema (prints to
-                             stdout, or writes to --out)
-  migrate <schema.ts> --diff [--database-url URL] [--out file.sql]
+                             stdout, or writes to --out). Schema defaults to
+                             app/schema.ts.
+  migrate [schema.ts] --diff [--database-url URL] [--out file.sql]
                              diff the schema against the live database and emit a
                              migration script (additive / flagged-alters /
-                             commented destructive). Reads DATABASE_URL if --database-url
-                             is omitted.
+                             commented destructive). Database URL defaults to
+                             --database-url, else DATABASE_URL, else the local
+                             docker-compose Postgres.
   dev <app.ts> [--port P] [--database-url URL] [--worker-bin bun]
                              run the engine against an app module (schema +
                              handlers); streams logs until Ctrl-C. Codegens +
@@ -251,17 +253,21 @@ async function main(): Promise<void> {
     }
 
     case "migrate": {
-      const schemaPath = args[0];
-      if (!schemaPath) throw new Error("usage: pulse migrate <schema.ts> [--out file.sql]");
+      // Schema defaults to app/schema.ts (the scaffold layout). A leading flag
+      // (e.g. `pulse migrate --diff`) is not a path, so ignore it as the positional.
+      const schemaArg = args[0] && !args[0].startsWith("-") ? args[0] : undefined;
+      const schemaPath = resolve(schemaArg ?? "app/schema.ts");
+      if (!existsSync(schemaPath))
+        throw new Error(
+          `schema not found at ${schemaPath} — run from your project root or pass it: \`pulse migrate <schema.ts>\``,
+        );
       const schema = await loadSchema(schemaPath);
       const ddl = has(args, "--diff")
         ? await migrateDiff(
             schema,
-            flag(args, "--database-url") ??
-              process.env.DATABASE_URL ??
-              (() => {
-                throw new Error("migrate --diff needs --database-url or DATABASE_URL");
-              })(),
+            // Same default as `pulse dev`: --database-url, else DATABASE_URL, else
+            // the local docker-compose Postgres — so `--diff` works with no config.
+            flag(args, "--database-url") ?? process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
           )
         : generateDDL(schema);
       const out = flag(args, "--out");
