@@ -29,13 +29,55 @@ export interface IndexRangeBuilder<T extends string> {
   lte<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): IndexRangeBuilder<T>;
 }
 
+/** Opaque handle for one filter predicate produced by a {@link FilterBuilder}. */
+declare const filterCondBrand: unique symbol;
+export type FilterCond = { readonly [filterCondBrand]: true };
+
+/**
+ * Builds one ORM-style predicate (`field <op> value`) over any column — not just
+ * an index. The comparison feeds both the SQL `WHERE` and the reactive read-set,
+ * so invalidation stays precise (a write only re-runs the query if the changed
+ * row matches). Chain multiple `.filter()` calls to AND them together.
+ */
+export interface FilterBuilder<T extends string> {
+  eq<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): FilterCond;
+  neq<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): FilterCond;
+  gt<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): FilterCond;
+  gte<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): FilterCond;
+  lt<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): FilterCond;
+  lte<F extends keyof Doc<T> & string>(field: F, value: Doc<T>[F]): FilterCond;
+  /** SQL `LIKE` on a string field (`%` = any run, `_` = one char). Precise reactivity. */
+  like<F extends StringKeys<T>>(field: F, pattern: string): FilterCond;
+  /** Case-insensitive `ILIKE`. Precise reactivity. */
+  ilike<F extends StringKeys<T>>(field: F, pattern: string): FilterCond;
+  /** `field IS NULL`. (Filters precisely in SQL; reactivity is table-coarse.) */
+  isNull<F extends keyof Doc<T> & string>(field: F): FilterCond;
+  /** `field IS NOT NULL`. (Filters precisely in SQL; reactivity is table-coarse.) */
+  isNotNull<F extends keyof Doc<T> & string>(field: F): FilterCond;
+  /** `field` ∈ `values` — sugar for an OR of equalities. Precise reactivity. */
+  in<F extends keyof Doc<T> & string>(field: F, values: ReadonlyArray<Doc<T>[F]>): FilterCond;
+  /** All sub-conditions must hold. */
+  and(...conds: FilterCond[]): FilterCond;
+  /** Any sub-condition holds — a real reactive OR (recorded as multiple filters). */
+  or(...conds: FilterCond[]): FilterCond;
+  /** Negation. Pushed to leaves (De Morgan) for precise reactivity where possible. */
+  not(cond: FilterCond): FilterCond;
+}
+
 /** A reactive-safe, instrumented query over one table. Reads feed the read-set. */
 export interface QueryBuilder<T extends string> {
   withIndex(
     indexName: string,
     range?: (q: IndexRangeBuilder<T>) => IndexRangeBuilder<T>,
   ): QueryBuilder<T>;
-  order(direction: "asc" | "desc"): QueryBuilder<T>;
+  /** Narrow by an arbitrary-column predicate (ANDed with any prior filters). */
+  filter(predicate: (q: FilterBuilder<T>) => FilterCond): QueryBuilder<T>;
+  /** Sort by `field` (default `_creationTime`). Chain `.order(...)` calls for a
+   *  multi-column sort (keys applied in order). Doesn't affect reactivity. */
+  order(direction: "asc" | "desc", field?: keyof Doc<T> & string): QueryBuilder<T>;
+  /** Offset-paginate: skip `offset` rows and resolve the next `limit`. Pair with
+   *  `order()` for a stable page. */
+  paginate(opts: { limit: number; offset?: number }): Promise<Doc<T>[]>;
   /** Resolve up to `n` documents. */
   take(n: number): Promise<Doc<T>[]>;
   /** Resolve all matching documents. */
@@ -44,7 +86,60 @@ export interface QueryBuilder<T extends string> {
   first(): Promise<Doc<T> | null>;
   /** Exactly one; rejects if more than one matches. */
   unique(): Promise<Doc<T> | null>;
+  /** Count matching rows (`count(*)`), or non-null values of `field` if given.
+   *  Reactive: any write to a row matching this query's filters recomputes it. */
+  count(field?: keyof Doc<T> & string): Promise<number>;
+  /** Count distinct values of a field over the matching rows. Reactive. */
+  countDistinct(field: keyof Doc<T> & string): Promise<number>;
+  /** Sum a numeric field over the matching rows (null over an empty/all-null set,
+   *  per SQL). Reactive, like {@link count}. */
+  sum(field: NumericKeys<T>): Promise<number | null>;
+  /** Min of a numeric field over the matching rows (null if none). Reactive. */
+  min(field: NumericKeys<T>): Promise<number | null>;
+  /** Max of a numeric field over the matching rows (null if none). Reactive. */
+  max(field: NumericKeys<T>): Promise<number | null>;
+  /** Average of a numeric field over the matching rows (null if none). Reactive. */
+  avg(field: NumericKeys<T>): Promise<number | null>;
+  /** Group the (filtered) rows by `field`; the returned handle's aggregate methods
+   *  resolve to one `{ key, value }` row per group. Same filter-precise reactivity
+   *  as a scalar aggregate. */
+  groupBy<F extends keyof Doc<T> & string>(field: F): GroupedQuery<T, Doc<T>[F]>;
 }
+
+/** A `HAVING` predicate on a grouped aggregate value — one comparison operator,
+ *  e.g. `{ gt: 5 }`. */
+export interface HavingPredicate {
+  eq?: number;
+  neq?: number;
+  gt?: number;
+  gte?: number;
+  lt?: number;
+  lte?: number;
+}
+
+/** Grouped-aggregate handle from {@link QueryBuilder.groupBy}. Each method
+ *  resolves to one row per group: `{ key: <group value>, value: <aggregate> }`.
+ *  An optional `having` keeps only groups whose aggregate satisfies it. */
+export interface GroupedQuery<T extends string, K> {
+  count(having?: HavingPredicate): Promise<Array<{ key: K; value: number }>>;
+  countDistinct(field: keyof Doc<T> & string, having?: HavingPredicate): Promise<Array<{ key: K; value: number }>>;
+  sum(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+  min(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+  max(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+  avg(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+}
+
+/** Keys of a doc whose value is a number — the valid targets for `sum()`. */
+type NumericKeys<T extends string> = {
+  [K in keyof Doc<T>]: Doc<T>[K] extends number ? K : never;
+}[keyof Doc<T>] &
+  string;
+
+/** Keys of a doc whose value is a string — the valid targets for `like`/`ilike`. */
+type StringKeys<T extends string> = {
+  [K in keyof Doc<T>]: Doc<T>[K] extends string ? K : never;
+}[keyof Doc<T>] &
+  string;
 
 /** Read-only database handle (queries + analytical). Every read is captured. */
 export interface DatabaseReader {

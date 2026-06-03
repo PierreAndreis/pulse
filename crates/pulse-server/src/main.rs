@@ -25,7 +25,7 @@ use tower_http::cors::CorsLayer;
 
 use uuid::Uuid;
 
-use pulse_core::{ChangeSet, Lsn};
+use pulse_core::{ChangeSet, Lsn, ReadSet};
 use pulse_jsruntime::{Worker, WorkerConfig, WorkerError};
 use pulse_reactor::{InMemoryReactor, ReExecutor, Reactor, Subscription};
 
@@ -50,11 +50,11 @@ impl ReExecutor for WorkerReExecutor {
         path: Vec<String>,
         input: Value,
         headers: HashMap<String, String>,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, ReadSet), String> {
         self.worker
             .execute(path, input, headers, None)
             .await
-            .map(|res| res.value)
+            .map(|res| (res.value, res.read_set))
             .map_err(|e| e.code)
     }
 }

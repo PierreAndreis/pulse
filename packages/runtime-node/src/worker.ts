@@ -77,22 +77,106 @@ function makeDb(requestId: string) {
     return rb;
   }
 
+  // Filter builder: each method RETURNS an expression node (a leaf cmp, or and/or
+  // of sub-expressions). `.filter(fn)` collects the returned tree; the engine
+  // lowers it to SQL + a DNF read-set so or/in keep precise reactivity.
+  function filterBuilder() {
+    const cmp = (op: string) => (field: string, value: unknown) => ({ field, op, value });
+    const unary = (op: string) => (field: string) => ({ field, op, value: null });
+    return {
+      eq: cmp("eq"),
+      neq: cmp("neq"),
+      gt: cmp("gt"),
+      gte: cmp("gte"),
+      lt: cmp("lt"),
+      lte: cmp("lte"),
+      like: cmp("like"),
+      ilike: cmp("ilike"),
+      isNull: unary("isnull"),
+      isNotNull: unary("isnotnull"),
+      and: (...args: unknown[]) => ({ and: args }),
+      or: (...args: unknown[]) => ({ or: args }),
+      not: (cond: unknown) => ({ not: cond }),
+      in: (field: string, values: unknown[]) => ({
+        or: (values ?? []).map((value) => ({ field, op: "eq", value })),
+      }),
+    };
+  }
+
   function query(table: string) {
     const predicates: Array<Record<string, unknown>> = [];
-    let order: string | undefined;
+    const filters: unknown[] = [];
+    const orderBy: Array<{ field?: string; dir: string }> = [];
+    let offset: number | undefined;
+    const base = () => ({ kind: "query", table, predicates, filters, orderBy, offset });
     const builder = {
       withIndex(_indexName: string, fn?: (q: ReturnType<typeof rangeBuilder>) => unknown) {
         if (fn) fn(rangeBuilder(predicates));
         return builder;
       },
-      order(direction: string) {
-        order = direction;
+      filter(fn: (q: ReturnType<typeof filterBuilder>) => unknown) {
+        filters.push(fn(filterBuilder()));
         return builder;
       },
-      take: (n: number) => call({ kind: "query", table, predicates, order, limit: n, mode: "take" }),
-      collect: () => call({ kind: "query", table, predicates, order, mode: "collect" }),
-      first: () => call({ kind: "query", table, predicates, order, mode: "first" }),
-      unique: () => call({ kind: "query", table, predicates, order, mode: "unique" }),
+      order(direction: string, field?: string) {
+        orderBy.push({ field, dir: direction });
+        return builder;
+      },
+      paginate(opts: { limit: number; offset?: number }) {
+        offset = opts.offset;
+        return call({ ...base(), limit: opts.limit, mode: "take" });
+      },
+      take: (n: number) => call({ ...base(), limit: n, mode: "take" }),
+      collect: () => call({ ...base(), mode: "collect" }),
+      first: () => call({ ...base(), mode: "first" }),
+      unique: () => call({ ...base(), mode: "unique" }),
+      count: (field?: string) =>
+        call({
+          ...base(),
+          aggregate: { func: "count", ...(field !== undefined ? { field } : {}) },
+          mode: "collect",
+        }),
+      countDistinct: (field: string) =>
+        call({ ...base(), aggregate: { func: "count", field, distinct: true }, mode: "collect" }),
+      sum: (field: string) =>
+        call({ ...base(), aggregate: { func: "sum", field }, mode: "collect" }),
+      min: (field: string) =>
+        call({ ...base(), aggregate: { func: "min", field }, mode: "collect" }),
+      max: (field: string) =>
+        call({ ...base(), aggregate: { func: "max", field }, mode: "collect" }),
+      avg: (field: string) =>
+        call({ ...base(), aggregate: { func: "avg", field }, mode: "collect" }),
+      // Grouped aggregate: returns one { key, value } row per group, optionally
+      // filtered by a HAVING predicate on the aggregate value.
+      groupBy(field: string) {
+        const toHaving = (h?: Record<string, number>) => {
+          for (const op of ["eq", "neq", "gt", "gte", "lt", "lte"] as const) {
+            if (h && h[op] !== undefined) return { op, value: h[op] };
+          }
+          return undefined;
+        };
+        const g = (func: string, aggField?: string, distinct?: boolean, having?: Record<string, number>) =>
+          call({
+            ...base(),
+            groupBy: field,
+            aggregate: {
+              func,
+              ...(aggField !== undefined ? { field: aggField } : {}),
+              ...(distinct ? { distinct: true } : {}),
+            },
+            ...(toHaving(having) ? { having: toHaving(having) } : {}),
+            mode: "collect",
+          });
+        type H = Record<string, number>;
+        return {
+          count: (having?: H) => g("count", undefined, false, having),
+          countDistinct: (f: string, having?: H) => g("count", f, true, having),
+          sum: (f: string, having?: H) => g("sum", f, false, having),
+          min: (f: string, having?: H) => g("min", f, false, having),
+          max: (f: string, having?: H) => g("max", f, false, having),
+          avg: (f: string, having?: H) => g("avg", f, false, having),
+        };
+      },
     };
     return builder;
   }

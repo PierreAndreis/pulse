@@ -14,6 +14,12 @@ importers:
       '@onveloz/pulse-contract':
         specifier: workspace:*
         version: link:packages/contract
+      '@onveloz/pulse-schema':
+        specifier: workspace:*
+        version: link:packages/schema
+      '@onveloz/pulse-server':
+        specifier: workspace:*
+        version: link:packages/server
       '@types/node':
         specifier: ^22.10.0
         version: 22.19.19

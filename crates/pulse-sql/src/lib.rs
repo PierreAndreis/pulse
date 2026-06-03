@@ -18,7 +18,7 @@ pub use catalog::{
 pub use naming::{column_to_field, field_to_column};
 pub use ops::{
     capture_reads, ensure_mutation_log, execute_op, execute_op_pool, lookup_mutation,
-    record_mutation, DbOp, Order, PredOp, Predicate, QueryMode, SqlError,
+    record_mutation, DbOp, FilterExpr, Order, OrderKey, PredOp, Predicate, QueryMode, SqlError,
 };
 // PoolConfig / connect_with are defined below.
 
