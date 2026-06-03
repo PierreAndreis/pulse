@@ -126,6 +126,13 @@ pub struct Agg {
     pub distinct: bool,
 }
 
+/// A `HAVING` predicate on a grouped aggregate's value (`<agg> <op> <value>`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Having {
+    pub op: PredOp,
+    pub value: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum DbOp {
@@ -157,6 +164,9 @@ pub enum DbOp {
         /// per group. Reactivity is the same filter read-set as a scalar aggregate.
         #[serde(default, rename = "groupBy")]
         group_by: Option<String>,
+        /// With `group_by`, keep only groups whose aggregate satisfies this `HAVING`.
+        #[serde(default)]
+        having: Option<Having>,
         mode: QueryMode,
     },
     Insert {
@@ -793,6 +803,7 @@ pub async fn execute_op(
             offset,
             aggregate,
             group_by,
+            having,
             mode,
         } => {
             let t = table(catalog, name)?;
@@ -834,8 +845,14 @@ pub async fn execute_op(
                 // read-set as the scalar path → filter-precise reactivity.
                 if let Some(gkey) = group_by {
                     let keycol = column(t, gkey)?;
+                    // HAVING filters groups by the aggregate value (numeric literal,
+                    // safe to inline). It doesn't change the read-set.
+                    let having_sql = match having {
+                        Some(h) => format!(" HAVING ({expr}) {} {}", h.op.sql(), h.value),
+                        None => String::new(),
+                    };
                     let sql = format!(
-                        "SELECT {0}::text, ({expr})::double precision FROM {name}{where_sql} GROUP BY {0}",
+                        "SELECT {0}::text, ({expr})::double precision FROM {name}{where_sql} GROUP BY {0}{having_sql}",
                         keycol.column,
                     );
                     let rows = fetch_grouped(&mut *conn, &sql, &binds, keycol).await?;

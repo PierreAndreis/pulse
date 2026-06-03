@@ -106,15 +106,27 @@ export interface QueryBuilder<T extends string> {
   groupBy<F extends keyof Doc<T> & string>(field: F): GroupedQuery<T, Doc<T>[F]>;
 }
 
+/** A `HAVING` predicate on a grouped aggregate value — one comparison operator,
+ *  e.g. `{ gt: 5 }`. */
+export interface HavingPredicate {
+  eq?: number;
+  neq?: number;
+  gt?: number;
+  gte?: number;
+  lt?: number;
+  lte?: number;
+}
+
 /** Grouped-aggregate handle from {@link QueryBuilder.groupBy}. Each method
- *  resolves to one row per group: `{ key: <group value>, value: <aggregate> }`. */
+ *  resolves to one row per group: `{ key: <group value>, value: <aggregate> }`.
+ *  An optional `having` keeps only groups whose aggregate satisfies it. */
 export interface GroupedQuery<T extends string, K> {
-  count(): Promise<Array<{ key: K; value: number }>>;
-  countDistinct(field: keyof Doc<T> & string): Promise<Array<{ key: K; value: number }>>;
-  sum(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
-  min(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
-  max(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
-  avg(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
+  count(having?: HavingPredicate): Promise<Array<{ key: K; value: number }>>;
+  countDistinct(field: keyof Doc<T> & string, having?: HavingPredicate): Promise<Array<{ key: K; value: number }>>;
+  sum(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+  min(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+  max(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
+  avg(field: NumericKeys<T>, having?: HavingPredicate): Promise<Array<{ key: K; value: number | null }>>;
 }
 
 /** Keys of a doc whose value is a number — the valid targets for `sum()`. */

@@ -34,6 +34,7 @@ export const contract = {
     // grouping
     byActive: rows(),
     sumByTag: rows(),
+    bigTags: rows(), // groupBy tag, count, HAVING count >= 2
     // join
     withAuthor: rows(),
     // mutations

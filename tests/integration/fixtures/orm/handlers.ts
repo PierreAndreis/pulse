@@ -46,6 +46,7 @@ export const maxQty = os.w.maxQty.handler(async ({ ctx }) => q(ctx).max("qty"));
 
 export const byActive = os.w.byActive.handler(async ({ ctx }) => q(ctx).groupBy("active").count());
 export const sumByTag = os.w.sumByTag.handler(async ({ ctx }) => q(ctx).groupBy("tag").sum("price"));
+export const bigTags = os.w.bigTags.handler(async ({ ctx }: any) => q(ctx).groupBy("tag").count({ gte: 2 }));
 
 // Reactive join via handler composition.
 export const withAuthor = os.w.withAuthor.handler(async ({ ctx }) => {

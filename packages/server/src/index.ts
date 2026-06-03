@@ -28,6 +28,7 @@ export type {
   DatabaseWriter,
   QueryBuilder,
   GroupedQuery,
+  HavingPredicate,
   IndexRangeBuilder,
   FilterBuilder,
   FilterCond,

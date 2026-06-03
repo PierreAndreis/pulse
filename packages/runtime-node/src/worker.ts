@@ -146,9 +146,16 @@ function makeDb(requestId: string) {
         call({ ...base(), aggregate: { func: "max", field }, mode: "collect" }),
       avg: (field: string) =>
         call({ ...base(), aggregate: { func: "avg", field }, mode: "collect" }),
-      // Grouped aggregate: returns one { key, value } row per group.
+      // Grouped aggregate: returns one { key, value } row per group, optionally
+      // filtered by a HAVING predicate on the aggregate value.
       groupBy(field: string) {
-        const g = (func: string, aggField?: string, distinct?: boolean) =>
+        const toHaving = (h?: Record<string, number>) => {
+          for (const op of ["eq", "neq", "gt", "gte", "lt", "lte"] as const) {
+            if (h && h[op] !== undefined) return { op, value: h[op] };
+          }
+          return undefined;
+        };
+        const g = (func: string, aggField?: string, distinct?: boolean, having?: Record<string, number>) =>
           call({
             ...base(),
             groupBy: field,
@@ -157,15 +164,17 @@ function makeDb(requestId: string) {
               ...(aggField !== undefined ? { field: aggField } : {}),
               ...(distinct ? { distinct: true } : {}),
             },
+            ...(toHaving(having) ? { having: toHaving(having) } : {}),
             mode: "collect",
           });
+        type H = Record<string, number>;
         return {
-          count: () => g("count"),
-          countDistinct: (f: string) => g("count", f, true),
-          sum: (f: string) => g("sum", f),
-          min: (f: string) => g("min", f),
-          max: (f: string) => g("max", f),
-          avg: (f: string) => g("avg", f),
+          count: (having?: H) => g("count", undefined, false, having),
+          countDistinct: (f: string, having?: H) => g("count", f, true, having),
+          sum: (f: string, having?: H) => g("sum", f, false, having),
+          min: (f: string, having?: H) => g("min", f, false, having),
+          max: (f: string, having?: H) => g("max", f, false, having),
+          avg: (f: string, having?: H) => g("avg", f, false, having),
         };
       },
     };

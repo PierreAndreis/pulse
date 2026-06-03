@@ -78,6 +78,7 @@ async fn capture_reads_prunes_foreign_channel() {
         offset: None,
         aggregate: None,
         group_by: None,
+        having: None,
         mode: QueryMode::Take,
     };
 
@@ -153,6 +154,7 @@ async fn capture_reads_or_filter_matches_either_branch() {
         offset: None,
         aggregate: None,
         group_by: None,
+        having: None,
         mode: QueryMode::Collect,
     };
 
@@ -200,6 +202,7 @@ async fn capture_reads_not_filter_negates_precisely() {
         offset: None,
         aggregate: None,
         group_by: None,
+        having: None,
         mode: QueryMode::Collect,
     };
     let mut rs = ReadSet::new();

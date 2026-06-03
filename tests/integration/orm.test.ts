@@ -122,6 +122,13 @@ describe("ORM group by", () => {
     expect(sumByTag.find((g) => g.key === "x")?.value).toBe(10); // apple 10 + cherry null
     expect(sumByTag.find((g) => g.key === "y")?.value).toBe(30);
   });
+
+  test("HAVING keeps only groups whose aggregate satisfies the predicate", async () => {
+    await seed(); // tag x has 2 widgets (apple, cherry); y has 1; null has 1
+    const big = (await c.w.bigTags.call({})) as { key: string | null; value: number }[];
+    // count(*) >= 2 → only tag "x"
+    expect(big).toEqual([{ key: "x", value: 2 }]);
+  });
 });
 
 describe("ORM joins (handler composition)", () => {
