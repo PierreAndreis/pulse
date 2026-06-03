@@ -629,16 +629,41 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
             table: name,
             predicates,
             filters,
+            aggregate,
+            group_by,
             ..
         } => {
             let tid = TableId::new(name.clone());
             if predicates.is_empty() && filters.is_empty() {
-                rs.add_table(tid); // full-table read
+                // No filter. A full-doc read depends on the whole table; an
+                // aggregate (e.g. unfiltered count) still depends on the table for
+                // membership, so both fall back to a table-wildcard read.
+                rs.add_table(tid);
                 return;
             }
             let Some(t) = catalog.table(name) else {
                 rs.add_table(tid);
                 return;
+            };
+            // Columns the result depends on beyond membership: full-doc reads → None
+            // (any change matters); aggregates → the group key + aggregated field
+            // (a bare count() → empty, so value-only updates to matching rows prune).
+            let read_cols: Option<Vec<String>> = match aggregate {
+                None => None,
+                Some(agg) => {
+                    let mut cols = Vec::new();
+                    if let Some(k) = group_by {
+                        cols.push(k.clone());
+                    }
+                    let bare_count =
+                        matches!(agg.func, AggFn::Count) && !agg.distinct && agg.field.is_none();
+                    if !bare_count {
+                        if let Some(f) = &agg.field {
+                            cols.push(f.clone());
+                        }
+                    }
+                    Some(cols)
+                }
             };
             // Convert predicates + filter trees to DNF. Each conjunction becomes a
             // precise `Filter` (an OR across them). An empty conjunction means
@@ -647,7 +672,13 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
             match query_dnf(t, predicates, filters) {
                 Some(dnf) if !dnf.is_empty() && !dnf.iter().any(|c| c.is_empty()) => {
                     for conds in dnf {
-                        rs.add_filter(tid.clone(), Filter { conds });
+                        rs.add_filter(
+                            tid.clone(),
+                            Filter {
+                                conds,
+                                read_cols: read_cols.clone(),
+                            },
+                        );
                     }
                 }
                 _ => rs.add_table(tid),

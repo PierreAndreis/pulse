@@ -309,6 +309,7 @@ mod tests {
                     op: FilterOp::Eq,
                     value: KeyValue::Text(value.into()),
                 }],
+                read_cols: None,
             },
         );
         rs

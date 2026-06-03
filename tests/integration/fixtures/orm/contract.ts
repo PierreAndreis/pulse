@@ -25,6 +25,7 @@ export const contract = {
     page: oc.reactive().input(v.object({ limit: v.number(), offset: v.number() })).output(v.array(v.any())),
     // aggregates
     count: num(),
+    activeCount: num(), // count() over a filter — value-only updates are pruned
     countPrice: num(),
     countDistinctTag: num(),
     sumPrice: numN(),
@@ -42,6 +43,7 @@ export const contract = {
     addWidget: oc.mutation().input(v.object({ name: v.string(), qty: v.number(), price: v.optional(v.number()), active: v.boolean(), tag: v.optional(v.string()), authorId: v.optional(v.id("authors")) })).output(v.any()),
     renameAuthor: oc.mutation().input(v.object({ id: v.id("authors"), name: v.string() })).output(v.null()),
     setActive: oc.mutation().input(v.object({ id: v.id("widgets"), active: v.boolean() })).output(v.null()),
+    renameWidget: oc.mutation().input(v.object({ id: v.id("widgets"), name: v.string() })).output(v.null()),
     remove: oc.mutation().input(v.object({ id: v.id("widgets") })).output(v.null()),
   },
 };

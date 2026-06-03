@@ -37,6 +37,8 @@ export const page = os.w.page.handler(async ({ ctx, input }: any) =>
   q(ctx).order("asc", "name").paginate({ limit: input.limit, offset: input.offset }));
 
 export const count = os.w.count.handler(async ({ ctx }) => q(ctx).count());
+export const activeCount = os.w.activeCount.handler(async ({ ctx }) =>
+  q(ctx).filter((x: any) => x.eq("active", true)).count());
 export const countPrice = os.w.countPrice.handler(async ({ ctx }) => q(ctx).count("price"));
 export const countDistinctTag = os.w.countDistinctTag.handler(async ({ ctx }) => q(ctx).countDistinct("tag"));
 export const sumPrice = os.w.sumPrice.handler(async ({ ctx }) => q(ctx).sum("price"));
@@ -77,6 +79,10 @@ export const renameAuthor = os.w.renameAuthor.handler(async ({ ctx, input }: any
 });
 export const setActive = os.w.setActive.handler(async ({ ctx, input }: any) => {
   await ctx.db.patch(input.id, { active: input.active });
+  return null;
+});
+export const renameWidget = os.w.renameWidget.handler(async ({ ctx, input }: any) => {
+  await ctx.db.patch(input.id, { name: input.name });
   return null;
 });
 export const remove = os.w.remove.handler(async ({ ctx, input }: any) => {

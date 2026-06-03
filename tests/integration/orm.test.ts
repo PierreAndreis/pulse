@@ -181,4 +181,27 @@ describe("ORM reactivity is precise", () => {
       unsub();
     }
   });
+
+  test("filtered count() prunes an unread-column update but fires on a membership flip", async () => {
+    const counts: number[] = [];
+    const unsub = c.w.activeCount.subscribe({}, (n) => counts.push(n as number));
+    try {
+      await waitFor(() => counts.length >= 1);
+      expect(counts.at(-1)).toBe(0);
+      const w = (await c.w.addWidget.call({ name: "w1", qty: 1, active: true })) as { _id: string };
+      await waitFor(() => counts.at(-1) === 1); // counted
+
+      // Rename: `name` is neither the filter column nor aggregated → count unchanged.
+      const pushesBefore = counts.length;
+      await c.w.renameWidget.call({ id: w._id as never, name: "w1-renamed" });
+      await new Promise((r) => setTimeout(r, 600));
+      expect(counts.length).toBe(pushesBefore); // pruned — no recompute
+
+      // Membership flip: active true→false removes it from the count → must recompute.
+      await c.w.setActive.call({ id: w._id as never, active: false });
+      await waitFor(() => counts.at(-1) === 0);
+    } finally {
+      unsub();
+    }
+  });
 });
