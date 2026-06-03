@@ -42,8 +42,9 @@ const HELP = `pulse <command>
                                --[no-]db                 start Postgres
                                --[no-]git                git init
                                -y, --yes                 accept all defaults
-  gen <schema.ts> [out.ts]   generate the Doc/Id data model from a schema
-                             (default out: <schemaDir>/_generated/dataModel.ts)
+  gen [schema.ts] [out.ts]   generate the Doc/Id data model from a schema
+                             (schema defaults to app/schema.ts; default out:
+                             <schemaDir>/_generated/dataModel.ts)
   migrate [schema.ts] [--out file.sql]
                              generate idempotent DDL from a schema (prints to
                              stdout, or writes to --out). Schema defaults to
@@ -54,19 +55,21 @@ const HELP = `pulse <command>
                              commented destructive). Database URL defaults to
                              --database-url, else DATABASE_URL, else the local
                              docker-compose Postgres.
-  dev <app.ts> [--port P] [--database-url URL] [--worker-bin bun]
+  dev [app.ts] [--port P] [--database-url URL] [--worker-bin bun]
                              run the engine against an app module (schema +
                              handlers); streams logs until Ctrl-C. Codegens +
                              syncs the schema on boot — for local development.
-  start <app.ts> [--port P] [--database-url URL] [--worker-bin bun] [--migrate]
+                             App defaults to app/app.ts.
+  start [app.ts] [--port P] [--database-url URL] [--worker-bin bun] [--migrate]
                              production serve: run the prebuilt engine + worker
                              (no codegen at boot). Pass --migrate to apply safe
                              additive schema changes; otherwise migrations are
                              left to an explicit step. Used by the Dockerfile.
-  deploy <app.ts> [--out dir]
+                             App defaults to app/app.ts.
+  deploy [app.ts] [--out dir]
                              build a self-contained release bundle (app + worker +
                              generated DDL + a run script) into <dir> (default
-                             ./pulse-dist).
+                             ./pulse-dist). App defaults to app/app.ts.
 `;
 
 /** Repo root: two levels up from packages/cli/src. */
@@ -116,6 +119,19 @@ function has(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
+/** Resolve a positional file arg, defaulting to the scaffold layout when it's
+ *  omitted (or the first arg is a flag), and failing with a clear hint if the
+ *  resolved file is missing — so commands work with zero args from a project root. */
+function resolveFileArg(args: string[], fallback: string, cmd: string): string {
+  const a = args[0];
+  const p = resolve(a && !a.startsWith("-") ? a : fallback);
+  if (!existsSync(p))
+    throw new Error(
+      `not found: ${p} — run from your project root, or pass it explicitly: \`pulse ${cmd} <path>\``,
+    );
+  return p;
+}
+
 /**
  * Connect to Postgres via node-postgres. We import it dynamically (the ONE
  * justified inline import in this CLI) so the no-DB paths (`gen`, `migrate`
@@ -133,7 +149,8 @@ async function connectPg(databaseUrl: string): Promise<PgClient> {
     await client.connect();
   } catch (e) {
     throw new Error(
-      `could not connect to Postgres at ${databaseUrl} — is it running? Try \`pnpm db\`. ` +
+      `could not connect to Postgres at ${databaseUrl} — is it running? Start it with your ` +
+        `package manager's \`db\` script (e.g. \`docker compose up -d\`). ` +
         `(${e instanceof Error ? e.message : String(e)})`,
     );
   }
@@ -239,13 +256,13 @@ async function main(): Promise<void> {
       return;
 
     case "gen": {
-      const schemaPath = args[0];
-      if (!schemaPath) throw new Error("usage: pulse gen <schema.ts> [out.ts]");
+      // Schema defaults to app/schema.ts; an explicit out path is the 2nd positional.
+      const schemaPath = resolveFileArg(args, "app/schema.ts", "gen");
+      const explicitOut = args[0] && !args[0].startsWith("-") && args[1] && !args[1].startsWith("-");
+      const out = explicitOut
+        ? resolve(args[1]!)
+        : resolve(dirname(schemaPath), "_generated", "dataModel.ts");
       const schema = await loadSchema(schemaPath);
-      const out =
-        args[1] && !args[1].startsWith("-")
-          ? args[1]
-          : resolve(dirname(resolve(schemaPath)), "_generated", "dataModel.ts");
       await mkdir(dirname(out), { recursive: true });
       await writeFile(out, generateDataModel(schema), "utf8");
       process.stdout.write(`pulse: wrote ${out}\n`);
@@ -253,14 +270,8 @@ async function main(): Promise<void> {
     }
 
     case "migrate": {
-      // Schema defaults to app/schema.ts (the scaffold layout). A leading flag
-      // (e.g. `pulse migrate --diff`) is not a path, so ignore it as the positional.
-      const schemaArg = args[0] && !args[0].startsWith("-") ? args[0] : undefined;
-      const schemaPath = resolve(schemaArg ?? "app/schema.ts");
-      if (!existsSync(schemaPath))
-        throw new Error(
-          `schema not found at ${schemaPath} — run from your project root or pass it: \`pulse migrate <schema.ts>\``,
-        );
+      // Schema defaults to app/schema.ts; a leading flag (e.g. `--diff`) isn't a path.
+      const schemaPath = resolveFileArg(args, "app/schema.ts", "migrate");
       const schema = await loadSchema(schemaPath);
       const ddl = has(args, "--diff")
         ? await migrateDiff(
@@ -281,12 +292,7 @@ async function main(): Promise<void> {
     }
 
     case "dev": {
-      const appPath = args[0];
-      if (!appPath || appPath.startsWith("-"))
-        throw new Error(
-          "usage: pulse dev <app.ts> [--port P] [--database-url URL] [--start <cmd>] [--schema <path>]",
-        );
-      const resolvedApp = resolve(appPath);
+      const resolvedApp = resolveFileArg(args, "app/app.ts", "dev");
 
       // Load the schema directly (default: schema.ts next to the app) rather than
       // the app module — the app re-exports its _generated types, which may not
@@ -363,12 +369,7 @@ async function main(): Promise<void> {
     }
 
     case "start": {
-      const appPath = args[0];
-      if (!appPath || appPath.startsWith("-"))
-        throw new Error(
-          "usage: pulse start <app.ts> [--port P] [--database-url URL] [--worker-bin bun] [--migrate]",
-        );
-      const resolvedApp = resolve(appPath);
+      const resolvedApp = resolveFileArg(args, "app/app.ts", "start");
 
       // Production serve. Unlike `dev`, this does NOT codegen at boot — it assumes
       // `pulse gen` already ran at build time (writing to the filesystem on a
@@ -430,12 +431,10 @@ async function main(): Promise<void> {
     }
 
     case "deploy": {
-      const appPath = args[0];
-      if (!appPath || appPath.startsWith("-"))
-        throw new Error("usage: pulse deploy <app.ts> [--out dir]");
+      const resolvedApp = resolveFileArg(args, "app/app.ts", "deploy");
       const root = repoRoot();
       const outDir = resolve(flag(args, "--out") ?? "pulse-dist");
-      const schema = await loadSchema(appPath);
+      const schema = await loadSchema(resolvedApp);
       await mkdir(outDir, { recursive: true });
       // 1. Schema DDL so the target DB can be provisioned.
       await writeFile(resolve(outDir, "schema.sql"), generateDDL(schema), "utf8");
@@ -446,7 +445,7 @@ async function main(): Promise<void> {
         `# Provision the schema, then run the engine. Set DATABASE_URL first.\n` +
         `: "\${DATABASE_URL:?set DATABASE_URL}"\n` +
         `psql "$DATABASE_URL" -f "$(dirname "$0")/schema.sql"\n` +
-        `export PULSE_APP="${resolve(appPath)}"\n` +
+        `export PULSE_APP="${resolvedApp}"\n` +
         `export PULSE_WORKER_SCRIPT="${workerScriptPath()}"\n` +
         `export PULSE_PORT="\${PULSE_PORT:-8787}"\n` +
         `exec "${bin ?? "./pulse-server"}"\n`;
