@@ -43,6 +43,9 @@ export function scaffoldApp(
           // and Vite (via --start). Just `pnpm dev`.
           dev: "pulse dev app/app.ts --start vite",
           db: "docker compose up -d",
+          // Apply the schema to the database: additive changes auto-apply;
+          // destructive ones prompt for confirmation (or need --force in CI).
+          migrate: "pulse migrate --apply",
           build: "tsc && vite build",
           typecheck: "tsc --noEmit",
         },

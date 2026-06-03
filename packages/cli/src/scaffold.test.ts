@@ -85,6 +85,11 @@ describe("scaffoldApp", () => {
     expect(pkg.scripts.db).toBe("docker compose up -d");
   });
 
+  it("ships a migrate script that applies the schema", () => {
+    const pkg = JSON.parse(files["package.json"]!);
+    expect(pkg.scripts.migrate).toBe("pulse migrate --apply");
+  });
+
   it("schema/contract/handlers reference the same table", () => {
     expect(files["app/schema.ts"]).toContain("todos:");
     expect(files["app/contract.ts"]).toContain("todos:");

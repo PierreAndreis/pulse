@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cancel, confirm, isCancel } from "@clack/prompts";
 import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema";
 import { generateDataModel } from "./codegen.js";
 import { generateDDL } from "./ddl.js";
@@ -55,6 +56,12 @@ const HELP = `pulse <command>
                              commented destructive). Database URL defaults to
                              --database-url, else DATABASE_URL, else the local
                              docker-compose Postgres.
+  migrate [schema.ts] --apply [--database-url URL] [--force]
+                             apply the schema to the live database. Additive
+                             changes apply automatically; destructive ones (drops)
+                             prompt for confirmation when interactive, and are
+                             refused in a non-interactive env (CI / AI) unless
+                             --force is passed.
   dev [app.ts] [--port P] [--database-url URL] [--worker-bin bun]
                              run the engine against an app module (schema +
                              handlers); streams logs until Ctrl-C. Codegens +
@@ -241,6 +248,81 @@ async function dropLosesNoData(client: PgClient, drop: Drop): Promise<boolean> {
   return !(res.rows[0] as { has: boolean }).has;
 }
 
+/**
+ * Apply the schema to the live database (`pulse migrate --apply`). Additive
+ * changes (new tables/columns/indexes) always apply. DESTRUCTIVE changes (drops)
+ * and risky alters (type/nullability changes) require confirmation, Prisma-style:
+ *   - interactive (a TTY): prompt before applying — default "no";
+ *   - non-interactive (CI / an AI agent driving the CLI, i.e. no TTY): refuse and
+ *     exit non-zero unless `--force` is passed, so data is never dropped silently.
+ */
+async function applyMigration(
+  databaseUrl: string,
+  schema: AnySchema,
+  opts: { force: boolean },
+): Promise<void> {
+  const client = await connectPg(databaseUrl);
+  try {
+    const { live, liveIndexes } = await introspect(client);
+    const diff = diffSchema(live, schema, liveIndexes);
+
+    for (const stmt of diff.additive) await client.query(stmt);
+
+    const riskyAlters = diff.alters.filter((s) => !s.trimStart().startsWith("--"));
+    const drops = diff.destructive;
+    if (!riskyAlters.length && !drops.length) {
+      process.stdout.write(
+        diff.additive.length
+          ? `pulse: applied ${diff.additive.length} change(s); schema up to date\n`
+          : "pulse: schema up to date\n",
+      );
+      return;
+    }
+
+    // There ARE destructive/risky changes. Show exactly what they are.
+    process.stdout.write(
+      `pulse: applied ${diff.additive.length} safe change(s). The following are ` +
+        `DESTRUCTIVE (permanent data loss):\n` +
+        renderDiff({ additive: [], alters: diff.alters, destructive: drops }),
+    );
+
+    let approved = opts.force;
+    if (!approved) {
+      if (process.stdin.isTTY) {
+        const answer = await confirm({
+          message: "Apply these destructive changes? This permanently deletes data.",
+          initialValue: false,
+        });
+        if (isCancel(answer)) {
+          cancel("Aborted — no destructive changes applied.");
+          return;
+        }
+        approved = answer === true;
+      } else {
+        // No TTY: an AI agent or CI is driving us. Never drop data on a guess.
+        process.stderr.write(
+          "pulse: refusing to apply destructive changes in a non-interactive environment. " +
+            "Re-run with --force to apply them, or review with `pulse migrate --diff`.\n",
+        );
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    if (!approved) {
+      process.stdout.write("pulse: skipped destructive changes (not applied).\n");
+      return;
+    }
+    for (const alter of riskyAlters) await client.query(alter);
+    for (const drop of drops) await client.query(dropStatement(drop));
+    process.stdout.write(
+      `pulse: applied ${riskyAlters.length + drops.length} destructive change(s).\n`,
+    );
+  } finally {
+    await client.end();
+  }
+}
+
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
 
@@ -273,14 +355,21 @@ async function main(): Promise<void> {
       // Schema defaults to app/schema.ts; a leading flag (e.g. `--diff`) isn't a path.
       const schemaPath = resolveFileArg(args, "app/schema.ts", "migrate");
       const schema = await loadSchema(schemaPath);
-      const ddl = has(args, "--diff")
-        ? await migrateDiff(
-            schema,
-            // Same default as `pulse dev`: --database-url, else DATABASE_URL, else
-            // the local docker-compose Postgres — so `--diff` works with no config.
-            flag(args, "--database-url") ?? process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
-          )
-        : generateDDL(schema);
+      // Same default as `pulse dev`: --database-url, else DATABASE_URL, else the
+      // local docker-compose Postgres — so the DB-backed modes work with no config.
+      const dbUrl = () =>
+        flag(args, "--database-url") ?? process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL;
+
+      // `--apply`: apply the schema to the live DB (additive auto; destructive
+      // only with confirmation / --force).
+      if (has(args, "--apply")) {
+        await applyMigration(dbUrl(), schema, {
+          force: has(args, "--force") || has(args, "--yes"),
+        });
+        return;
+      }
+
+      const ddl = has(args, "--diff") ? await migrateDiff(schema, dbUrl()) : generateDDL(schema);
       const out = flag(args, "--out");
       if (out) {
         await writeFile(out, ddl, "utf8");
