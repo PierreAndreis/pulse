@@ -25,7 +25,7 @@ use tower_http::cors::CorsLayer;
 
 use uuid::Uuid;
 
-use pulse_core::{ChangeSet, Lsn, ReadSet};
+use pulse_core::{ChangeSet, Lsn, ReadSet, TableId};
 use pulse_jsruntime::{Worker, WorkerConfig, WorkerError};
 use pulse_reactor::{InMemoryReactor, ReExecutor, Reactor, Subscription};
 
@@ -150,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
                 while let Some(event) = rx.recv().await {
                     match event {
                         pulse_cdc::BusEvent::Changes(cs) => reactor.apply_change_set(cs).await,
+                        pulse_cdc::BusEvent::ResyncTables(tables) => {
+                            let ts = tables.into_iter().map(TableId::new).collect();
+                            reactor.invalidate_tables(ts).await;
+                        }
                         pulse_cdc::BusEvent::Resync => reactor.invalidate_all().await,
                     }
                 }

@@ -63,6 +63,11 @@ pub trait Reactor: Send + Sync {
     async fn push(&self, client_id: &str, sub: &str, value: &Value, commit_lsn: Lsn) -> bool;
     /// The single invalidation entry point: match → dedup → re-exec → diff → push.
     async fn apply_change_set(&self, change_set: ChangeSet);
+    /// Re-evaluate every subscription referencing any of `tables`, regardless of
+    /// row-level predicates. Scoped over-approximation used when a precise
+    /// change-set can't be delivered but the touched tables are known (an oversized
+    /// cross-node payload that still carried its table list).
+    async fn invalidate_tables(&self, tables: HashSet<TableId>);
     /// Re-evaluate every subscription regardless of read-set. Safe (over-broad)
     /// fallback used when a precise change-set can't be delivered (e.g. an
     /// oversized cross-node bus payload).
@@ -372,6 +377,13 @@ impl Reactor for InMemoryReactor {
                 .collect()
         };
         self.reexec_and_push(dirty, change_set.commit_lsn).await;
+    }
+
+    async fn invalidate_tables(&self, tables: HashSet<TableId>) {
+        // Re-exec every subscription on the affected tables (no row-level matching —
+        // we don't have the rows). The index makes this scoped to those tables.
+        let dirty: Vec<Subscription> = self.reg.lock().await.candidates(&tables);
+        self.reexec_and_push(dirty, Lsn::ZERO).await;
     }
 
     async fn invalidate_all(&self) {
@@ -866,6 +878,43 @@ mod tests {
             reexec.calls.load(Ordering::SeqCst),
             2,
             "a change to the no-longer-referenced table must be pruned"
+        );
+    }
+
+    /// A coarse table-scoped invalidation (the oversized-bus-payload path) must
+    /// re-exec only subscriptions on the named tables, leaving other tables alone.
+    #[tokio::test]
+    async fn invalidate_tables_is_scoped_to_named_tables() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await; // read-set references `messages`
+
+        // A second sub on an unrelated table (`users`).
+        let mut users_rs = ReadSet::new();
+        users_rs.add_table(TableId::new("users"));
+        reactor
+            .add_subscription(Subscription {
+                client_id: "a".into(),
+                sub: "users::list".into(),
+                path: vec!["users".into(), "list".into()],
+                input: json!({}),
+                headers: HashMap::new(),
+                read_set: users_rs,
+                last: None,
+            })
+            .await;
+
+        reactor
+            .invalidate_tables(HashSet::from([TableId::new("messages")]))
+            .await;
+
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            1,
+            "only the `messages` sub re-execs; the `users` sub is untouched"
         );
     }
 

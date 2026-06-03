@@ -34,8 +34,12 @@ const MAX_PAYLOAD: usize = 7800;
 pub enum BusEvent {
     /// A concrete change-set from another node — apply it precisely.
     Changes(ChangeSet),
-    /// The originating change-set was too large to ship; re-evaluate everything
-    /// (rare, safe over-approximation).
+    /// The originating change-set was too large to ship precisely, but the set of
+    /// tables it touched still fit — re-evaluate only subscriptions on those tables
+    /// (coarse, but scoped to the affected tables instead of everything).
+    ResyncTables(Vec<String>),
+    /// Even the touched-table list didn't fit (pathologically wide write) →
+    /// re-evaluate everything (rare, safe over-approximation).
     Resync,
 }
 
@@ -44,6 +48,7 @@ pub enum BusEvent {
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Wire {
     Changes { origin: String, data: ChangeSet },
+    ResyncTables { origin: String, tables: Vec<String> },
     Resync { origin: String },
 }
 
@@ -55,8 +60,11 @@ pub enum BusError {
     Json(#[from] serde_json::Error),
 }
 
-/// Encode a change-set for the wire. Small change-sets ship in full; oversized
-/// ones (over [`MAX_PAYLOAD`]) degrade to a `Resync` marker.
+/// Encode a change-set for the wire, degrading gracefully as it grows:
+///   1. small enough → ship the full change-set (precise),
+///   2. too big, but the distinct touched-table list fits → ship `ResyncTables`
+///      so peers invalidate only those tables (scoped over-approximation),
+///   3. even the table list is too big → ship `Resync` (global re-eval).
 fn encode_payload(node_id: &str, cs: &ChangeSet) -> Result<String, BusError> {
     let full = Wire::Changes {
         origin: node_id.to_string(),
@@ -64,12 +72,23 @@ fn encode_payload(node_id: &str, cs: &ChangeSet) -> Result<String, BusError> {
     };
     let payload = serde_json::to_string(&full)?;
     if payload.len() <= MAX_PAYLOAD {
-        Ok(payload)
-    } else {
-        Ok(serde_json::to_string(&Wire::Resync {
-            origin: node_id.to_string(),
-        })?)
+        return Ok(payload);
     }
+
+    let mut tables: Vec<String> = cs.changes.iter().map(|c| c.table.0.clone()).collect();
+    tables.sort();
+    tables.dedup();
+    let scoped = serde_json::to_string(&Wire::ResyncTables {
+        origin: node_id.to_string(),
+        tables,
+    })?;
+    if scoped.len() <= MAX_PAYLOAD {
+        return Ok(scoped);
+    }
+
+    Ok(serde_json::to_string(&Wire::Resync {
+        origin: node_id.to_string(),
+    })?)
 }
 
 /// Classify a decoded wire message against the local node id. Self-originated
@@ -84,6 +103,13 @@ fn classify(wire: Wire, self_node_id: &str) -> Option<BusEvent> {
                 Some(BusEvent::Changes(data))
             }
         }
+        Wire::ResyncTables { origin, tables } => {
+            if origin == self_node_id {
+                None
+            } else {
+                Some(BusEvent::ResyncTables(tables))
+            }
+        }
         Wire::Resync { origin } => {
             if origin == self_node_id {
                 None
@@ -95,7 +121,8 @@ fn classify(wire: Wire, self_node_id: &str) -> Option<BusEvent> {
 }
 
 /// Publish a change-set to every node (including the origin). Small change-sets
-/// ship in full; oversized ones degrade to a `Resync` marker.
+/// ship in full; oversized ones degrade to a scoped `ResyncTables` (or a global
+/// `Resync` if even the table list overflows) — see [`encode_payload`].
 pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
     let payload = encode_payload(node_id, cs)?;
     sqlx::query("SELECT pg_notify($1, $2)")
@@ -183,7 +210,7 @@ mod tests {
                 assert_eq!(origin, "node-a");
                 assert_eq!(data, small_changeset());
             }
-            Wire::Resync { .. } => panic!("expected Changes variant"),
+            _ => panic!("expected Changes variant"),
         }
     }
 
@@ -197,7 +224,7 @@ mod tests {
         let back: Wire = serde_json::from_str(&json).unwrap();
         match back {
             Wire::Resync { origin } => assert_eq!(origin, "node-z"),
-            Wire::Changes { .. } => panic!("expected Resync variant"),
+            _ => panic!("expected Resync variant"),
         }
     }
 
@@ -236,13 +263,32 @@ mod tests {
     }
 
     #[test]
-    fn oversize_payload_triggers_resync() {
+    fn classify_keeps_foreign_resync_tables() {
+        let wire = Wire::ResyncTables {
+            origin: "other".to_string(),
+            tables: vec!["public.messages".to_string()],
+        };
+        match classify(wire, "self") {
+            Some(BusEvent::ResyncTables(t)) => assert_eq!(t, vec!["public.messages"]),
+            other => panic!("expected foreign ResyncTables, got {other:?}"),
+        }
+        // self-originated is dropped
+        let mine = Wire::ResyncTables {
+            origin: "self".to_string(),
+            tables: vec!["x".to_string()],
+        };
+        assert!(classify(mine, "self").is_none());
+    }
+
+    #[test]
+    fn oversize_payload_degrades_to_scoped_table_resync() {
         // Under the guard: a small change-set ships in full.
         let small = encode_payload("n1", &small_changeset()).unwrap();
         assert!(small.len() <= MAX_PAYLOAD);
         assert!(small.contains("\"kind\":\"changes\""), "json was: {small}");
 
-        // Over the guard: many changes blow past MAX_PAYLOAD → degrade to Resync.
+        // Over the guard but few distinct tables: degrade to ResyncTables carrying
+        // the touched tables (NOT a global Resync) — this is the blast-radius win.
         let mut big = ChangeSet::new(lsn());
         for i in 0..2000 {
             big.push(Change::point(
@@ -251,7 +297,6 @@ mod tests {
                 ChangeOp::Insert,
             ));
         }
-        // Sanity: the full encoding really would exceed the cap.
         let full = serde_json::to_string(&Wire::Changes {
             origin: "n1".to_string(),
             data: big.clone(),
@@ -259,22 +304,40 @@ mod tests {
         .unwrap();
         assert!(
             full.len() > MAX_PAYLOAD,
-            "fixture not large enough: {}",
+            "fixture too small: {}",
             full.len()
         );
 
         let encoded = encode_payload("n1", &big).unwrap();
         assert!(encoded.len() <= MAX_PAYLOAD);
-        assert!(
-            encoded.contains("\"kind\":\"resync\""),
-            "json was: {encoded}"
-        );
-
-        // And it decodes back to a Resync wire carrying the origin.
         let back: Wire = serde_json::from_str(&encoded).unwrap();
         match back {
-            Wire::Resync { origin } => assert_eq!(origin, "n1"),
-            Wire::Changes { .. } => panic!("oversize payload should be Resync"),
+            Wire::ResyncTables { origin, tables } => {
+                assert_eq!(origin, "n1");
+                assert_eq!(tables, vec!["public.messages"], "dedup to the one table");
+            }
+            _ => panic!("expected ResyncTables, got a different wire variant"),
         }
+    }
+
+    #[test]
+    fn pathologically_wide_write_falls_back_to_global_resync() {
+        // Thousands of DISTINCT tables → even the table list exceeds the cap →
+        // fall all the way back to a global Resync.
+        let mut big = ChangeSet::new(lsn());
+        for i in 0..3000 {
+            big.push(Change::point(
+                TableId::new(format!("public.table_with_a_longish_name_{i:06}")),
+                PrimaryKey::single(KeyValue::Int(i)),
+                ChangeOp::Insert,
+            ));
+        }
+        let encoded = encode_payload("n1", &big).unwrap();
+        assert!(encoded.len() <= MAX_PAYLOAD);
+        let back: Wire = serde_json::from_str(&encoded).unwrap();
+        assert!(
+            matches!(back, Wire::Resync { .. }),
+            "a write spanning thousands of tables must fall back to global Resync"
+        );
     }
 }
