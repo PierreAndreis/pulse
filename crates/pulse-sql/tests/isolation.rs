@@ -35,6 +35,18 @@ async fn concurrent_rmw_raises_serialization_failure() {
         eprintln!("skip: no Postgres");
         return;
     };
+    // Self-seed the table so the test does not depend on an externally
+    // migrated DB (matches the self-seeding pattern in tests/collab.rs).
+    pool.execute(
+        "create table if not exists counters (\
+            _id uuid primary key,\
+            _creation_time bigint not null default 0,\
+            name text,\
+            value bigint not null default 0)",
+    )
+    .await
+    .unwrap();
+
     // Fresh row.
     pool.execute(
         "INSERT INTO counters (_id, name, value) VALUES ('00000000-0000-0000-0000-0000000000ff','iso',0)
