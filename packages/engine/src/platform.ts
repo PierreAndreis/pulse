@@ -6,7 +6,8 @@ export type EngineTarget =
   | "x86_64-apple-darwin"
   | "x86_64-unknown-linux-gnu"
   | "x86_64-unknown-linux-musl"
-  | "aarch64-unknown-linux-gnu";
+  | "aarch64-unknown-linux-gnu"
+  | "aarch64-unknown-linux-musl";
 
 /** Detect whether the Linux userland is musl (Alpine) vs glibc. */
 function isMusl(): boolean {
@@ -23,17 +24,20 @@ function isMusl(): boolean {
   return existsSync("/etc/alpine-release");
 }
 
-/** Resolve the engine target triple for the current host, or null if unsupported. */
+/** Resolve the engine target triple for the current host, or null if unsupported.
+ *  `muslHost` defaults to runtime detection but can be overridden (tests). */
 export function detectTarget(
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
+  muslHost: boolean = isMusl(),
 ): EngineTarget | null {
   if (platform === "darwin") {
     return arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
   }
   if (platform === "linux") {
-    if (arch === "arm64") return "aarch64-unknown-linux-gnu";
-    if (arch === "x64") return isMusl() ? "x86_64-unknown-linux-musl" : "x86_64-unknown-linux-gnu";
+    if (arch === "arm64")
+      return muslHost ? "aarch64-unknown-linux-musl" : "aarch64-unknown-linux-gnu";
+    if (arch === "x64") return muslHost ? "x86_64-unknown-linux-musl" : "x86_64-unknown-linux-gnu";
   }
   return null;
 }

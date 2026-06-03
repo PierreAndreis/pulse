@@ -341,8 +341,10 @@ ${editLine}
 # statically and pointed at this server's public URL via VITE_PULSE_ENGINE_URL.
 # Requires a Postgres reachable at DATABASE_URL.
 #
-# Debian trixie (glibc 2.41): the prebuilt engine binary is built on glibc 2.39,
-# so an older base (e.g. bookworm / glibc 2.36) fails with "GLIBC_2.39 not found".
+# Debian trixie-slim runs the prebuilt gnu engine binary on any arch. For the
+# smallest image, swap to Alpine (the engine also ships static musl binaries):
+#   FROM node:22-alpine
+#   COPY --from=oven/bun:1-alpine /usr/local/bin/bun /usr/local/bin/bun
 FROM node:22-trixie-slim
 
 # bun runs the worker — it executes your app's TypeScript directly.

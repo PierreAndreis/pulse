@@ -7,8 +7,12 @@ describe("detectTarget", () => {
     expect(detectTarget("darwin", "arm64")).toBe("aarch64-apple-darwin");
     expect(detectTarget("darwin", "x64")).toBe("x86_64-apple-darwin");
   });
-  it("maps linux arm64 to gnu", () => {
-    expect(detectTarget("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
+  it("maps linux by arch + libc (glibc vs musl/Alpine)", () => {
+    // explicit muslHost so the result doesn't depend on the test host's libc
+    expect(detectTarget("linux", "arm64", false)).toBe("aarch64-unknown-linux-gnu");
+    expect(detectTarget("linux", "arm64", true)).toBe("aarch64-unknown-linux-musl");
+    expect(detectTarget("linux", "x64", false)).toBe("x86_64-unknown-linux-gnu");
+    expect(detectTarget("linux", "x64", true)).toBe("x86_64-unknown-linux-musl");
   });
   it("returns null for unsupported platforms", () => {
     expect(detectTarget("win32", "x64")).toBeNull();
