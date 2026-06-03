@@ -77,6 +77,7 @@ async fn capture_reads_prunes_foreign_channel() {
         limit: Some(100),
         offset: None,
         aggregate: None,
+        group_by: None,
         mode: QueryMode::Take,
     };
 
@@ -151,6 +152,7 @@ async fn capture_reads_or_filter_matches_either_branch() {
         limit: None,
         offset: None,
         aggregate: None,
+        group_by: None,
         mode: QueryMode::Collect,
     };
 

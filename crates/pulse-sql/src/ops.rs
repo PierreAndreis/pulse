@@ -152,6 +152,10 @@ pub enum DbOp {
         /// instead of the rows themselves (order/limit/offset are ignored).
         #[serde(default)]
         aggregate: Option<Agg>,
+        /// With `aggregate`, group by this field and return one `{key, value}` row
+        /// per group. Reactivity is the same filter read-set as a scalar aggregate.
+        #[serde(default, rename = "groupBy")]
+        group_by: Option<String>,
         mode: QueryMode,
     },
     Insert {
@@ -347,6 +351,47 @@ async fn fetch_scalar_opt_f64(
         q = q.bind(b.clone());
     }
     Ok(q.fetch_one(conn).await?)
+}
+
+/// The SQL aggregate expression (uncast) for a scalar or grouped aggregate.
+fn agg_sql(t: &Table, agg: &Agg) -> Result<String, SqlError> {
+    let col = |a: &Agg| -> Result<String, SqlError> {
+        Ok(column(t, a.field.as_deref().unwrap_or_default())?
+            .column
+            .clone())
+    };
+    Ok(match agg.func {
+        AggFn::Count => match (agg.distinct, agg.field.as_deref()) {
+            (true, Some(f)) => format!("count(distinct {})", column(t, f)?.column),
+            _ => "count(*)".to_string(),
+        },
+        AggFn::Sum => format!("coalesce(sum({}), 0)", col(agg)?),
+        AggFn::Min => format!("min({})", col(agg)?),
+        AggFn::Max => format!("max({})", col(agg)?),
+        AggFn::Avg => format!("avg({})", col(agg)?),
+    })
+}
+
+/// Fetch grouped aggregate rows as `{key, value}` objects. Column 0 is the group
+/// key (read as text, decoded via `keycol`), column 1 the aggregate (f64/null).
+async fn fetch_grouped(
+    conn: &mut PgConnection,
+    sql: &str,
+    binds: &[Option<String>],
+    keycol: &Column,
+) -> Result<Vec<Value>, SqlError> {
+    let mut q = sqlx::query(sql);
+    for b in binds {
+        q = q.bind(b.clone());
+    }
+    let rows = q.fetch_all(conn).await?;
+    rows.iter()
+        .map(|r| {
+            let k: Option<String> = r.try_get(0)?;
+            let v: Option<f64> = r.try_get(1)?;
+            Ok(json!({ "key": text_to_json(k, keycol), "value": v }))
+        })
+        .collect()
 }
 
 /// Render a filter expression tree to a parenthesized SQL boolean, pushing binds.
@@ -708,6 +753,7 @@ pub async fn execute_op(
             limit,
             offset,
             aggregate,
+            group_by,
             mode,
         } => {
             let t = table(catalog, name)?;
@@ -744,6 +790,18 @@ pub async fn execute_op(
             // filters into the read-set, so a matching write recomputes it. count/sum
             // are 0 over an empty set; min/max/avg are null.
             if let Some(agg) = aggregate {
+                // Grouped aggregate: one {key, value} row per group. Same filter
+                // read-set as the scalar path → filter-precise reactivity.
+                if let Some(gkey) = group_by {
+                    let keycol = column(t, gkey)?;
+                    let sql = format!(
+                        "SELECT {0}::text, ({1})::double precision FROM {name}{where_sql} GROUP BY {0}",
+                        keycol.column,
+                        agg_sql(t, agg)?,
+                    );
+                    let rows = fetch_grouped(&mut *conn, &sql, &binds, keycol).await?;
+                    return Ok((Value::Array(rows), None));
+                }
                 let value = match agg.func {
                     AggFn::Count => {
                         // count(distinct field) when requested, else count(*).

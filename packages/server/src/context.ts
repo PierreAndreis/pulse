@@ -97,6 +97,21 @@ export interface QueryBuilder<T extends string> {
   max(field: NumericKeys<T>): Promise<number | null>;
   /** Average of a numeric field over the matching rows (null if none). Reactive. */
   avg(field: NumericKeys<T>): Promise<number | null>;
+  /** Group the (filtered) rows by `field`; the returned handle's aggregate methods
+   *  resolve to one `{ key, value }` row per group. Same filter-precise reactivity
+   *  as a scalar aggregate. */
+  groupBy<F extends keyof Doc<T> & string>(field: F): GroupedQuery<T, Doc<T>[F]>;
+}
+
+/** Grouped-aggregate handle from {@link QueryBuilder.groupBy}. Each method
+ *  resolves to one row per group: `{ key: <group value>, value: <aggregate> }`. */
+export interface GroupedQuery<T extends string, K> {
+  count(): Promise<Array<{ key: K; value: number }>>;
+  countDistinct(field: keyof Doc<T> & string): Promise<Array<{ key: K; value: number }>>;
+  sum(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
+  min(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
+  max(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
+  avg(field: NumericKeys<T>): Promise<Array<{ key: K; value: number | null }>>;
 }
 
 /** Keys of a doc whose value is a number — the valid targets for `sum()`. */

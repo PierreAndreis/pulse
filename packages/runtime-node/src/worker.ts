@@ -140,6 +140,28 @@ function makeDb(requestId: string) {
         call({ ...base(), aggregate: { func: "max", field }, mode: "collect" }),
       avg: (field: string) =>
         call({ ...base(), aggregate: { func: "avg", field }, mode: "collect" }),
+      // Grouped aggregate: returns one { key, value } row per group.
+      groupBy(field: string) {
+        const g = (func: string, aggField?: string, distinct?: boolean) =>
+          call({
+            ...base(),
+            groupBy: field,
+            aggregate: {
+              func,
+              ...(aggField !== undefined ? { field: aggField } : {}),
+              ...(distinct ? { distinct: true } : {}),
+            },
+            mode: "collect",
+          });
+        return {
+          count: () => g("count"),
+          countDistinct: (f: string) => g("count", f, true),
+          sum: (f: string) => g("sum", f),
+          min: (f: string) => g("min", f),
+          max: (f: string) => g("max", f),
+          avg: (f: string) => g("avg", f),
+        };
+      },
     };
     return builder;
   }

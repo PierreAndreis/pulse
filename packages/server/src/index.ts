@@ -27,6 +27,7 @@ export type {
   DatabaseReader,
   DatabaseWriter,
   QueryBuilder,
+  GroupedQuery,
   IndexRangeBuilder,
   FilterBuilder,
   FilterCond,
