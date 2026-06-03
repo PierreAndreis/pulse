@@ -96,6 +96,52 @@ describe("replication: cross-node push latency (LISTEN/NOTIFY bus)", () => {
     },
     120_000,
   );
+
+  test(
+    "cross-node replication recovers after a Postgres restart (listener reconnect + resync)",
+    async () => {
+      const seen: number[] = [];
+      const unsub = cb.w.activeCount.subscribe({}, (n) => seen.push(n as number));
+      try {
+        await waitFor(() => seen.length >= 1);
+        const base = seen.at(-1)!; // current active count (prior tests left rows)
+
+        // Baseline: a write on A crosses the bus to B.
+        await ca.w.addWidget.call({ name: "pre-restart", qty: 1, active: true });
+        await waitFor(() => seen.at(-1) === base + 1, 10_000);
+
+        // Bounce Postgres — every node's listener connection drops.
+        await execFileAsync("docker", ["restart", process.env.PULSE_PG_CONTAINER ?? "pulse-prune-test"]);
+        for (let i = 0; i < 60; i++) {
+          try {
+            await execFileAsync("docker", ["exec", process.env.PULSE_PG_CONTAINER ?? "pulse-prune-test", "pg_isready", "-U", "pulse", "-d", "pulse"]);
+            break;
+          } catch {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+        // Give the engines' pools + bus listeners time to reconnect (500ms backoff).
+        await new Promise((r) => setTimeout(r, 2500));
+
+        // A write on A must again reach B — proving the listener reconnected and the
+        // bus is live. Retry the write itself: A's pool may need a reconnect too.
+        let wrote = false;
+        for (let i = 0; i < 10 && !wrote; i++) {
+          try {
+            await ca.w.addWidget.call({ name: "post-restart", qty: 1, active: true });
+            wrote = true;
+          } catch {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+        expect(wrote).toBe(true);
+        await waitFor(() => (seen.at(-1) ?? 0) >= base + 2, 20_000);
+      } finally {
+        unsub();
+      }
+    },
+    120_000,
+  );
 });
 
 describe("replication: server memory at scale", () => {

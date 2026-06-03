@@ -141,9 +141,11 @@ pub async fn start_listener(
     database_url: &str,
     node_id: String,
 ) -> Result<mpsc::Receiver<BusEvent>, BusError> {
+    // Connect synchronously so a misconfigured URL / down DB surfaces to the caller.
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen(CHANNEL).await?;
     let (tx, rx) = mpsc::channel(1024);
+    let db = database_url.to_string();
 
     tokio::spawn(async move {
         loop {
@@ -154,7 +156,7 @@ pub async fn start_listener(
                         Ok(wire) => match classify(wire, &node_id) {
                             Some(event) => {
                                 if tx.send(event).await.is_err() {
-                                    break; // receiver gone
+                                    return; // receiver gone
                                 }
                             }
                             None => continue, // self-originated; already applied locally
@@ -165,14 +167,45 @@ pub async fn start_listener(
                     }
                 }
                 Err(e) => {
-                    tracing::error!(target: "pulse::cdc", "bus listener error: {e}");
-                    break;
+                    // A connection drop must NOT kill cross-node replication: reconnect
+                    // with backoff, then force a Resync — NOTIFY has no replay, so any
+                    // change during the gap was missed and the node must re-evaluate.
+                    tracing::error!(target: "pulse::cdc", "bus listener error, reconnecting: {e}");
+                    match reconnect(&db, &tx).await {
+                        Some(l) => {
+                            listener = l;
+                            if tx.send(BusEvent::Resync).await.is_err() {
+                                return; // receiver gone
+                            }
+                        }
+                        None => return, // receiver dropped during backoff → stop
+                    }
                 }
             }
         }
     });
 
     Ok(rx)
+}
+
+/// Reconnect the bus listener, retrying with a fixed backoff until it succeeds.
+/// Returns `None` if the receiver was dropped while we were retrying (a permanent
+/// outage with nobody left to notify) so the listener task can exit cleanly.
+async fn reconnect(database_url: &str, tx: &mpsc::Sender<BusEvent>) -> Option<PgListener> {
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+    loop {
+        if tx.is_closed() {
+            return None;
+        }
+        tokio::time::sleep(BACKOFF).await;
+        match PgListener::connect(database_url).await {
+            Ok(mut l) => match l.listen(CHANNEL).await {
+                Ok(()) => return Some(l),
+                Err(e) => tracing::error!(target: "pulse::cdc", "re-LISTEN failed: {e}"),
+            },
+            Err(e) => tracing::error!(target: "pulse::cdc", "bus reconnect failed: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
