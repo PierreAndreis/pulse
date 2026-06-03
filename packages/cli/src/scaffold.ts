@@ -368,10 +368,12 @@ RUN npx pulse gen app/schema.ts \\
 ENV PULSE_PORT=8787 PULSE_WORKER_BIN=bun
 EXPOSE 8787
 
-# \`pulse dev\` without --start = codegen + safe schema sync (additive changes
-# auto-apply; destructive ones are refused) + run the engine and worker. Provide
-# DATABASE_URL at runtime${auth ? " (and PULSE_JWKS_URL pointing at your hosted Better Auth issuer)" : ""}.
-CMD ["npx", "pulse", "dev", "app/app.ts"]
+# Production serve: run the prebuilt engine + worker (no codegen at boot — it ran
+# at build above). \`--migrate\` applies safe additive schema changes on start,
+# which suits a single container. For multiple replicas, drop \`--migrate\` and run
+# migrations as one explicit step instead (e.g. \`pulse start app/app.ts --migrate\`
+# once, then start the replicas without it). Provide DATABASE_URL at runtime${auth ? ",\n# plus PULSE_JWKS_URL pointing at your hosted Better Auth issuer" : ""}.
+CMD ["npx", "pulse", "start", "app/app.ts", "--migrate"]
 `;
   files[".dockerignore"] = `node_modules
 dist

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,7 +54,13 @@ const HELP = `pulse <command>
                              is omitted.
   dev <app.ts> [--port P] [--database-url URL] [--worker-bin bun]
                              run the engine against an app module (schema +
-                             handlers); streams logs until Ctrl-C.
+                             handlers); streams logs until Ctrl-C. Codegens +
+                             syncs the schema on boot — for local development.
+  start <app.ts> [--port P] [--database-url URL] [--worker-bin bun] [--migrate]
+                             production serve: run the prebuilt engine + worker
+                             (no codegen at boot). Pass --migrate to apply safe
+                             additive schema changes; otherwise migrations are
+                             left to an explicit step. Used by the Dockerfile.
   deploy <app.ts> [--out dir]
                              build a self-contained release bundle (app + worker +
                              generated DDL + a run script) into <dir> (default
@@ -346,6 +352,73 @@ async function main(): Promise<void> {
             stopAll("SIGTERM");
           });
         }
+      });
+      return;
+    }
+
+    case "start": {
+      const appPath = args[0];
+      if (!appPath || appPath.startsWith("-"))
+        throw new Error(
+          "usage: pulse start <app.ts> [--port P] [--database-url URL] [--worker-bin bun] [--migrate]",
+        );
+      const resolvedApp = resolve(appPath);
+
+      // Production serve. Unlike `dev`, this does NOT codegen at boot — it assumes
+      // `pulse gen` already ran at build time (writing to the filesystem on a
+      // read-only prod container would fail). Fail clearly if it's missing.
+      const genPath = resolve(dirname(resolvedApp), "_generated", "dataModel.ts");
+      if (!existsSync(genPath))
+        throw new Error(
+          `missing ${genPath} — run \`pulse gen <schema.ts>\` (or rebuild the image) before \`pulse start\``,
+        );
+
+      // Resolve the engine binary (download if not already cached).
+      const root = repoRoot();
+      const { enginePathSync, ensureEngine } = await import("@onveloz/pulse-engine");
+      let bin = resolveEngineBin(root, process.env, undefined, enginePathSync);
+      if (!bin) {
+        process.stdout.write("pulse: no engine found locally; downloading…\n");
+        bin = await ensureEngine();
+      }
+      if (!bin)
+        throw new Error(
+          "engine binary not found — no prebuilt engine for this platform. " +
+            "Build it (`cargo build -p pulse-server`) and set PULSE_SERVER_BIN.",
+        );
+
+      const env = buildEngineEnv({
+        appPath: resolvedApp,
+        workerScript: workerScriptPath(),
+        port: flag(args, "--port"),
+        databaseUrl: flag(args, "--database-url"),
+        workerBin: flag(args, "--worker-bin"),
+      });
+
+      // Migrations are EXPLICIT in production: only sync when asked, so scaling to
+      // N replicas doesn't run DDL from every boot. Safe additive only; risky and
+      // destructive changes are refused (review with `pulse migrate --diff`).
+      if (has(args, "--migrate")) {
+        const schemaPath = flag(args, "--schema") ?? resolve(dirname(resolvedApp), "schema.ts");
+        await syncSchema(env.DATABASE_URL!, await loadSchema(schemaPath));
+      }
+
+      // Run the engine in the foreground (it IS the server) and forward signals
+      // so the container stops cleanly.
+      process.stdout.write(`pulse: starting engine on :${env.PULSE_PORT} (app ${env.PULSE_APP})\n`);
+      const child = spawn(bin, [], { env, stdio: "inherit" });
+      process.on("SIGINT", () => child.kill("SIGINT"));
+      process.on("SIGTERM", () => child.kill("SIGTERM"));
+      await new Promise<void>((res) => {
+        child.on("exit", (code) => {
+          if (code) process.exitCode = code;
+          res();
+        });
+        child.on("error", (err) => {
+          process.stderr.write(`pulse: ${err.message}\n`);
+          process.exitCode = 1;
+          res();
+        });
       });
       return;
     }

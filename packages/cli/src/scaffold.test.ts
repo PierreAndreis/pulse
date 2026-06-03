@@ -34,6 +34,9 @@ describe("scaffoldApp", () => {
     expect(files["Dockerfile"]).toContain("node:22-trixie-slim");
     expect(files["Dockerfile"]).toContain("oven/bun");
     expect(files["Dockerfile"]).toContain("npx pulse gen app/schema.ts");
+    // Prod serve uses `pulse start` (no codegen at boot), not the dev command.
+    expect(files["Dockerfile"]).toContain('"pulse", "start", "app/app.ts"');
+    expect(files["Dockerfile"]).not.toContain('"dev"');
     expect(files[".dockerignore"]).toContain("node_modules");
   });
 
