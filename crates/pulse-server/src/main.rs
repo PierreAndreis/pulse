@@ -40,6 +40,12 @@ struct AppState {
     /// their change-set's commit watermark from this instead of querying the WAL on
     /// every write — WAL only advances, so the watermark stays monotonic.
     wal_lsn: Arc<std::sync::atomic::AtomicU64>,
+    /// Force global broadcast instead of interest routing (PULSE_BUS_BROADCAST) —
+    /// the benchmark baseline and a routing kill-switch.
+    broadcast: bool,
+    /// Count of bus events this node received from the network (the cross-node
+    /// "network layer" work) — exposed at `/metrics` for fan-out benchmarks.
+    bus_events: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Re-executes procedures for the reactor, over the JS-runtime worker.
@@ -214,11 +220,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let broadcast = env_or("PULSE_BUS_BROADCAST", "0") == "1";
+    let bus_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
     match pulse_cdc::start_listener(&database_url, node_id.clone()).await {
         Ok(mut rx) => {
             let reactor = reactor.clone();
+            let bus_events = bus_events.clone();
             tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
+                    // Every event here crossed the network to this node — the unit of
+                    // cross-node "network layer" work the fan-out benchmark measures.
+                    bus_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     match event {
                         pulse_cdc::BusEvent::Changes(cs) => reactor.apply_change_set(cs).await,
                         pulse_cdc::BusEvent::ResyncTables(tables) => {
@@ -229,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             });
-            tracing::info!("change bus listener started (node {node_id})");
+            tracing::info!("change bus listener started (node {node_id}, broadcast={broadcast})");
         }
         Err(e) => tracing::error!("failed to start change bus listener: {e}"),
     }
@@ -240,10 +252,13 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         node_id,
         wal_lsn,
+        broadcast,
+        bus_events,
     });
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/rpc", post(rpc))
         .route("/sync", get(sync))
         .route("/subscribe", post(subscribe))
@@ -260,6 +275,17 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Node metrics for the fan-out benchmark: `busEvents` is how many cross-node bus
+/// messages this node has received (the network-layer work), and `broadcast` is the
+/// active routing mode.
+async fn metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "nodeId": state.node_id,
+        "broadcast": state.broadcast,
+        "busEvents": state.bus_events.load(std::sync::atomic::Ordering::Relaxed),
+    }))
 }
 
 fn collect_headers(headers: &HeaderMap) -> HashMap<String, String> {
@@ -337,6 +363,7 @@ async fn rpc(
                 let reactor = state.reactor.clone();
                 let pool = state.pool.clone();
                 let node_id = state.node_id.clone();
+                let broadcast = state.broadcast;
                 let change_set = ChangeSet {
                     commit_lsn,
                     changes: res.changes,
@@ -351,7 +378,7 @@ async fn rpc(
                     };
                     if let Ok(mut conn) = pool.acquire().await {
                         if let Err(e) =
-                            pulse_cdc::publish_on(&mut conn, &node_id, &change_set).await
+                            pulse_cdc::publish_on(&mut conn, &node_id, &change_set, broadcast).await
                         {
                             tracing::warn!("change bus publish failed: {e}");
                         }

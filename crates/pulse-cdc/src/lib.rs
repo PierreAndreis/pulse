@@ -179,10 +179,14 @@ pub async fn publish_on(
     conn: &mut sqlx::PgConnection,
     node_id: &str,
     cs: &ChangeSet,
+    broadcast: bool,
 ) -> Result<(), BusError> {
     let (payload, route) = encode(node_id, cs)?;
+    // `broadcast` forces the global channel (every node), bypassing interest routing
+    // — the comparison baseline, and a kill-switch if routing ever misbehaves.
     let tables = match route {
         Route::Global => return notify(&mut *conn, CHANNEL, &payload).await,
+        Route::Tables(_) if broadcast => return notify(&mut *conn, CHANNEL, &payload).await,
         Route::Tables(tables) => tables,
     };
     // One statement does the interest lookup AND every NOTIFY: pg_notify is called
@@ -212,10 +216,11 @@ pub async fn publish_on(
     }
 }
 
-/// Convenience wrapper that acquires one connection from `pool` and publishes on it.
+/// Convenience wrapper that acquires one connection from `pool` and publishes on it
+/// with interest routing (no broadcast).
 pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
     let mut conn = pool.acquire().await?;
-    publish_on(&mut conn, node_id, cs).await
+    publish_on(&mut conn, node_id, cs, false).await
 }
 
 /// Start listening for bus events from *other* nodes. Returns a receiver that

@@ -96,6 +96,8 @@ export interface StartOptions {
   /** Max SERIALIZABLE retry attempts before CONFLICT (default 25 in the engine).
    *  Set small to force retry exhaustion deterministically at low concurrency. */
   maxTxAttempts?: number;
+  /** Extra environment variables for this engine process (merged last, overriding). */
+  env?: Record<string, string>;
 }
 
 function pickPort(): number {
@@ -154,6 +156,7 @@ export async function startEngine(opts: StartOptions = {}): Promise<Harness> {
         ? { PULSE_OLAP_STATEMENT_TIMEOUT_MS: String(opts.olapStatementTimeoutMs) }
         : {}),
       RUST_LOG: process.env.RUST_LOG ?? "pulse=info,warn",
+      ...(opts.env ?? {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
