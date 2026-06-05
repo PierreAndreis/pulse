@@ -61,7 +61,7 @@ async fn publish_wakes_interested_nodes_only() {
     publish(&pool, "A", &change_on("widgets")).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
     assert!(
-        matches!(got, Ok(Some(BusEvent::Changes(_)))),
+        matches!(got, Ok(Some(BusEvent::Changes { .. }))),
         "an interested node must receive the routed change, got {got:?}"
     );
 

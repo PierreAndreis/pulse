@@ -98,6 +98,58 @@ describe("replication: cross-node push latency (LISTEN/NOTIFY bus)", () => {
   );
 
   test(
+    "latency decomposition: bus propagation (commit→deliver) vs remote re-exec (deliver→applied)",
+    async () => {
+      const seen: number[] = [];
+      const unsub = cb.w.activeCount.subscribe({}, (n) => seen.push(n as number));
+      try {
+        await waitFor(() => seen.length >= 1);
+        await new Promise((r) => setTimeout(r, 800)); // drain residual
+        const base = seen.at(-1)!;
+
+        // Window node B's bus metrics around this run so prior tests don't skew it.
+        const m0 = (await (await fetch(`${b.baseUrl}/metrics`)).json()) as {
+          changes: number; busEvents: number; lagUsSum: number; applyUsSum: number;
+        };
+
+        const N = 40;
+        const e2e: number[] = [];
+        for (let i = 1; i <= N; i++) {
+          const t0 = performance.now();
+          await ca.w.addWidget.call({ name: `lat${i}`, qty: 1, active: true });
+          await waitFor(() => (seen.at(-1) ?? 0) >= base + i, 10_000);
+          e2e.push(performance.now() - t0);
+        }
+        const m1 = (await (await fetch(`${b.baseUrl}/metrics`)).json()) as {
+          changes: number; busEvents: number; lagUsSum: number; applyUsSum: number;
+        };
+
+        const dChanges = m1.changes - m0.changes;
+        const dEvents = m1.busEvents - m0.busEvents;
+        const busLagMs = dChanges > 0 ? (m1.lagUsSum - m0.lagUsSum) / dChanges / 1000 : 0;
+        const applyMs = dEvents > 0 ? (m1.applyUsSum - m0.applyUsSum) / dEvents / 1000 : 0;
+        const e2eSorted = [...e2e].sort((x, y) => x - y);
+        const p50 = e2eSorted[Math.floor(e2eSorted.length / 2)]!;
+
+        // eslint-disable-next-line no-console
+        console.log(
+          `\ncross-node latency decomposition (${N} writes A→B)\n` +
+            `  end-to-end (write→push, driver)   p50=${p50.toFixed(1)}ms\n` +
+            `  ├─ bus propagation (commit→deliver) avg=${busLagMs.toFixed(1)}ms   [the network layer]\n` +
+            `  └─ remote re-exec (deliver→applied) avg=${applyMs.toFixed(1)}ms`,
+        );
+
+        expect(dChanges).toBeGreaterThanOrEqual(N); // B received every change over the bus
+        expect(busLagMs).toBeGreaterThan(0); // a real, measured propagation latency
+        expect(applyMs).toBeGreaterThan(0);
+      } finally {
+        unsub();
+      }
+    },
+    120_000,
+  );
+
+  test(
     "cross-node replication recovers after a Postgres restart (listener reconnect + resync)",
     async () => {
       const seen: number[] = [];

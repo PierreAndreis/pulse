@@ -43,9 +43,31 @@ struct AppState {
     /// Force global broadcast instead of interest routing (PULSE_BUS_BROADCAST) —
     /// the benchmark baseline and a routing kill-switch.
     broadcast: bool,
-    /// Count of bus events this node received from the network (the cross-node
-    /// "network layer" work) — exposed at `/metrics` for fan-out benchmarks.
-    bus_events: Arc<std::sync::atomic::AtomicU64>,
+    /// Cross-node bus metrics (events + latency decomposition), exposed at `/metrics`.
+    metrics: Arc<BusMetrics>,
+}
+
+/// Counters for the cross-node "network layer": how many bus events arrived, and a
+/// latency decomposition — commit→deliver (bus propagation) vs deliver→applied
+/// (remote re-exec). Sums in µs; the benchmark divides by the counts for averages.
+#[derive(Default)]
+struct BusMetrics {
+    /// All bus events received (the network-layer work the fan-out bench counts).
+    events: std::sync::atomic::AtomicU64,
+    /// Concrete `Changes` events (those carrying a publish timestamp → a lag sample).
+    changes: std::sync::atomic::AtomicU64,
+    /// Σ commit→deliver propagation latency over `changes` events (µs).
+    lag_us_sum: std::sync::atomic::AtomicU64,
+    /// Σ deliver→applied (match + re-exec + push) duration over all events (µs).
+    apply_us_sum: std::sync::atomic::AtomicU64,
+}
+
+/// Microseconds since the Unix epoch (wall clock), for same-host bus-latency math.
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Re-executes procedures for the reactor, over the JS-runtime worker.
@@ -221,24 +243,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let broadcast = env_or("PULSE_BUS_BROADCAST", "0") == "1";
-    let bus_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let metrics = Arc::new(BusMetrics::default());
     match pulse_cdc::start_listener(&database_url, node_id.clone()).await {
         Ok(mut rx) => {
             let reactor = reactor.clone();
-            let bus_events = bus_events.clone();
+            let metrics = metrics.clone();
             tokio::spawn(async move {
+                use std::sync::atomic::Ordering::Relaxed;
                 while let Some(event) = rx.recv().await {
-                    // Every event here crossed the network to this node — the unit of
-                    // cross-node "network layer" work the fan-out benchmark measures.
-                    bus_events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Each event crossed the network to this node — the unit of
+                    // cross-node "network layer" work. Decompose its latency:
+                    // commit→deliver (bus propagation) and deliver→applied (re-exec).
+                    metrics.events.fetch_add(1, Relaxed);
+                    let started = std::time::Instant::now();
                     match event {
-                        pulse_cdc::BusEvent::Changes(cs) => reactor.apply_change_set(cs).await,
+                        pulse_cdc::BusEvent::Changes { cs, origin_us } => {
+                            let lag = (now_us() - origin_us).max(0) as u64;
+                            metrics.lag_us_sum.fetch_add(lag, Relaxed);
+                            metrics.changes.fetch_add(1, Relaxed);
+                            reactor.apply_change_set(cs).await;
+                        }
                         pulse_cdc::BusEvent::ResyncTables(tables) => {
                             let ts = tables.into_iter().map(TableId::new).collect();
                             reactor.invalidate_tables(ts).await;
                         }
                         pulse_cdc::BusEvent::Resync => reactor.invalidate_all().await,
                     }
+                    metrics
+                        .apply_us_sum
+                        .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
                 }
             });
             tracing::info!("change bus listener started (node {node_id}, broadcast={broadcast})");
@@ -253,12 +286,12 @@ async fn main() -> anyhow::Result<()> {
         node_id,
         wal_lsn,
         broadcast,
-        bus_events,
+        metrics,
     });
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(node_metrics))
         .route("/rpc", post(rpc))
         .route("/sync", get(sync))
         .route("/subscribe", post(subscribe))
@@ -277,14 +310,32 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Node metrics for the fan-out benchmark: `busEvents` is how many cross-node bus
-/// messages this node has received (the network-layer work), and `broadcast` is the
-/// active routing mode.
-async fn metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
+/// Node metrics for the fan-out / latency benchmarks. `busEvents` is how many
+/// cross-node bus messages this node received (the network-layer work). The latency
+/// decomposition reports averages (ms): `busLagMs` = commit→deliver (bus
+/// propagation), `applyMs` = deliver→applied (match + re-exec + push).
+async fn node_metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &state.metrics;
+    let events = m.events.load(Relaxed);
+    let changes = m.changes.load(Relaxed);
+    let avg_ms = |sum: u64, n: u64| {
+        if n == 0 {
+            0.0
+        } else {
+            (sum as f64 / n as f64) / 1000.0
+        }
+    };
     Json(json!({
         "nodeId": state.node_id,
         "broadcast": state.broadcast,
-        "busEvents": state.bus_events.load(std::sync::atomic::Ordering::Relaxed),
+        "busEvents": events,
+        "changes": changes,
+        "busLagMs": avg_ms(m.lag_us_sum.load(Relaxed), changes),
+        "applyMs": avg_ms(m.apply_us_sum.load(Relaxed), events),
+        // Raw sums (µs) so a benchmark can compute a windowed average via deltas.
+        "lagUsSum": m.lag_us_sum.load(Relaxed),
+        "applyUsSum": m.apply_us_sum.load(Relaxed),
     }))
 }
 

@@ -62,11 +62,22 @@ fn distinct_tables(cs: &ChangeSet) -> Vec<String> {
     t
 }
 
+/// Microseconds since the Unix epoch (wall clock). Used to stamp publish time so a
+/// receiver on the same host can measure bus propagation latency; falls back to 0
+/// if the clock is before the epoch (never, in practice).
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 /// A decoded bus event handed to the local reactor.
 #[derive(Debug, Clone)]
 pub enum BusEvent {
-    /// A concrete change-set from another node — apply it precisely.
-    Changes(ChangeSet),
+    /// A concrete change-set from another node — apply it precisely. `origin_us` is
+    /// the publisher's wall-clock (µs) at publish, for same-host latency decomposition.
+    Changes { cs: ChangeSet, origin_us: i64 },
     /// The originating change-set was too large to ship precisely, but the set of
     /// tables it touched still fit — re-evaluate only subscriptions on those tables
     /// (coarse, but scoped to the affected tables instead of everything).
@@ -80,9 +91,20 @@ pub enum BusEvent {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Wire {
-    Changes { origin: String, data: ChangeSet },
-    ResyncTables { origin: String, tables: Vec<String> },
-    Resync { origin: String },
+    Changes {
+        origin: String,
+        data: ChangeSet,
+        /// Publish-time wall clock (µs since epoch) — see [`BusEvent::Changes`].
+        #[serde(default)]
+        ts_us: i64,
+    },
+    ResyncTables {
+        origin: String,
+        tables: Vec<String>,
+    },
+    Resync {
+        origin: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +124,7 @@ fn encode(node_id: &str, cs: &ChangeSet) -> Result<(String, Route), BusError> {
     let full = Wire::Changes {
         origin: node_id.to_string(),
         data: cs.clone(),
+        ts_us: now_us(),
     };
     let payload = serde_json::to_string(&full)?;
     if payload.len() <= MAX_PAYLOAD {
@@ -133,11 +156,18 @@ fn encode_payload(node_id: &str, cs: &ChangeSet) -> Result<String, BusError> {
 /// messages return the `BusEvent` to hand to the local reactor.
 fn classify(wire: Wire, self_node_id: &str) -> Option<BusEvent> {
     match wire {
-        Wire::Changes { origin, data } => {
+        Wire::Changes {
+            origin,
+            data,
+            ts_us,
+        } => {
             if origin == self_node_id {
                 None // already applied locally
             } else {
-                Some(BusEvent::Changes(data))
+                Some(BusEvent::Changes {
+                    cs: data,
+                    origin_us: ts_us,
+                })
             }
         }
         Wire::ResyncTables { origin, tables } => {
@@ -328,6 +358,7 @@ mod tests {
         let wire = Wire::Changes {
             origin: "node-a".to_string(),
             data: small_changeset(),
+            ts_us: 123,
         };
         let json = serde_json::to_string(&wire).unwrap();
         // lowercase kind tag from serde rename_all = "lowercase"
@@ -335,9 +366,14 @@ mod tests {
 
         let back: Wire = serde_json::from_str(&json).unwrap();
         match back {
-            Wire::Changes { origin, data } => {
+            Wire::Changes {
+                origin,
+                data,
+                ts_us,
+            } => {
                 assert_eq!(origin, "node-a");
                 assert_eq!(data, small_changeset());
+                assert_eq!(ts_us, 123);
             }
             _ => panic!("expected Changes variant"),
         }
@@ -362,6 +398,7 @@ mod tests {
         let wire = Wire::Changes {
             origin: "self".to_string(),
             data: small_changeset(),
+            ts_us: 0,
         };
         assert!(classify(wire, "self").is_none());
 
@@ -376,9 +413,13 @@ mod tests {
         let wire = Wire::Changes {
             origin: "other".to_string(),
             data: small_changeset(),
+            ts_us: 42,
         };
         match classify(wire, "self") {
-            Some(BusEvent::Changes(cs)) => assert_eq!(cs, small_changeset()),
+            Some(BusEvent::Changes { cs, origin_us }) => {
+                assert_eq!(cs, small_changeset());
+                assert_eq!(origin_us, 42);
+            }
             other => panic!("expected foreign Changes, got {other:?}"),
         }
 
@@ -429,6 +470,7 @@ mod tests {
         let full = serde_json::to_string(&Wire::Changes {
             origin: "n1".to_string(),
             data: big.clone(),
+            ts_us: 0,
         })
         .unwrap();
         assert!(
