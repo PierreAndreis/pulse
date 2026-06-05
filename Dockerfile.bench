@@ -1,0 +1,18 @@
+# Engine image for the real-network fan-out benchmark.
+#
+# Built native (arm64-musl on Apple Silicon) inside rust:alpine — no cross-compile.
+# The runtime stage has bun for the worker; the repo (worker.ts + node_modules +
+# fixtures) is BIND-MOUNTED at /app at run time, so this image carries only the
+# engine binary and stays small. pnpm's relative symlinks resolve inside the mount.
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p pulse-server
+
+FROM oven/bun:1-alpine
+COPY --from=build /src/target/release/pulse-server /usr/local/bin/pulse-server
+ENV PULSE_PORT=8787
+EXPOSE 8787
+CMD ["pulse-server"]
