@@ -254,7 +254,7 @@ async fn rpc(
         Ok(res) => {
             if !res.changes.is_empty() {
                 let change_set = ChangeSet {
-                    commit_lsn: Lsn::ZERO,
+                    commit_lsn: res.commit_lsn.unwrap_or(Lsn::ZERO),
                     changes: res.changes,
                 };
                 // Apply locally now (low latency for this node's own subscribers)...
@@ -327,6 +327,7 @@ async fn subscribe(
                     headers: hdrs,
                     read_set: res.read_set,
                     last: Some(res.value.clone()),
+                    last_lsn: Lsn::ZERO,
                 })
                 .await;
             // Initial push reflects no committed change yet → LSN zero.

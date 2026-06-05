@@ -205,3 +205,70 @@ describe("ORM reactivity is precise", () => {
     }
   });
 });
+
+describe("commit LSN watermark (end-to-end via raw SSE)", () => {
+  // The typed client ignores commitLsn, so read the SSE stream directly to prove
+  // real WAL LSNs are captured at commit and flow through to the push, monotonically.
+  test("pushes carry a non-zero, monotonically non-decreasing commitLsn", async () => {
+    const clientId = "lsn-probe";
+    const auth = { authorization: "Bearer test" };
+    const lsns: string[] = [];
+
+    // Open the SSE stream and parse `data:` frames in the background.
+    const ac = new AbortController();
+    const res = await fetch(`${h.baseUrl}/sync?clientId=${clientId}`, { headers: auth, signal: ac.signal });
+    const reader = res.body!.getReader();
+    const pump = (async () => {
+      const dec = new TextDecoder();
+      let buf = "";
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (line.startsWith("data:")) {
+              try {
+                const evt = JSON.parse(line.slice(5).trim());
+                if (evt.sub === "count" && typeof evt.commitLsn === "string") lsns.push(evt.commitLsn);
+              } catch {
+                /* keepalive / non-JSON frame */
+              }
+            }
+          }
+        }
+      } catch {
+        /* aborted */
+      }
+    })();
+
+    try {
+      // Subscribe to count (its value changes on every insert).
+      await fetch(`${h.baseUrl}/subscribe`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ clientId, sub: "count", path: ["w", "count"], input: {} }),
+      });
+      await waitFor(() => lsns.length >= 1); // initial push (LSN 0/0)
+
+      await c.w.addWidget.call({ name: "lsn1", qty: 1, active: true });
+      await waitFor(() => lsns.length >= 2);
+      await c.w.addWidget.call({ name: "lsn2", qty: 1, active: true });
+      await waitFor(() => lsns.length >= 3);
+
+      const parse = (s: string): number => {
+        const [hi, lo] = s.split("/");
+        return parseInt(hi, 16) * 2 ** 32 + parseInt(lo, 16);
+      };
+      const post = lsns.slice(1).map(parse); // drop the initial 0/0 push
+      expect(post[0]).toBeGreaterThan(0); // real WAL LSN captured at commit
+      expect(post[1]).toBeGreaterThanOrEqual(post[0]); // monotonic
+    } finally {
+      ac.abort();
+      await pump.catch(() => {});
+    }
+  });
+});

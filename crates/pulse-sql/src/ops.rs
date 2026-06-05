@@ -5,7 +5,8 @@ use sqlx::{postgres::PgPool, postgres::PgRow, PgConnection, Row};
 use uuid::Uuid;
 
 use pulse_core::{
-    Change, ChangeOp, Cond, Filter, FilterOp, KeyValue, PrimaryKey, ReadSet, RowValues, TableId,
+    Change, ChangeOp, Cond, Filter, FilterOp, KeyValue, Lsn, PrimaryKey, ReadSet, RowValues,
+    TableId,
 };
 
 use crate::catalog::{decode_id, encode_id, Catalog, Column, PgTypeClass, Table};
@@ -793,6 +794,20 @@ pub async fn record_mutation(
         Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23505") => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// The current WAL insert position, used to stamp a committed change-set with an
+/// approximate commit LSN. Queried as the last statement of a mutation's
+/// transaction (before COMMIT): it is monotonically non-decreasing, so for
+/// serialized/conflicting commits it preserves commit order. It is an upper bound
+/// on positions written so far, not the exact commit-record LSN — a globally
+/// exact per-commit LSN needs a logical-replication consumer.
+pub async fn current_wal_lsn(conn: &mut PgConnection) -> Result<Lsn, sqlx::Error> {
+    let (s,): (String,) = sqlx::query_as("SELECT pg_current_wal_insert_lsn()::text")
+        .fetch_one(&mut *conn)
+        .await?;
+    s.parse()
+        .map_err(|e: pulse_core::ParseLsnError| sqlx::Error::Decode(Box::new(e)))
 }
 
 /// Execute one operation on a freshly-acquired pooled connection (autocommit).

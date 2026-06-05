@@ -34,6 +34,11 @@ pub struct Subscription {
     pub read_set: ReadSet,
     /// Last value pushed, for redundant-push suppression.
     pub last: Option<Value>,
+    /// Highest commit LSN emitted to this subscriber. The emitted `commitLsn` is
+    /// clamped to be monotonically non-decreasing per subscription, so a client's
+    /// watermark never goes backwards even if invalidations arrive out of order.
+    #[doc(hidden)]
+    pub last_lsn: Lsn,
 }
 
 /// The minimal slice of a subscription needed to re-execute and push: identity +
@@ -303,14 +308,20 @@ impl InMemoryReactor {
             match result {
                 Ok((value, read_set)) => {
                     for sub in subs {
-                        if !self
-                            .record_value(&sub.client_id, &sub.sub, &value, read_set.clone())
+                        let Some(effective_lsn) = self
+                            .record_value(
+                                &sub.client_id,
+                                &sub.sub,
+                                &value,
+                                read_set.clone(),
+                                commit_lsn,
+                            )
                             .await
-                        {
+                        else {
                             continue; // unchanged for this subscriber → no redundant push
-                        }
+                        };
                         if !self
-                            .send(&sub.client_id, &sub.sub, &value, commit_lsn)
+                            .send(&sub.client_id, &sub.sub, &value, effective_lsn)
                             .await
                         {
                             self.remove_client(&sub.client_id).await;
@@ -346,29 +357,33 @@ impl InMemoryReactor {
     }
 
     /// Refresh the subscription's read-set from the latest run (so dependencies
-    /// track the data), and report whether `value` differs from the last pushed
-    /// value (recording it). Skips byte-identical recomputations.
+    /// track the data) and advance its commit watermark. Returns `Some(effective_lsn)`
+    /// — the monotonic LSN to stamp on the push — when `value` differs from the last
+    /// pushed value, or `None` to suppress a byte-identical recomputation.
+    ///
+    /// `effective_lsn = max(commit_lsn, last_lsn)`: the watermark only ever advances,
+    /// so a later-but-lower-LSN invalidation (out-of-order delivery, or a coarse
+    /// resync stamped LSN zero) never regresses the client's commit position.
     async fn record_value(
         &self,
         client_id: &str,
         sub: &str,
         value: &Value,
         read_set: ReadSet,
-    ) -> bool {
+        commit_lsn: Lsn,
+    ) -> Option<Lsn> {
         let key = sub_key(client_id, sub);
         let mut reg = self.reg.lock().await;
         // Dependencies may have shifted since the last run → reindex if so.
         reg.set_read_set(&key, read_set);
-        match reg.subs.get_mut(&key) {
-            Some(s) => {
-                if s.last.as_ref() == Some(value) {
-                    false
-                } else {
-                    s.last = Some(value.clone());
-                    true
-                }
-            }
-            None => false,
+        let s = reg.subs.get_mut(&key)?;
+        let effective = commit_lsn.max(s.last_lsn);
+        s.last_lsn = effective;
+        if s.last.as_ref() == Some(value) {
+            None
+        } else {
+            s.last = Some(value.clone());
+            Some(effective)
         }
     }
 }
@@ -505,6 +520,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: channel_filter(channel),
                 last: None,
+                last_lsn: Lsn::ZERO,
             })
             .await;
     }
@@ -840,10 +856,110 @@ mod tests {
                 "messages.list::ghost",
                 &json!({ "x": 1 }),
                 ReadSet::new(),
+                Lsn::ZERO,
             )
             .await;
 
-        assert!(!recorded, "recording for an unknown sub is false");
+        assert!(recorded.is_none(), "recording for an unknown sub is None");
+    }
+
+    /// A re-executor that returns a fresh value each call (so every push goes
+    /// through) AND keeps the subscription's read-set stable (so it keeps matching
+    /// across multiple applies — unlike `CountingReExec`, whose empty read-set
+    /// deindexes the sub after the first run).
+    struct StableUniqueReExec {
+        n: AtomicUsize,
+        read_set: ReadSet,
+    }
+    #[async_trait]
+    impl ReExecutor for StableUniqueReExec {
+        async fn exec(
+            &self,
+            _path: Vec<String>,
+            _input: Value,
+            _headers: HashMap<String, String>,
+        ) -> Result<(Value, ReadSet), String> {
+            Ok((
+                json!({ "n": self.n.fetch_add(1, Ordering::SeqCst) }),
+                self.read_set.clone(),
+            ))
+        }
+    }
+
+    fn commit_lsn_of(push: &SsePush) -> Lsn {
+        let v: Value = serde_json::from_str(&push.body).unwrap();
+        v["commitLsn"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn change_at(channel: &str, lsn: u64) -> ChangeSet {
+        ChangeSet {
+            commit_lsn: Lsn(lsn),
+            changes: vec![insert_into(channel)],
+        }
+    }
+
+    /// The emitted `commitLsn` must never regress for a subscription, even when an
+    /// invalidation arrives with a LOWER commit LSN (out-of-order delivery).
+    #[tokio::test]
+    async fn commit_lsn_watermark_never_regresses() {
+        let reactor = InMemoryReactor::new(Arc::new(StableUniqueReExec {
+            n: AtomicUsize::new(0),
+            read_set: channel_filter("A"),
+        }));
+        let mut rx = reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await;
+
+        reactor.apply_change_set(change_at("A", 5)).await;
+        reactor.apply_change_set(change_at("A", 3)).await; // lower LSN, out of order
+
+        let first = commit_lsn_of(&rx.try_recv().unwrap());
+        let second = commit_lsn_of(&rx.try_recv().unwrap());
+        assert_eq!(first, Lsn(5));
+        assert_eq!(
+            second,
+            Lsn(5),
+            "watermark clamps up; never drops to the lower LSN"
+        );
+        assert!(second >= first);
+    }
+
+    /// With increasing commit LSNs the watermark follows them upward.
+    #[tokio::test]
+    async fn commit_lsn_watermark_follows_increasing_lsn() {
+        let reactor = InMemoryReactor::new(Arc::new(StableUniqueReExec {
+            n: AtomicUsize::new(0),
+            read_set: channel_filter("A"),
+        }));
+        let mut rx = reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await;
+
+        reactor.apply_change_set(change_at("A", 3)).await;
+        reactor.apply_change_set(change_at("A", 7)).await;
+
+        assert_eq!(commit_lsn_of(&rx.try_recv().unwrap()), Lsn(3));
+        assert_eq!(commit_lsn_of(&rx.try_recv().unwrap()), Lsn(7));
+    }
+
+    /// A coarse resync (stamped LSN zero) must not regress the watermark: the push
+    /// still carries the highest LSN already emitted, not 0.
+    #[tokio::test]
+    async fn resync_does_not_regress_watermark() {
+        let reactor = InMemoryReactor::new(Arc::new(StableUniqueReExec {
+            n: AtomicUsize::new(0),
+            read_set: channel_filter("A"),
+        }));
+        let mut rx = reactor.register_client("a".into()).await;
+        sub(&reactor, "a", "A").await;
+
+        reactor.apply_change_set(change_at("A", 9)).await;
+        reactor.invalidate_all().await; // recovery path → Lsn::ZERO
+
+        assert_eq!(commit_lsn_of(&rx.try_recv().unwrap()), Lsn(9));
+        assert_eq!(
+            commit_lsn_of(&rx.try_recv().unwrap()),
+            Lsn(9),
+            "resync keeps the watermark at 9, does not reset to 0"
+        );
     }
 
     /// A re-executor that re-points the subscription's read-set at a *different*
@@ -949,6 +1065,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: users_rs,
                 last: None,
+                last_lsn: Lsn::ZERO,
             })
             .await;
 
@@ -982,6 +1099,7 @@ mod tests {
                     headers: HashMap::new(),
                     read_set: rs,
                     last: None,
+                    last_lsn: Lsn::ZERO,
                 })
                 .await;
         }
