@@ -157,40 +157,65 @@ fn classify(wire: Wire, self_node_id: &str) -> Option<BusEvent> {
     }
 }
 
-async fn notify(pool: &PgPool, channel: &str, payload: &str) -> Result<(), BusError> {
+async fn notify<'e, E>(executor: E, channel: &str, payload: &str) -> Result<(), BusError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(channel)
         .bind(payload)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
 
-/// Publish a change-set to the rest of the cluster, routed by interest: a normal
-/// change (or scoped `ResyncTables`) is NOTIFY'd only to the per-node channels of
-/// nodes that currently have subscriptions on the touched tables; a global
-/// `Resync` is broadcast. Oversized change-sets degrade Changes → ResyncTables →
-/// Resync (see [`encode`]). If the interest lookup fails we fall back to a global
+/// Publish a change-set to the rest of the cluster, routed by interest, reusing a
+/// single connection for the interest lookup and every NOTIFY — so propagation
+/// costs ONE pooled connection, not one per query. A normal change (or scoped
+/// `ResyncTables`) goes only to nodes interested in the touched tables; a global
+/// `Resync` is broadcast. If the interest lookup fails we fall back to a global
 /// broadcast — correctness (no missed invalidation) over routing efficiency.
-pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
+pub async fn publish_on(
+    conn: &mut sqlx::PgConnection,
+    node_id: &str,
+    cs: &ChangeSet,
+) -> Result<(), BusError> {
     let (payload, route) = encode(node_id, cs)?;
-    match route {
-        Route::Global => notify(pool, CHANNEL, &payload).await,
-        Route::Tables(tables) => {
-            match interested_nodes(pool, &tables, node_id, INTEREST_TTL_SECS).await {
-                Ok(nodes) => {
-                    for n in nodes {
-                        notify(pool, &node_channel(&n), &payload).await?;
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::warn!(target: "pulse::cdc", "interest lookup failed, broadcasting: {e}");
-                    notify(pool, CHANNEL, &payload).await
-                }
-            }
+    let tables = match route {
+        Route::Global => return notify(&mut *conn, CHANNEL, &payload).await,
+        Route::Tables(tables) => tables,
+    };
+    // One statement does the interest lookup AND every NOTIFY: pg_notify is called
+    // once per interested node directly from the query. The per-node channel name
+    // mirrors `node_channel` (`pulse_n_` + the id with hyphens stripped).
+    let res = sqlx::query(
+        "SELECT pg_notify('pulse_n_' || replace(node_id, '-', ''), $3)
+         FROM (
+            SELECT DISTINCT node_id FROM _pulse_node_interest
+            WHERE table_name = ANY($1)
+              AND node_id <> $2
+              AND updated_at > now() - ($4::int * interval '1 second')
+         ) t",
+    )
+    .bind(&tables)
+    .bind(node_id)
+    .bind(&payload)
+    .bind(INTEREST_TTL_SECS as i32)
+    .execute(&mut *conn)
+    .await;
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(target: "pulse::cdc", "routed publish failed, broadcasting: {e}");
+            notify(&mut *conn, CHANNEL, &payload).await
         }
     }
+}
+
+/// Convenience wrapper that acquires one connection from `pool` and publishes on it.
+pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
+    let mut conn = pool.acquire().await?;
+    publish_on(&mut conn, node_id, cs).await
 }
 
 /// Start listening for bus events from *other* nodes. Returns a receiver that

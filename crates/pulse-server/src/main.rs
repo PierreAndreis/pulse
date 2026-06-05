@@ -36,6 +36,10 @@ struct AppState {
     pool: pulse_sql::PgPool,
     /// This node's id — bus messages it originates are skipped on receipt.
     node_id: String,
+    /// Latest sampled WAL position, refreshed by a background task. Mutations stamp
+    /// their change-set's commit watermark from this instead of querying the WAL on
+    /// every write — WAL only advances, so the watermark stays monotonic.
+    wal_lsn: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Re-executes procedures for the reactor, over the JS-runtime worker.
@@ -168,6 +172,26 @@ async fn main() -> anyhow::Result<()> {
     let reactor: Arc<dyn Reactor> =
         Arc::new(InMemoryReactor::new(reexec).with_interest(interest_sink));
 
+    // WAL position sampler: refresh the commit watermark off the write path so
+    // mutations don't each pay a WAL round-trip. ~100ms granularity is plenty for a
+    // monotonic watermark; the first tick fires immediately so writes get a real LSN.
+    let wal_lsn = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let pool = pool.clone();
+        let wal_lsn = wal_lsn.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                if let Ok(mut conn) = pool.acquire().await {
+                    if let Ok(lsn) = pulse_sql::current_wal_lsn(&mut conn).await {
+                        wal_lsn.store(lsn.as_u64(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+
     // Heartbeat: keep this node's interest rows fresh and prune dead nodes'. The
     // interval must stay well under INTEREST_TTL_SECS so interest never lapses.
     {
@@ -215,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         reactor,
         pool: pool.clone(),
         node_id,
+        wal_lsn,
     });
 
     let app = Router::new()
@@ -300,24 +325,38 @@ async fn rpc(
     {
         Ok(res) => {
             if !res.changes.is_empty() {
-                let change_set = ChangeSet {
-                    commit_lsn: res.commit_lsn.unwrap_or(Lsn::ZERO),
-                    changes: res.changes,
-                };
-                // Apply locally now (low latency for this node's own subscribers)...
+                // Propagate off the RPC's critical path: capture the commit LSN
+                // (after the tx already committed, so it never lengthens the
+                // SERIALIZABLE transaction), then apply locally and publish to the
+                // bus. The LSN is a monotonic watermark, so a post-commit read of
+                // the WAL position is sufficient.
+                // Stamp the watermark from the sampled WAL position — no per-write
+                // WAL round-trip. Local apply and the cross-node publish then run
+                // off the RPC's critical path.
+                let commit_lsn = Lsn(state.wal_lsn.load(std::sync::atomic::Ordering::Relaxed));
                 let reactor = state.reactor.clone();
-                tokio::spawn({
-                    let cs = change_set.clone();
-                    async move { reactor.apply_change_set(cs).await }
-                });
-                // ...and publish to the bus so every other node invalidates too.
-                // (Self-originated messages are dropped on receipt — see node_id.)
                 let pool = state.pool.clone();
                 let node_id = state.node_id.clone();
+                let change_set = ChangeSet {
+                    commit_lsn,
+                    changes: res.changes,
+                };
                 tokio::spawn(async move {
-                    if let Err(e) = pulse_cdc::publish(&pool, &node_id, &change_set).await {
-                        tracing::warn!("change bus publish failed: {e}");
+                    // Local apply (this node's subscribers) in parallel with the
+                    // routed cross-node publish; the latter needs one pooled conn.
+                    let local = {
+                        let reactor = reactor.clone();
+                        let cs = change_set.clone();
+                        tokio::spawn(async move { reactor.apply_change_set(cs).await })
+                    };
+                    if let Ok(mut conn) = pool.acquire().await {
+                        if let Err(e) =
+                            pulse_cdc::publish_on(&mut conn, &node_id, &change_set).await
+                        {
+                            tracing::warn!("change bus publish failed: {e}");
+                        }
                     }
+                    let _ = local.await;
                 });
             }
             (StatusCode::OK, Json(json!({ "result": res.value })))

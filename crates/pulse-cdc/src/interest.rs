@@ -24,6 +24,14 @@ pub async fn ensure_interest_table(pool: &PgPool) -> Result<(), BusError> {
     )
     .execute(pool)
     .await?;
+    // The routing lookup filters by table_name (+ updated_at TTL); the PK leads with
+    // node_id, so add an index that serves the publish path as the registry grows.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS pulse_node_interest_by_table
+         ON _pulse_node_interest (table_name, updated_at)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -53,12 +61,15 @@ pub async fn register_interest(
 /// Distinct node ids (excluding `self_node`) that currently have live interest in
 /// any of `tables` — i.e. whose heartbeat is within `ttl_secs`. These are exactly
 /// the nodes a change touching `tables` must be routed to.
-pub async fn interested_nodes(
-    pool: &PgPool,
+pub async fn interested_nodes<'e, E>(
+    executor: E,
     tables: &[String],
     self_node: &str,
     ttl_secs: i64,
-) -> Result<Vec<String>, BusError> {
+) -> Result<Vec<String>, BusError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     if tables.is_empty() {
         return Ok(Vec::new());
     }
@@ -71,7 +82,7 @@ pub async fn interested_nodes(
     .bind(tables)
     .bind(self_node)
     .bind(ttl_secs as i32)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().map(|(n,)| n).collect())
 }

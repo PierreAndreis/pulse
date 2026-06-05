@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use pulse_core::{Change, Lsn, ProcedureKind, ReadSet};
+use pulse_core::{Change, ProcedureKind, ReadSet};
 use pulse_sql::{capture_reads, execute_op, execute_op_pool, introspect, Catalog, PgPool};
 
 use protocol::{EngineMsg, WorkerOut};
@@ -63,9 +63,6 @@ pub struct WorkerConfig {
 struct Capture {
     read_set: ReadSet,
     changes: Vec<Change>,
-    /// The committing transaction's WAL position, stamped on the change-set so
-    /// invalidations carry a monotonic commit watermark. `None` until the tx commits.
-    commit_lsn: Option<Lsn>,
 }
 
 /// A procedure result plus the read-set it captured and the changes it produced.
@@ -73,8 +70,6 @@ pub struct ExecResult {
     pub value: Value,
     pub read_set: ReadSet,
     pub changes: Vec<Change>,
-    /// Commit LSN of the mutation's transaction (`None` for reads / no-op commits).
-    pub commit_lsn: Option<Lsn>,
 }
 
 /// A message to a mutation's transaction task.
@@ -277,22 +272,11 @@ async fn tx_task(
                         let _ = tx.rollback().await;
                         Err("SERIALIZATION_FAILURE".into())
                     } else {
-                        // Stamp the commit LSN: read the WAL position as the final
-                        // statement of the tx (monotonic across serialized commits),
-                        // then commit. A failure to read the LSN is non-fatal — the
-                        // change-set just falls back to LSN zero.
-                        let lsn = pulse_sql::current_wal_lsn(&mut tx).await.ok();
+                        // The commit LSN is captured off the critical path (after the
+                        // RPC returns) so it never lengthens this SERIALIZABLE tx —
+                        // see the propagation task in pulse-server's rpc handler.
                         match tx.commit().await {
-                            Ok(()) => {
-                                if let Some(lsn) = lsn {
-                                    if let Some(cap) =
-                                        inner.captures.lock().await.get_mut(&request_id)
-                                    {
-                                        cap.commit_lsn = Some(lsn);
-                                    }
-                                }
-                                Ok(())
-                            }
+                            Ok(()) => Ok(()),
                             Err(e) if is_serialization_failure(&e) => {
                                 Err("SERIALIZATION_FAILURE".into())
                             }
@@ -405,7 +389,6 @@ impl Worker {
                         value,
                         read_set: ReadSet::new(),
                         changes: Vec::new(),
-                        commit_lsn: None,
                     });
                 }
             }
@@ -442,7 +425,6 @@ impl Worker {
                         value,
                         read_set: ReadSet::new(),
                         changes: Vec::new(),
-                        commit_lsn: None,
                     });
                 }
                 Err(e) if e.code == "SERIALIZATION_FAILURE" => {
@@ -546,7 +528,6 @@ impl Worker {
             value,
             read_set: capture.read_set,
             changes: capture.changes,
-            commit_lsn: capture.commit_lsn,
         })
     }
 }

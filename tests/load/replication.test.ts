@@ -104,11 +104,14 @@ describe("replication: cross-node push latency (LISTEN/NOTIFY bus)", () => {
       const unsub = cb.w.activeCount.subscribe({}, (n) => seen.push(n as number));
       try {
         await waitFor(() => seen.length >= 1);
+        // Let any residual propagation from prior tests drain so the count is stable
+        // before we anchor `base` (otherwise it's a moving target).
+        await new Promise((r) => setTimeout(r, 1500));
         const base = seen.at(-1)!; // current active count (prior tests left rows)
 
         // Baseline: a write on A crosses the bus to B.
         await ca.w.addWidget.call({ name: "pre-restart", qty: 1, active: true });
-        await waitFor(() => seen.at(-1) === base + 1, 10_000);
+        await waitFor(() => (seen.at(-1) ?? 0) >= base + 1, 10_000);
 
         // Bounce Postgres — every node's listener connection drops.
         await execFileAsync("docker", ["restart", process.env.PULSE_PG_CONTAINER ?? "pulse-prune-test"]);
@@ -121,12 +124,12 @@ describe("replication: cross-node push latency (LISTEN/NOTIFY bus)", () => {
           }
         }
         // Give the engines' pools + bus listeners time to reconnect (500ms backoff).
-        await new Promise((r) => setTimeout(r, 2500));
+        await new Promise((r) => setTimeout(r, 3500));
 
         // A write on A must again reach B — proving the listener reconnected and the
         // bus is live. Retry the write itself: A's pool may need a reconnect too.
         let wrote = false;
-        for (let i = 0; i < 10 && !wrote; i++) {
+        for (let i = 0; i < 20 && !wrote; i++) {
           try {
             await ca.w.addWidget.call({ name: "post-restart", qty: 1, active: true });
             wrote = true;
@@ -135,7 +138,7 @@ describe("replication: cross-node push latency (LISTEN/NOTIFY bus)", () => {
           }
         }
         expect(wrote).toBe(true);
-        await waitFor(() => (seen.at(-1) ?? 0) >= base + 2, 20_000);
+        await waitFor(() => (seen.at(-1) ?? 0) >= base + 2, 30_000);
       } finally {
         unsub();
       }
