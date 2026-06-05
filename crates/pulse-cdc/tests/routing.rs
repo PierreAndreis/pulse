@@ -14,11 +14,17 @@ static URL: OnceCell<Option<String>> = OnceCell::const_new();
 
 async fn url() -> Option<&'static str> {
     URL.get_or_init(|| async {
-        let node = Postgres::default().with_tag("16-alpine").start().await.ok()?;
+        let node = Postgres::default()
+            .with_tag("16-alpine")
+            .start()
+            .await
+            .ok()?;
         let host = node.get_host().await.ok()?;
         let port = node.get_host_port_ipv4(5432).await.ok()?;
         std::mem::forget(node);
-        Some(format!("postgres://postgres:postgres@{host}:{port}/postgres"))
+        Some(format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
     })
     .await
     .as_deref()
@@ -45,7 +51,9 @@ async fn publish_wakes_interested_nodes_only() {
 
     // Node B listens and registers interest in `widgets` only.
     let mut rx = start_listener(url, "B".into()).await.unwrap();
-    register_interest(&pool, "B", &["widgets".to_string()]).await.unwrap();
+    register_interest(&pool, "B", &["widgets".to_string()])
+        .await
+        .unwrap();
     // Give LISTEN a moment to be established before the first NOTIFY.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
