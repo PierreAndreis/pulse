@@ -23,11 +23,44 @@ use tokio::sync::mpsc;
 
 use pulse_core::ChangeSet;
 
-/// The NOTIFY channel all nodes publish/subscribe on.
+mod interest;
+pub use interest::{
+    clear_interest, ensure_interest_table, interested_nodes, prune_interest, register_interest,
+};
+
+/// The global broadcast channel every node listens on — used only for messages
+/// that must reach all nodes (a global `Resync`, or a routing-failure fallback).
 pub const CHANNEL: &str = "pulse_changes";
+
+/// How long an interest row stays "live" without a heartbeat refresh. The heartbeat
+/// interval must be comfortably below this so a node's interest never lapses while
+/// it still holds subscriptions.
+pub const INTEREST_TTL_SECS: i64 = 30;
 
 /// Postgres NOTIFY payloads are capped at 8000 bytes; stay safely under.
 const MAX_PAYLOAD: usize = 7800;
+
+/// The per-node NOTIFY channel a node listens on for changes routed to it. The
+/// node id (a UUID) is stripped of hyphens so the result is a valid identifier.
+pub fn node_channel(node_id: &str) -> String {
+    format!("pulse_n_{}", node_id.replace('-', ""))
+}
+
+/// How a message should reach the rest of the cluster.
+enum Route {
+    /// Route to nodes with live interest in these tables (the common path).
+    Tables(Vec<String>),
+    /// Broadcast to all nodes (a global resync — no table information to route by).
+    Global,
+}
+
+/// Distinct table names a change-set touched (sorted, deduped).
+fn distinct_tables(cs: &ChangeSet) -> Vec<String> {
+    let mut t: Vec<String> = cs.changes.iter().map(|c| c.table.0.clone()).collect();
+    t.sort();
+    t.dedup();
+    t
+}
 
 /// A decoded bus event handed to the local reactor.
 #[derive(Debug, Clone)]
@@ -65,30 +98,34 @@ pub enum BusError {
 ///   2. too big, but the distinct touched-table list fits → ship `ResyncTables`
 ///      so peers invalidate only those tables (scoped over-approximation),
 ///   3. even the table list is too big → ship `Resync` (global re-eval).
-fn encode_payload(node_id: &str, cs: &ChangeSet) -> Result<String, BusError> {
+fn encode(node_id: &str, cs: &ChangeSet) -> Result<(String, Route), BusError> {
     let full = Wire::Changes {
         origin: node_id.to_string(),
         data: cs.clone(),
     };
     let payload = serde_json::to_string(&full)?;
     if payload.len() <= MAX_PAYLOAD {
-        return Ok(payload);
+        return Ok((payload, Route::Tables(distinct_tables(cs))));
     }
 
-    let mut tables: Vec<String> = cs.changes.iter().map(|c| c.table.0.clone()).collect();
-    tables.sort();
-    tables.dedup();
+    let tables = distinct_tables(cs);
     let scoped = serde_json::to_string(&Wire::ResyncTables {
         origin: node_id.to_string(),
-        tables,
+        tables: tables.clone(),
     })?;
     if scoped.len() <= MAX_PAYLOAD {
-        return Ok(scoped);
+        return Ok((scoped, Route::Tables(tables)));
     }
 
-    Ok(serde_json::to_string(&Wire::Resync {
+    let global = serde_json::to_string(&Wire::Resync {
         origin: node_id.to_string(),
-    })?)
+    })?;
+    Ok((global, Route::Global))
+}
+
+#[cfg(test)]
+fn encode_payload(node_id: &str, cs: &ChangeSet) -> Result<String, BusError> {
+    Ok(encode(node_id, cs)?.0)
 }
 
 /// Classify a decoded wire message against the local node id. Self-originated
@@ -120,17 +157,40 @@ fn classify(wire: Wire, self_node_id: &str) -> Option<BusEvent> {
     }
 }
 
-/// Publish a change-set to every node (including the origin). Small change-sets
-/// ship in full; oversized ones degrade to a scoped `ResyncTables` (or a global
-/// `Resync` if even the table list overflows) — see [`encode_payload`].
-pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
-    let payload = encode_payload(node_id, cs)?;
+async fn notify(pool: &PgPool, channel: &str, payload: &str) -> Result<(), BusError> {
     sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(CHANNEL)
+        .bind(channel)
         .bind(payload)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Publish a change-set to the rest of the cluster, routed by interest: a normal
+/// change (or scoped `ResyncTables`) is NOTIFY'd only to the per-node channels of
+/// nodes that currently have subscriptions on the touched tables; a global
+/// `Resync` is broadcast. Oversized change-sets degrade Changes → ResyncTables →
+/// Resync (see [`encode`]). If the interest lookup fails we fall back to a global
+/// broadcast — correctness (no missed invalidation) over routing efficiency.
+pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
+    let (payload, route) = encode(node_id, cs)?;
+    match route {
+        Route::Global => notify(pool, CHANNEL, &payload).await,
+        Route::Tables(tables) => {
+            match interested_nodes(pool, &tables, node_id, INTEREST_TTL_SECS).await {
+                Ok(nodes) => {
+                    for n in nodes {
+                        notify(pool, &node_channel(&n), &payload).await?;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(target: "pulse::cdc", "interest lookup failed, broadcasting: {e}");
+                    notify(pool, CHANNEL, &payload).await
+                }
+            }
+        }
+    }
 }
 
 /// Start listening for bus events from *other* nodes. Returns a receiver that
@@ -142,8 +202,10 @@ pub async fn start_listener(
     node_id: String,
 ) -> Result<mpsc::Receiver<BusEvent>, BusError> {
     // Connect synchronously so a misconfigured URL / down DB surfaces to the caller.
+    // Listen on the global broadcast channel AND this node's routed channel.
+    let node_chan = node_channel(&node_id);
     let mut listener = PgListener::connect(database_url).await?;
-    listener.listen(CHANNEL).await?;
+    listener.listen_all([CHANNEL, node_chan.as_str()]).await?;
     let (tx, rx) = mpsc::channel(1024);
     let db = database_url.to_string();
 
@@ -171,7 +233,7 @@ pub async fn start_listener(
                     // with backoff, then force a Resync — NOTIFY has no replay, so any
                     // change during the gap was missed and the node must re-evaluate.
                     tracing::error!(target: "pulse::cdc", "bus listener error, reconnecting: {e}");
-                    match reconnect(&db, &tx).await {
+                    match reconnect(&db, &node_chan, &tx).await {
                         Some(l) => {
                             listener = l;
                             if tx.send(BusEvent::Resync).await.is_err() {
@@ -191,7 +253,11 @@ pub async fn start_listener(
 /// Reconnect the bus listener, retrying with a fixed backoff until it succeeds.
 /// Returns `None` if the receiver was dropped while we were retrying (a permanent
 /// outage with nobody left to notify) so the listener task can exit cleanly.
-async fn reconnect(database_url: &str, tx: &mpsc::Sender<BusEvent>) -> Option<PgListener> {
+async fn reconnect(
+    database_url: &str,
+    node_chan: &str,
+    tx: &mpsc::Sender<BusEvent>,
+) -> Option<PgListener> {
     const BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
     loop {
         if tx.is_closed() {
@@ -199,7 +265,7 @@ async fn reconnect(database_url: &str, tx: &mpsc::Sender<BusEvent>) -> Option<Pg
         }
         tokio::time::sleep(BACKOFF).await;
         match PgListener::connect(database_url).await {
-            Ok(mut l) => match l.listen(CHANNEL).await {
+            Ok(mut l) => match l.listen_all([CHANNEL, node_chan]).await {
                 Ok(()) => return Some(l),
                 Err(e) => tracing::error!(target: "pulse::cdc", "re-LISTEN failed: {e}"),
             },

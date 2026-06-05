@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use pulse_core::{ChangeSet, Lsn, ReadSet, TableId};
 use pulse_jsruntime::{Worker, WorkerConfig, WorkerError};
-use pulse_reactor::{InMemoryReactor, ReExecutor, Reactor, Subscription};
+use pulse_reactor::{InMemoryReactor, InterestSink, ReExecutor, Reactor, Subscription};
 
 struct AppState {
     worker: Arc<Worker>,
@@ -56,6 +56,23 @@ impl ReExecutor for WorkerReExecutor {
             .await
             .map(|res| (res.value, res.read_set))
             .map_err(|e| e.code)
+    }
+}
+
+/// Registers this node's table interest on the change bus when the reactor begins
+/// watching a new table — so a publisher routes the table's changes to this node.
+struct BusInterestSink {
+    pool: pulse_sql::PgPool,
+    node_id: String,
+}
+
+#[async_trait]
+impl InterestSink for BusInterestSink {
+    async fn on_tables_added(&self, tables: Vec<TableId>) {
+        let names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
+        if let Err(e) = pulse_cdc::register_interest(&self.pool, &self.node_id, &names).await {
+            tracing::warn!("interest register failed: {e}");
+        }
     }
 }
 
@@ -135,14 +152,44 @@ async fn main() -> anyhow::Result<()> {
     let reexec = Arc::new(WorkerReExecutor {
         worker: worker.clone(),
     });
-    let reactor: Arc<dyn Reactor> = Arc::new(InMemoryReactor::new(reexec));
 
-    // Cross-node change bus: each node has an id; after a local mutation it
-    // applies invalidation locally AND publishes the change-set, so writes on any
-    // node invalidate subscriptions on every node. The listener drops messages
-    // this node originated (already applied locally), keeping single-node behavior
-    // unchanged.
+    // Cross-node change bus: each node has an id; after a local mutation it applies
+    // invalidation locally AND publishes the change-set, routed to nodes interested
+    // in the touched tables. The interest registry is the routing table; this node
+    // registers a table the moment the reactor begins watching it.
     let node_id = Uuid::new_v4().to_string();
+    if let Err(e) = pulse_cdc::ensure_interest_table(&pool).await {
+        tracing::error!("failed to ensure interest table: {e}");
+    }
+    let interest_sink = Arc::new(BusInterestSink {
+        pool: pool.clone(),
+        node_id: node_id.clone(),
+    });
+    let reactor: Arc<dyn Reactor> =
+        Arc::new(InMemoryReactor::new(reexec).with_interest(interest_sink));
+
+    // Heartbeat: keep this node's interest rows fresh and prune dead nodes'. The
+    // interval must stay well under INTEREST_TTL_SECS so interest never lapses.
+    {
+        let pool = pool.clone();
+        let node_id = node_id.clone();
+        let reactor = reactor.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let tables: Vec<String> = reactor
+                    .interest_tables()
+                    .await
+                    .into_iter()
+                    .map(|t| t.0)
+                    .collect();
+                let _ = pulse_cdc::register_interest(&pool, &node_id, &tables).await;
+                let _ = pulse_cdc::prune_interest(&pool, pulse_cdc::INTEREST_TTL_SECS).await;
+            }
+        });
+    }
+
     match pulse_cdc::start_listener(&database_url, node_id.clone()).await {
         Ok(mut rx) => {
             let reactor = reactor.clone();
@@ -334,6 +381,14 @@ async fn subscribe(
             state
                 .reactor
                 .push(&req.client_id, &req.sub, &res.value, Lsn::ZERO)
+                .await;
+            // Catch-up: interest is now registered (add_subscription announced it),
+            // so re-evaluate once to pick up any remote write that landed between the
+            // initial query snapshot and interest registration. A dedup'd no-op when
+            // nothing was missed (the common case).
+            state
+                .reactor
+                .refresh_subscription(&req.client_id, &req.sub)
                 .await;
             (StatusCode::OK, Json(json!({ "result": "ok" })))
         }

@@ -67,6 +67,16 @@ impl ReExecJob {
     }
 }
 
+/// Notified when this node begins watching tables it wasn't watching before, so
+/// the host can register cross-node interest (the bus routing table) *before* the
+/// subscription relies on the bus for those tables — closing the subscribe-time
+/// race where a remote write could otherwise be missed. Implemented by the host
+/// over the change bus (e.g. `pulse_cdc::register_interest`).
+#[async_trait]
+pub trait InterestSink: Send + Sync {
+    async fn on_tables_added(&self, tables: Vec<TableId>);
+}
+
 /// Re-executes a procedure for invalidation. Implemented by the host over its
 /// function runtime (e.g. `pulse-jsruntime::Worker`).
 #[async_trait]
@@ -94,6 +104,12 @@ pub trait Reactor: Send + Sync {
     async fn push(&self, client_id: &str, sub: &str, value: &Value, commit_lsn: Lsn) -> bool;
     /// The single invalidation entry point: match → dedup → re-exec → diff → push.
     async fn apply_change_set(&self, change_set: ChangeSet);
+    /// Re-execute one subscription now and push only if its result changed. Used as
+    /// a catch-up right after a subscription registers cross-node interest, to pick
+    /// up any remote write that landed between the initial query snapshot and the
+    /// interest registration (closing the routed-bus subscribe race). A no-op push
+    /// when nothing changed (the common case), thanks to last-value dedup.
+    async fn refresh_subscription(&self, client_id: &str, sub: &str);
     /// Re-evaluate every subscription referencing any of `tables`, regardless of
     /// row-level predicates. Scoped over-approximation used when a precise
     /// change-set can't be delivered but the touched tables are known (an oversized
@@ -103,6 +119,9 @@ pub trait Reactor: Send + Sync {
     /// fallback used when a precise change-set can't be delivered (e.g. an
     /// oversized cross-node bus payload).
     async fn invalidate_all(&self);
+    /// The tables this node currently has at least one subscription on — the set to
+    /// (re)register as cross-node interest on the bus heartbeat.
+    async fn interest_tables(&self) -> Vec<TableId>;
 }
 
 struct Client {
@@ -127,10 +146,19 @@ struct Registry {
 }
 
 impl Registry {
-    fn index(&mut self, key: &str, rs: &ReadSet) {
+    /// Index `key` under every table its read-set references. Returns the tables
+    /// that became newly-watched by this node (their bucket was empty before), so
+    /// the caller can register fresh cross-node interest for them.
+    fn index(&mut self, key: &str, rs: &ReadSet) -> Vec<TableId> {
+        let mut newly_watched = Vec::new();
         for t in rs.referenced_tables() {
-            self.by_table.entry(t).or_default().insert(key.to_string());
+            let bucket = self.by_table.entry(t.clone()).or_default();
+            if bucket.is_empty() {
+                newly_watched.push(t);
+            }
+            bucket.insert(key.to_string());
         }
+        newly_watched
     }
 
     fn deindex(&mut self, key: &str, rs: &ReadSet) {
@@ -144,13 +172,14 @@ impl Registry {
         }
     }
 
-    fn insert(&mut self, key: String, sub: Subscription) {
+    fn insert(&mut self, key: String, sub: Subscription) -> Vec<TableId> {
         if let Some(old) = self.subs.get(&key) {
             let old_rs = old.read_set.clone();
             self.deindex(&key, &old_rs);
         }
-        self.index(&key, &sub.read_set);
+        let newly_watched = self.index(&key, &sub.read_set);
         self.subs.insert(key, sub);
+        newly_watched
     }
 
     fn remove(&mut self, key: &str) {
@@ -163,19 +192,21 @@ impl Registry {
     /// tables changed (a re-exec can shift dependencies — e.g. a join that begins
     /// reading a newly-inserted row's table). Missing this would let a later
     /// change to the new table be silently skipped for this subscription.
-    fn set_read_set(&mut self, key: &str, rs: ReadSet) {
+    fn set_read_set(&mut self, key: &str, rs: ReadSet) -> Vec<TableId> {
         let changed = match self.subs.get(key) {
             Some(s) => s.read_set.referenced_tables() != rs.referenced_tables(),
-            None => return,
+            None => return Vec::new(),
         };
+        let mut newly_watched = Vec::new();
         if changed {
             let old = self.subs[key].read_set.clone();
             self.deindex(key, &old);
-            self.index(key, &rs);
+            newly_watched = self.index(key, &rs);
         }
         if let Some(s) = self.subs.get_mut(key) {
             s.read_set = rs;
         }
+        newly_watched
     }
 
     /// Visit each subscription referencing any of `tables`, once, calling `f` with
@@ -231,6 +262,7 @@ pub struct InMemoryReactor {
     clients: Mutex<HashMap<String, Client>>,
     reg: Mutex<Registry>,
     reexec: Arc<dyn ReExecutor>,
+    interest: Option<Arc<dyn InterestSink>>,
 }
 
 impl InMemoryReactor {
@@ -239,6 +271,25 @@ impl InMemoryReactor {
             clients: Mutex::new(HashMap::new()),
             reg: Mutex::new(Registry::default()),
             reexec,
+            interest: None,
+        }
+    }
+
+    /// Attach an interest sink (cross-node bus routing). Builder-style; call before
+    /// wrapping the reactor in an `Arc`.
+    pub fn with_interest(mut self, sink: Arc<dyn InterestSink>) -> Self {
+        self.interest = Some(sink);
+        self
+    }
+
+    /// Hand newly-watched tables to the interest sink (if any). Called after the
+    /// registry lock is released so the sink's I/O never runs under the lock.
+    async fn announce_interest(&self, tables: Vec<TableId>) {
+        if tables.is_empty() {
+            return;
+        }
+        if let Some(sink) = &self.interest {
+            sink.on_tables_added(tables).await;
         }
     }
 
@@ -373,18 +424,26 @@ impl InMemoryReactor {
         commit_lsn: Lsn,
     ) -> Option<Lsn> {
         let key = sub_key(client_id, sub);
-        let mut reg = self.reg.lock().await;
-        // Dependencies may have shifted since the last run → reindex if so.
-        reg.set_read_set(&key, read_set);
-        let s = reg.subs.get_mut(&key)?;
-        let effective = commit_lsn.max(s.last_lsn);
-        s.last_lsn = effective;
-        if s.last.as_ref() == Some(value) {
-            None
-        } else {
-            s.last = Some(value.clone());
-            Some(effective)
-        }
+        let (result, newly_watched) = {
+            let mut reg = self.reg.lock().await;
+            // Dependencies may have shifted since the last run → reindex if so.
+            let newly_watched = reg.set_read_set(&key, read_set);
+            let result = reg.subs.get_mut(&key).map(|s| {
+                let effective = commit_lsn.max(s.last_lsn);
+                s.last_lsn = effective;
+                if s.last.as_ref() == Some(value) {
+                    None
+                } else {
+                    s.last = Some(value.clone());
+                    Some(effective)
+                }
+            });
+            (result, newly_watched)
+        };
+        // A re-exec that began reading a new table must register interest in it too
+        // (dynamic dependencies, e.g. a join reaching a new row's table).
+        self.announce_interest(newly_watched).await;
+        result.flatten()
     }
 }
 
@@ -415,7 +474,8 @@ impl Reactor for InMemoryReactor {
 
     async fn add_subscription(&self, sub: Subscription) {
         let key = sub_key(&sub.client_id, &sub.sub);
-        self.reg.lock().await.insert(key, sub);
+        let newly_watched = self.reg.lock().await.insert(key, sub);
+        self.announce_interest(newly_watched).await;
     }
 
     async fn remove_subscription(&self, client_id: &str, sub: &str) {
@@ -439,6 +499,16 @@ impl Reactor for InMemoryReactor {
         self.reexec_and_push(dirty, change_set.commit_lsn).await;
     }
 
+    async fn refresh_subscription(&self, client_id: &str, sub: &str) {
+        let job = {
+            let reg = self.reg.lock().await;
+            reg.subs.get(&sub_key(client_id, sub)).map(ReExecJob::of)
+        };
+        if let Some(job) = job {
+            self.reexec_and_push(vec![job], Lsn::ZERO).await;
+        }
+    }
+
     async fn invalidate_tables(&self, tables: HashSet<TableId>) {
         // Re-exec every subscription on the affected tables (no row-level matching —
         // we don't have the rows). The index makes this scoped to those tables.
@@ -449,6 +519,10 @@ impl Reactor for InMemoryReactor {
     async fn invalidate_all(&self) {
         let all = self.reg.lock().await.all_jobs();
         self.reexec_and_push(all, Lsn::ZERO).await;
+    }
+
+    async fn interest_tables(&self) -> Vec<TableId> {
+        self.reg.lock().await.by_table.keys().cloned().collect()
     }
 }
 
@@ -861,6 +935,73 @@ mod tests {
             .await;
 
         assert!(recorded.is_none(), "recording for an unknown sub is None");
+    }
+
+    /// Records every set of tables announced to the interest sink.
+    #[derive(Default)]
+    struct RecordingSink {
+        announced: Mutex<Vec<Vec<String>>>,
+    }
+    #[async_trait]
+    impl InterestSink for RecordingSink {
+        async fn on_tables_added(&self, tables: Vec<TableId>) {
+            self.announced
+                .lock()
+                .await
+                .push(tables.into_iter().map(|t| t.0).collect());
+        }
+    }
+
+    /// Subscribing announces interest in a table the node wasn't watching; a second
+    /// sub on the SAME table does not re-announce (the bucket was already non-empty).
+    #[tokio::test]
+    async fn new_table_announces_interest_once() {
+        let sink = Arc::new(RecordingSink::default());
+        let reactor = InMemoryReactor::new(Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_interest(sink.clone());
+
+        reactor.register_client("a".into()).await;
+        reactor.register_client("b".into()).await;
+        sub(&reactor, "a", "A").await; // first sub on `messages` → announce
+        sub(&reactor, "b", "B").await; // another `messages` sub → no new announce
+
+        let announced = sink.announced.lock().await.clone();
+        assert_eq!(announced, vec![vec!["messages".to_string()]]);
+        assert_eq!(
+            reactor.interest_tables().await,
+            vec![TableId::new("messages")]
+        );
+    }
+
+    /// `refresh_subscription` re-execs one sub but suppresses the push when the
+    /// value is unchanged (the catch-up no-op case).
+    #[tokio::test]
+    async fn refresh_subscription_is_a_noop_when_unchanged() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        // Seed `last` to the value CountingReExec will return on its first call so
+        // the refresh recomputes an identical value and suppresses the push.
+        reactor
+            .add_subscription(Subscription {
+                client_id: "a".into(),
+                sub: "messages.list::A".into(),
+                path: vec!["messages".into(), "list".into()],
+                input: json!({ "channelId": "A" }),
+                headers: HashMap::new(),
+                read_set: channel_filter("A"),
+                last: Some(json!({ "n": 1 })),
+                last_lsn: Lsn::ZERO,
+            })
+            .await;
+
+        reactor.refresh_subscription("a", "messages.list::A").await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1, "re-exec ran once");
+        assert!(rx.try_recv().is_err(), "unchanged value → no catch-up push");
     }
 
     /// A re-executor that returns a fresh value each call (so every push goes
