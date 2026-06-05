@@ -127,28 +127,66 @@ fn like_match(value: &KeyValue, pattern: &KeyValue, case_insensitive: bool) -> b
     }
 }
 
-/// SQL LIKE pattern match (no escape handling). DP over chars.
+/// SQL LIKE pattern match (no escape handling; `%` = any run, `_` = one char).
+///
+/// Runs on the matcher hot path (every change × every LIKE filter), so it avoids
+/// the O(n·m)-space DP. Two layers:
+///   1. zero-allocation O(n) fast paths for the patterns people actually write —
+///      a literal, `foo%`, `%foo`, `%foo%` (no `_`, `%` only in end runs);
+///   2. a greedy two-pointer fallback (LeetCode 44) for the general case —
+///      O(1) extra space, O(n+m) typical.
 fn like_is_match(s: &str, p: &str) -> bool {
-    let s: Vec<char> = s.chars().collect();
-    let p: Vec<char> = p.chars().collect();
-    let (n, m) = (s.len(), p.len());
-    let mut dp = vec![vec![false; m + 1]; n + 1];
-    dp[0][0] = true;
-    for j in 1..=m {
-        if p[j - 1] == '%' {
-            dp[0][j] = dp[0][j - 1];
-        }
+    // (1) Fast paths — operate directly on &str, no allocation.
+    if !p.contains(['%', '_']) {
+        return s == p; // pure literal
     }
-    for i in 1..=n {
-        for j in 1..=m {
-            dp[i][j] = match p[j - 1] {
-                '%' => dp[i - 1][j] || dp[i][j - 1],
-                '_' => dp[i - 1][j - 1],
-                c => dp[i - 1][j - 1] && s[i - 1] == c,
+    if !p.contains('_') {
+        let core = p.trim_matches('%');
+        if !core.contains('%') {
+            // The only wildcards are leading/trailing `%` runs (p has at least one
+            // `%`, so at least one side is anchored by a wildcard).
+            return match (p.starts_with('%'), p.ends_with('%')) {
+                (true, true) => s.contains(core),
+                (true, false) => s.ends_with(core),
+                (false, true) => s.starts_with(core),
+                (false, false) => like_greedy(s, p), // unreachable, but safe
             };
         }
     }
-    dp[n][m]
+    // (2) General case: `_`, or `%` embedded between literals.
+    like_greedy(s, p)
+}
+
+/// Greedy wildcard match in O(1) extra space. On a mismatch after a `%`, backtrack
+/// the pattern to just past that `%` and advance the consumed-by-`%` cursor by one.
+fn like_greedy(s: &str, p: &str) -> bool {
+    let s: Vec<char> = s.chars().collect();
+    let p: Vec<char> = p.chars().collect();
+    let (n, m) = (s.len(), p.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut star: Option<usize> = None; // pattern index of the last `%`
+    let mut matched = 0usize; // how much of `s` that `%` has absorbed
+    while i < n {
+        if j < m && (p[j] == '_' || p[j] == s[i]) {
+            i += 1;
+            j += 1;
+        } else if j < m && p[j] == '%' {
+            star = Some(j);
+            matched = i;
+            j += 1;
+        } else if let Some(sj) = star {
+            j = sj + 1;
+            matched += 1;
+            i = matched;
+        } else {
+            return false;
+        }
+    }
+    // Trailing pattern must be all `%` to match the (now consumed) string.
+    while j < m && p[j] == '%' {
+        j += 1;
+    }
+    j == m
 }
 
 fn filter_matches(filter: &Filter, change: &Change) -> bool {
@@ -384,6 +422,121 @@ mod tests {
         assert!(!rs.matches_change(&title("APPLE"))); // case-sensitive LIKE
         let ci = mk(FilterOp::Ilike);
         assert!(ci.matches_change(&title("APPLE"))); // ILIKE is case-insensitive
+    }
+
+    /// Reference O(n·m) DP — the previous implementation, kept here as the oracle
+    /// the optimized `like_is_match` (fast paths + greedy) must agree with exactly.
+    fn like_dp(s: &str, p: &str) -> bool {
+        let s: Vec<char> = s.chars().collect();
+        let p: Vec<char> = p.chars().collect();
+        let (n, m) = (s.len(), p.len());
+        let mut dp = vec![vec![false; m + 1]; n + 1];
+        dp[0][0] = true;
+        for j in 1..=m {
+            if p[j - 1] == '%' {
+                dp[0][j] = dp[0][j - 1];
+            }
+        }
+        for i in 1..=n {
+            for j in 1..=m {
+                dp[i][j] = match p[j - 1] {
+                    '%' => dp[i - 1][j] || dp[i][j - 1],
+                    '_' => dp[i - 1][j - 1],
+                    c => dp[i - 1][j - 1] && s[i - 1] == c,
+                };
+            }
+        }
+        dp[n][m]
+    }
+
+    #[test]
+    fn like_explicit_cases() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("", "", true),
+            ("a", "", false),
+            ("", "%", true),
+            ("", "%%", true),
+            ("", "_", false),
+            ("abc", "abc", true),
+            ("abc", "abd", false),
+            ("abc", "a_c", true),
+            ("abc", "a_", false),
+            ("abc", "a%", true),  // prefix
+            ("abc", "%c", true),  // suffix
+            ("abc", "%b%", true), // contains
+            ("abc", "%x%", false),
+            ("abc", "a%c", true), // embedded %
+            ("aXXc", "a%c", true),
+            ("ac", "a%c", true), // % matches empty
+            ("abc", "%", true),
+            ("abc", "a%%c", true), // consecutive %
+            ("abc", "_bc", true),
+            ("abc", "ab_", true),
+            ("abc", "___", true),
+            ("abc", "____", false),
+            ("a%b", "a%b", true),  // literal % in text vs % wildcard
+            ("café", "ca%", true), // unicode
+            ("café", "caf_", true),
+        ];
+        for (s, p, want) in cases {
+            assert_eq!(like_is_match(s, p), *want, "LIKE {s:?} ~ {p:?}");
+            assert_eq!(like_dp(s, p), *want, "DP oracle disagrees on {s:?} ~ {p:?}");
+        }
+    }
+
+    /// Benchmark: optimized `like_is_match` vs the O(n·m)-space DP oracle on
+    /// representative patterns. Run:
+    ///   cargo test -p pulse-core --release -- --ignored --nocapture bench_like
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_like() {
+        use std::time::Instant;
+        const ITERS: u32 = 1_000_000;
+        let text = "the quick brown fox jumps over the lazy dog";
+        let pats: &[(&str, &str)] = &[
+            ("contains  ", "%brown%"),
+            ("prefix    ", "the %"),
+            ("suffix    ", "%dog"),
+            ("embedded _", "the %fox%la_y%"),
+        ];
+        for (label, p) in pats {
+            let timed = |f: &dyn Fn(&str, &str) -> bool| {
+                let start = Instant::now();
+                let mut hits = 0u64;
+                for _ in 0..ITERS {
+                    if f(std::hint::black_box(text), std::hint::black_box(p)) {
+                        hits += 1;
+                    }
+                }
+                (start.elapsed().as_nanos() as f64 / ITERS as f64, hits)
+            };
+            let (fast, _) = timed(&like_is_match);
+            let (dp, _) = timed(&like_dp);
+            println!(
+                "{label} fast={fast:>7.1} ns/op  dp={dp:>7.1} ns/op  ({:.1}x)",
+                dp / fast
+            );
+        }
+    }
+
+    /// Differential test: the optimized matcher must agree with the DP oracle on a
+    /// broad cartesian product of strings and patterns (incl. tricky % / _ mixes).
+    #[test]
+    fn like_matches_dp_oracle_exhaustively() {
+        let strings = ["", "a", "b", "ab", "ba", "aa", "abc", "abab", "aXbc"];
+        let patterns = [
+            "", "%", "_", "%%", "a", "a%", "%a", "%a%", "a_", "_a", "a%b", "%a%b%", "a_c", "___",
+            "%_", "_%", "a%%b", "ab", "%ab%", "_b_",
+        ];
+        for s in strings {
+            for p in patterns {
+                assert_eq!(
+                    like_is_match(s, p),
+                    like_dp(s, p),
+                    "mismatch vs oracle: {s:?} ~ {p:?}"
+                );
+            }
+        }
     }
 
     #[test]
