@@ -258,11 +258,17 @@ impl Registry {
 /// In-process reactor: a `Mutex<Registry>` (subscriptions + table index) plus an
 /// injected re-executor. Single-node; the `Reactor` trait is the seam for a
 /// distributed implementation later.
+/// Default per-client SSE buffer (events queued before a slow client is dropped).
+pub const DEFAULT_SSE_BUFFER: usize = 256;
+
 pub struct InMemoryReactor {
     clients: Mutex<HashMap<String, Client>>,
     reg: Mutex<Registry>,
     reexec: Arc<dyn ReExecutor>,
     interest: Option<Arc<dyn InterestSink>>,
+    /// Per-client SSE channel capacity — a bigger buffer tolerates burstier/slower
+    /// clients at the cost of memory; a full buffer drops the client.
+    sse_buffer: usize,
 }
 
 impl InMemoryReactor {
@@ -272,6 +278,7 @@ impl InMemoryReactor {
             reg: Mutex::new(Registry::default()),
             reexec,
             interest: None,
+            sse_buffer: DEFAULT_SSE_BUFFER,
         }
     }
 
@@ -279,6 +286,13 @@ impl InMemoryReactor {
     /// wrapping the reactor in an `Arc`.
     pub fn with_interest(mut self, sink: Arc<dyn InterestSink>) -> Self {
         self.interest = Some(sink);
+        self
+    }
+
+    /// Set the per-client SSE buffer capacity (knob; defaults to [`DEFAULT_SSE_BUFFER`]).
+    /// Builder-style; call before wrapping in an `Arc`. A zero is bumped to 1.
+    pub fn with_sse_buffer(mut self, n: usize) -> Self {
+        self.sse_buffer = n.max(1);
         self
     }
 
@@ -450,7 +464,7 @@ impl InMemoryReactor {
 #[async_trait]
 impl Reactor for InMemoryReactor {
     async fn register_client(&self, client_id: String) -> mpsc::Receiver<SsePush> {
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(self.sse_buffer);
         self.clients
             .lock()
             .await
@@ -785,6 +799,33 @@ mod tests {
             "register_client wedged behind a stalled client's push — the clients \
              lock must not be held across the channel send().await"
         );
+    }
+
+    /// The SSE buffer is a configurable knob: a tiny buffer fills fast but must not
+    /// wedge other clients, and zero is bumped to a usable minimum.
+    #[tokio::test]
+    async fn sse_buffer_is_configurable() {
+        let reactor = Arc::new(
+            InMemoryReactor::new(Arc::new(UniqueReExec {
+                n: AtomicUsize::new(0),
+            }))
+            .with_sse_buffer(0), // → bumped to 1
+        );
+        let _rx_slow = reactor.register_client("slow".into()).await;
+        let r2 = reactor.clone();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                r2.push("slow", "s", &json!({}), pulse_core::Lsn::ZERO)
+                    .await; // fills the tiny buffer, then parks
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reactor.register_client("other".into()),
+        )
+        .await;
+        assert!(ok.is_ok(), "a tiny SSE buffer must not wedge other clients");
     }
 
     /// Re-executor that ALWAYS returns the same fixed value, regardless of how

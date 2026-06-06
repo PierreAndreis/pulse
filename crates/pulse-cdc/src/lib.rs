@@ -200,6 +200,9 @@ pub struct PublishOpts {
     /// Split an oversized change-set into precise chunks instead of degrading to a
     /// coarse resync.
     pub chunk: bool,
+    /// Interest freshness window (seconds): only route to nodes whose heartbeat is
+    /// within this. Must match the cluster's prune/heartbeat config.
+    pub ttl_secs: i64,
 }
 
 impl Default for PublishOpts {
@@ -207,6 +210,7 @@ impl Default for PublishOpts {
         Self {
             broadcast: false,
             chunk: true,
+            ttl_secs: INTEREST_TTL_SECS,
         }
     }
 }
@@ -284,7 +288,15 @@ pub async fn publish_on(
     // One or more wire messages (chunked if oversized + opts.chunk), each routed
     // to the nodes interested in the tables IT touches.
     for (payload, route) in encode_messages(node_id, cs, opts.chunk) {
-        route_one(&mut *conn, node_id, &payload, route, opts.broadcast).await?;
+        route_one(
+            &mut *conn,
+            node_id,
+            &payload,
+            route,
+            opts.broadcast,
+            opts.ttl_secs,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -297,6 +309,7 @@ async fn route_one(
     payload: &str,
     route: Route,
     broadcast: bool,
+    ttl_secs: i64,
 ) -> Result<(), BusError> {
     let tables = match route {
         Route::Global => return notify(&mut *conn, CHANNEL, payload).await,
@@ -318,7 +331,7 @@ async fn route_one(
     .bind(&tables)
     .bind(node_id)
     .bind(payload)
-    .bind(INTEREST_TTL_SECS as i32)
+    .bind(ttl_secs as i32)
     .execute(&mut *conn)
     .await;
     match res {

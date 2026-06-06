@@ -46,6 +46,8 @@ struct AppState {
     /// Chunk oversized change-sets into precise messages instead of degrading to a
     /// coarse resync (PULSE_BUS_CHUNK; default on).
     chunk: bool,
+    /// Interest freshness window (PULSE_INTEREST_TTL_SECS) used for routing.
+    ttl_secs: i64,
     /// Cross-node bus metrics (events + latency decomposition), exposed at `/metrics`.
     metrics: Arc<BusMetrics>,
 }
@@ -118,6 +120,14 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Parse a numeric env value, falling back to `default` if unset or unparseable.
+fn parse_num(raw: Option<String>, default: u64) -> u64 {
+    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+}
+fn num_env(key: &str, default: u64) -> u64 {
+    parse_num(std::env::var(key).ok(), default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -144,6 +154,19 @@ async fn main() -> anyhow::Result<()> {
     let olap_timeout: u64 = env_or("PULSE_OLAP_STATEMENT_TIMEOUT_MS", "60000")
         .parse()
         .unwrap_or(60000);
+
+    // Cross-node bus tuning knobs (great defaults; override for your deployment).
+    let interest_ttl_secs = num_env("PULSE_INTEREST_TTL_SECS", 30) as i64;
+    let mut heartbeat_ms = num_env("PULSE_HEARTBEAT_MS", 10_000);
+    // The heartbeat must refresh interest well within the TTL, or a live node's
+    // interest lapses and it silently misses invalidations — clamp to TTL/3.
+    let max_heartbeat = (interest_ttl_secs.max(1) as u64) * 1000 / 3;
+    if heartbeat_ms > max_heartbeat {
+        tracing::warn!("PULSE_HEARTBEAT_MS {heartbeat_ms} > ttl/3; clamping to {max_heartbeat}");
+        heartbeat_ms = max_heartbeat.max(1);
+    }
+    let wal_sample_ms = num_env("PULSE_WAL_SAMPLE_MS", 100).max(1);
+    let sse_buffer = num_env("PULSE_SSE_BUFFER", pulse_reactor::DEFAULT_SSE_BUFFER as u64) as usize;
 
     let worker_bin = env_or("PULSE_WORKER_BIN", "bun");
     let worker_script = env_or("PULSE_WORKER_SCRIPT", "packages/runtime-node/src/worker.ts");
@@ -203,8 +226,11 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         node_id: node_id.clone(),
     });
-    let reactor: Arc<dyn Reactor> =
-        Arc::new(InMemoryReactor::new(reexec).with_interest(interest_sink));
+    let reactor: Arc<dyn Reactor> = Arc::new(
+        InMemoryReactor::new(reexec)
+            .with_interest(interest_sink)
+            .with_sse_buffer(sse_buffer),
+    );
 
     // WAL position sampler: refresh the commit watermark off the write path so
     // mutations don't each pay a WAL round-trip. ~100ms granularity is plenty for a
@@ -214,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
         let pool = pool.clone();
         let wal_lsn = wal_lsn.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(wal_sample_ms));
             loop {
                 tick.tick().await;
                 if let Ok(mut conn) = pool.acquire().await {
@@ -233,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
         let node_id = node_id.clone();
         let reactor = reactor.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(heartbeat_ms));
             loop {
                 tick.tick().await;
                 let tables: Vec<String> = reactor
@@ -243,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|t| t.0)
                     .collect();
                 let _ = pulse_cdc::register_interest(&pool, &node_id, &tables).await;
-                let _ = pulse_cdc::prune_interest(&pool, pulse_cdc::INTEREST_TTL_SECS).await;
+                let _ = pulse_cdc::prune_interest(&pool, interest_ttl_secs).await;
             }
         });
     }
@@ -298,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
         wal_lsn,
         broadcast,
         chunk,
+        ttl_secs: interest_ttl_secs,
         metrics,
     });
 
@@ -430,6 +457,7 @@ async fn rpc(
                 let opts = pulse_cdc::PublishOpts {
                     broadcast: state.broadcast,
                     chunk: state.chunk,
+                    ttl_secs: state.ttl_secs,
                 };
                 let change_set = ChangeSet {
                     commit_lsn,
@@ -551,6 +579,15 @@ async fn unsubscribe(
 mod tests {
     use super::*;
     use axum::http::header::{HeaderName, HeaderValue};
+
+    #[test]
+    fn parse_num_uses_default_when_absent_or_invalid() {
+        assert_eq!(parse_num(None, 100), 100); // unset → default
+        assert_eq!(parse_num(Some("250".into()), 100), 250); // valid override
+        assert_eq!(parse_num(Some("  42 ".into()), 100), 42); // trimmed
+        assert_eq!(parse_num(Some("nope".into()), 100), 100); // garbage → default
+        assert_eq!(parse_num(Some("".into()), 100), 100); // empty → default
+    }
 
     #[test]
     fn status_for_known_and_unknown() {
