@@ -60,6 +60,9 @@ struct BusMetrics {
     lag_us_sum: std::sync::atomic::AtomicU64,
     /// Σ deliver→applied (match + re-exec + push) duration over all events (µs).
     apply_us_sum: std::sync::atomic::AtomicU64,
+    /// Coarse resync events received (ResyncTables/Resync) — a change-set that blew
+    /// past the NOTIFY payload cap and degraded to table-/global-scoped re-eval.
+    resyncs: std::sync::atomic::AtomicU64,
 }
 
 /// Microseconds since the Unix epoch (wall clock), for same-host bus-latency math.
@@ -264,10 +267,14 @@ async fn main() -> anyhow::Result<()> {
                             reactor.apply_change_set(cs).await;
                         }
                         pulse_cdc::BusEvent::ResyncTables(tables) => {
+                            metrics.resyncs.fetch_add(1, Relaxed);
                             let ts = tables.into_iter().map(TableId::new).collect();
                             reactor.invalidate_tables(ts).await;
                         }
-                        pulse_cdc::BusEvent::Resync => reactor.invalidate_all().await,
+                        pulse_cdc::BusEvent::Resync => {
+                            metrics.resyncs.fetch_add(1, Relaxed);
+                            reactor.invalidate_all().await;
+                        }
                     }
                     metrics
                         .apply_us_sum
@@ -331,6 +338,7 @@ async fn node_metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
         "broadcast": state.broadcast,
         "busEvents": events,
         "changes": changes,
+        "resyncs": m.resyncs.load(Relaxed),
         "busLagMs": avg_ms(m.lag_us_sum.load(Relaxed), changes),
         "applyMs": avg_ms(m.apply_us_sum.load(Relaxed), events),
         // Raw sums (µs) so a benchmark can compute a windowed average via deltas.
