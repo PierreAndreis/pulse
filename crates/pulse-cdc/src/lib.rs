@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::mpsc;
 
-use pulse_core::ChangeSet;
+use pulse_core::{Change, ChangeSet, Lsn};
 
 mod interest;
 pub use interest::{
@@ -115,40 +115,110 @@ pub enum BusError {
     Json(#[from] serde_json::Error),
 }
 
-/// Encode a change-set for the wire, degrading gracefully as it grows:
-///   1. small enough → ship the full change-set (precise),
-///   2. too big, but the distinct touched-table list fits → ship `ResyncTables`
-///      so peers invalidate only those tables (scoped over-approximation),
-///   3. even the table list is too big → ship `Resync` (global re-eval).
-fn encode(node_id: &str, cs: &ChangeSet) -> Result<(String, Route), BusError> {
-    let full = Wire::Changes {
+/// Distinct table names touched by a slice of changes (sorted, deduped).
+fn tables_of(changes: &[Change]) -> Vec<String> {
+    let mut t: Vec<String> = changes.iter().map(|c| c.table.0.clone()).collect();
+    t.sort();
+    t.dedup();
+    t
+}
+
+/// Serialize `changes` as a `Changes` wire message iff it fits under the cap.
+fn fit_changes(node_id: &str, lsn: Lsn, changes: &[Change]) -> Option<String> {
+    let w = Wire::Changes {
         origin: node_id.to_string(),
-        data: cs.clone(),
+        data: ChangeSet {
+            commit_lsn: lsn,
+            changes: changes.to_vec(),
+        },
         ts_us: now_us(),
     };
-    let payload = serde_json::to_string(&full)?;
-    if payload.len() <= MAX_PAYLOAD {
-        return Ok((payload, Route::Tables(distinct_tables(cs))));
-    }
+    let s = serde_json::to_string(&w).ok()?;
+    (s.len() <= MAX_PAYLOAD).then_some(s)
+}
 
+/// Split a too-big change-set into consecutive `Changes` messages that each fit
+/// under the cap — preserving PRECISE delivery for bulk writes. Returns `None` if
+/// a single change is itself larger than the cap (can't be split precisely), so the
+/// caller can fall back to a coarse resync for that case only.
+fn chunk_changes(node_id: &str, cs: &ChangeSet) -> Option<Vec<(String, Route)>> {
+    let mut out: Vec<(String, Route)> = Vec::new();
+    let mut cur: Vec<Change> = Vec::new();
+    for ch in &cs.changes {
+        // One change exceeds the cap alone → can't chunk precisely.
+        fit_changes(node_id, cs.commit_lsn, std::slice::from_ref(ch))?;
+        cur.push(ch.clone());
+        if fit_changes(node_id, cs.commit_lsn, &cur).is_none() {
+            let last = cur.pop().expect("just pushed");
+            let payload = fit_changes(node_id, cs.commit_lsn, &cur).expect("fit before last push");
+            out.push((payload, Route::Tables(tables_of(&cur))));
+            cur = vec![last];
+        }
+    }
+    if !cur.is_empty() {
+        let payload = fit_changes(node_id, cs.commit_lsn, &cur)?;
+        out.push((payload, Route::Tables(tables_of(&cur))));
+    }
+    Some(out)
+}
+
+/// Build the wire message(s) for a change-set, degrading gracefully as it grows:
+///   1. fits under the cap → one precise `Changes`;
+///   2. over cap & `chunk` → several precise `Changes` slices that each fit;
+///   3. over cap & not chunkable → `ResyncTables` (touched tables), or `Resync`
+///      if even the table list overflows.
+fn encode_messages(node_id: &str, cs: &ChangeSet, chunk: bool) -> Vec<(String, Route)> {
+    if let Some(one) = fit_changes(node_id, cs.commit_lsn, &cs.changes) {
+        return vec![(one, Route::Tables(tables_of(&cs.changes)))];
+    }
+    if chunk {
+        if let Some(chunks) = chunk_changes(node_id, cs) {
+            return chunks;
+        }
+    }
     let tables = distinct_tables(cs);
-    let scoped = serde_json::to_string(&Wire::ResyncTables {
+    if let Ok(scoped) = serde_json::to_string(&Wire::ResyncTables {
         origin: node_id.to_string(),
         tables: tables.clone(),
-    })?;
-    if scoped.len() <= MAX_PAYLOAD {
-        return Ok((scoped, Route::Tables(tables)));
+    }) {
+        if scoped.len() <= MAX_PAYLOAD {
+            return vec![(scoped, Route::Tables(tables))];
+        }
     }
-
     let global = serde_json::to_string(&Wire::Resync {
         origin: node_id.to_string(),
-    })?;
-    Ok((global, Route::Global))
+    })
+    .unwrap_or_else(|_| "{\"kind\":\"resync\",\"origin\":\"\"}".to_string());
+    vec![(global, Route::Global)]
+}
+
+/// Publish-time knobs. Defaults: route by interest, chunk oversized change-sets.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishOpts {
+    /// Force a global broadcast instead of interest routing (kill-switch / baseline).
+    pub broadcast: bool,
+    /// Split an oversized change-set into precise chunks instead of degrading to a
+    /// coarse resync.
+    pub chunk: bool,
+}
+
+impl Default for PublishOpts {
+    fn default() -> Self {
+        Self {
+            broadcast: false,
+            chunk: true,
+        }
+    }
 }
 
 #[cfg(test)]
 fn encode_payload(node_id: &str, cs: &ChangeSet) -> Result<String, BusError> {
-    Ok(encode(node_id, cs)?.0)
+    // Test helper mirrors the no-chunk degrade path (one message).
+    Ok(encode_messages(node_id, cs, false)
+        .into_iter()
+        .next()
+        .unwrap()
+        .0)
 }
 
 /// Classify a decoded wire message against the local node id. Self-originated
@@ -209,14 +279,28 @@ pub async fn publish_on(
     conn: &mut sqlx::PgConnection,
     node_id: &str,
     cs: &ChangeSet,
+    opts: PublishOpts,
+) -> Result<(), BusError> {
+    // One or more wire messages (chunked if oversized + opts.chunk), each routed
+    // to the nodes interested in the tables IT touches.
+    for (payload, route) in encode_messages(node_id, cs, opts.chunk) {
+        route_one(&mut *conn, node_id, &payload, route, opts.broadcast).await?;
+    }
+    Ok(())
+}
+
+/// Route a single wire message: broadcast (global channel) or interest-routed to
+/// the per-node channels of nodes watching the touched tables.
+async fn route_one(
+    conn: &mut sqlx::PgConnection,
+    node_id: &str,
+    payload: &str,
+    route: Route,
     broadcast: bool,
 ) -> Result<(), BusError> {
-    let (payload, route) = encode(node_id, cs)?;
-    // `broadcast` forces the global channel (every node), bypassing interest routing
-    // — the comparison baseline, and a kill-switch if routing ever misbehaves.
     let tables = match route {
-        Route::Global => return notify(&mut *conn, CHANNEL, &payload).await,
-        Route::Tables(_) if broadcast => return notify(&mut *conn, CHANNEL, &payload).await,
+        Route::Global => return notify(&mut *conn, CHANNEL, payload).await,
+        Route::Tables(_) if broadcast => return notify(&mut *conn, CHANNEL, payload).await,
         Route::Tables(tables) => tables,
     };
     // One statement does the interest lookup AND every NOTIFY: pg_notify is called
@@ -233,7 +317,7 @@ pub async fn publish_on(
     )
     .bind(&tables)
     .bind(node_id)
-    .bind(&payload)
+    .bind(payload)
     .bind(INTEREST_TTL_SECS as i32)
     .execute(&mut *conn)
     .await;
@@ -241,16 +325,16 @@ pub async fn publish_on(
         Ok(_) => Ok(()),
         Err(e) => {
             tracing::warn!(target: "pulse::cdc", "routed publish failed, broadcasting: {e}");
-            notify(&mut *conn, CHANNEL, &payload).await
+            notify(&mut *conn, CHANNEL, payload).await
         }
     }
 }
 
-/// Convenience wrapper that acquires one connection from `pool` and publishes on it
-/// with interest routing (no broadcast).
+/// Convenience wrapper that acquires one connection from `pool` and publishes with
+/// default options (interest-routed, chunked).
 pub async fn publish(pool: &PgPool, node_id: &str, cs: &ChangeSet) -> Result<(), BusError> {
     let mut conn = pool.acquire().await?;
-    publish_on(&mut conn, node_id, cs, false).await
+    publish_on(&mut conn, node_id, cs, PublishOpts::default()).await
 }
 
 /// Start listening for bus events from *other* nodes. Returns a receiver that
@@ -510,5 +594,81 @@ mod tests {
             matches!(back, Wire::Resync { .. }),
             "a write spanning thousands of tables must fall back to global Resync"
         );
+    }
+
+    fn big_changeset(rows: usize) -> ChangeSet {
+        let mut cs = ChangeSet::new(lsn());
+        for i in 0..rows {
+            cs.push(Change::point(
+                TableId::new("public.orders"),
+                PrimaryKey::single(KeyValue::Int(i as i64)),
+                ChangeOp::Insert,
+            ));
+        }
+        cs
+    }
+
+    #[test]
+    fn chunk_splits_oversized_into_precise_fitting_messages() {
+        let cs = big_changeset(2000);
+        assert!(
+            fit_changes("n1", lsn(), &cs.changes).is_none(),
+            "fixture must exceed the cap as one message"
+        );
+        let msgs = encode_messages("n1", &cs, true);
+        assert!(
+            msgs.len() > 1,
+            "oversized change-set must split into chunks"
+        );
+        let mut total = 0;
+        for (payload, _route) in &msgs {
+            assert!(payload.len() <= MAX_PAYLOAD, "each chunk must fit the cap");
+            match serde_json::from_str::<Wire>(payload).unwrap() {
+                Wire::Changes { data, .. } => total += data.changes.len(),
+                _ => panic!("every chunk must be a precise Changes message"),
+            }
+        }
+        // Precise: no change lost or duplicated across the chunks.
+        assert_eq!(total, cs.changes.len());
+    }
+
+    #[test]
+    fn no_chunk_degrades_to_resync_tables() {
+        let cs = big_changeset(2000);
+        let msgs = encode_messages("n1", &cs, false);
+        assert_eq!(msgs.len(), 1, "without chunking, one coarse message");
+        match serde_json::from_str::<Wire>(&msgs[0].0).unwrap() {
+            Wire::ResyncTables { tables, .. } => assert_eq!(tables, vec!["public.orders"]),
+            _ => panic!("expected a scoped ResyncTables"),
+        }
+    }
+
+    #[test]
+    fn small_changeset_is_one_changes_message_either_way() {
+        for chunk in [true, false] {
+            let msgs = encode_messages("n1", &small_changeset(), chunk);
+            assert_eq!(msgs.len(), 1);
+            assert!(matches!(
+                serde_json::from_str::<Wire>(&msgs[0].0).unwrap(),
+                Wire::Changes { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn single_change_over_cap_cannot_chunk_and_resyncs() {
+        // One change whose key alone blows the cap → not precisely chunkable.
+        let mut cs = ChangeSet::new(lsn());
+        cs.push(Change::point(
+            TableId::new("public.big"),
+            PrimaryKey::single(KeyValue::Text("x".repeat(9000))),
+            ChangeOp::Insert,
+        ));
+        let msgs = encode_messages("n1", &cs, true);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            serde_json::from_str::<Wire>(&msgs[0].0).unwrap(),
+            Wire::ResyncTables { .. } | Wire::Resync { .. }
+        ));
     }
 }

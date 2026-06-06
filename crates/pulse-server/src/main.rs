@@ -43,6 +43,9 @@ struct AppState {
     /// Force global broadcast instead of interest routing (PULSE_BUS_BROADCAST) —
     /// the benchmark baseline and a routing kill-switch.
     broadcast: bool,
+    /// Chunk oversized change-sets into precise messages instead of degrading to a
+    /// coarse resync (PULSE_BUS_CHUNK; default on).
+    chunk: bool,
     /// Cross-node bus metrics (events + latency decomposition), exposed at `/metrics`.
     metrics: Arc<BusMetrics>,
 }
@@ -246,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let broadcast = env_or("PULSE_BUS_BROADCAST", "0") == "1";
+    let chunk = env_or("PULSE_BUS_CHUNK", "1") == "1";
     let metrics = Arc::new(BusMetrics::default());
     match pulse_cdc::start_listener(&database_url, node_id.clone()).await {
         Ok(mut rx) => {
@@ -293,6 +297,7 @@ async fn main() -> anyhow::Result<()> {
         node_id,
         wal_lsn,
         broadcast,
+        chunk,
         metrics,
     });
 
@@ -422,7 +427,10 @@ async fn rpc(
                 let reactor = state.reactor.clone();
                 let pool = state.pool.clone();
                 let node_id = state.node_id.clone();
-                let broadcast = state.broadcast;
+                let opts = pulse_cdc::PublishOpts {
+                    broadcast: state.broadcast,
+                    chunk: state.chunk,
+                };
                 let change_set = ChangeSet {
                     commit_lsn,
                     changes: res.changes,
@@ -437,7 +445,7 @@ async fn rpc(
                     };
                     if let Ok(mut conn) = pool.acquire().await {
                         if let Err(e) =
-                            pulse_cdc::publish_on(&mut conn, &node_id, &change_set, broadcast).await
+                            pulse_cdc::publish_on(&mut conn, &node_id, &change_set, opts).await
                         {
                             tracing::warn!("change bus publish failed: {e}");
                         }

@@ -168,31 +168,38 @@ describe("bottleneck atlas (realistic shop workload)", () => {
   );
 
   test(
-    "D. bulk write — a big tx blows past the 8KB NOTIFY cap → coarse cross-node resync",
+    "D. bulk write & the PULSE_BUS_CHUNK knob — chunk-off degrades to coarse resync, chunk-on stays precise",
     async () => {
+      // Subscriber node B (interested in `orders`), and two writer nodes differing
+      // only in the chunk knob.
       const b = await startEngine({ app: APP, oltpMaxConns: 8 });
-      const cb = mk(b);
-      const unsub = cb.s.recentOrders.subscribe({}, () => {}); // B is interested in `orders`
-      await sleep(800); // interest registered on B
+      const aOff = await startEngine({ app: APP, oltpMaxConns: 8, env: { PULSE_BUS_CHUNK: "0" } });
+      const aOn = await startEngine({ app: APP, oltpMaxConns: 8, env: { PULSE_BUS_CHUNK: "1" } });
+      const unsub = mk(b).s.recentOrders.subscribe({}, () => {});
+      await sleep(900); // interest registered on B
+      const resyncsB = async () => ((await (await fetch(`${b.baseUrl}/metrics`)).json()) as { resyncs: number }).resyncs;
       try {
-        const rows: { n: number; mode: string }[] = [];
-        let prev = ((await (await fetch(`${b.baseUrl}/metrics`)).json()) as { resyncs: number }).resyncs;
-        for (const n of [1, 3, 8, 20, 50, 120]) {
-          await c.s.bulkOrders.call({ userId: UID, count: n });
-          await sleep(900);
-          const m = (await (await fetch(`${b.baseUrl}/metrics`)).json()) as { resyncs: number };
-          const coarse = m.resyncs > prev;
-          prev = m.resyncs;
-          rows.push({ n, mode: coarse ? "COARSE resync (cap exceeded)" : "precise change-set" });
-        }
+        const N = 50; // a 50-order tx (150 rows) is well over the 8KB cap
+        const before1 = await resyncsB();
+        await mk(aOff).s.bulkOrders.call({ userId: UID, count: N });
+        await sleep(1200);
+        const offResyncs = (await resyncsB()) - before1;
+
+        const before2 = await resyncsB();
+        await mk(aOn).s.bulkOrders.call({ userId: UID, count: N });
+        await sleep(1200);
+        const onResyncs = (await resyncsB()) - before2;
+
         log(
-          "\nD. cross-node delivery of a bulk write (rows per tx) — precise vs coarse:\n" +
-            rows.map((r) => `   ${String(r.n).padStart(3)} orders/tx  →  ${r.mode}`).join("\n"),
+          `\nD. bulk write of ${N} orders/tx, cross-node delivery to B:\n` +
+            `   PULSE_BUS_CHUNK=0  →  ${offResyncs > 0 ? "COARSE resync (cap exceeded)" : "precise"}  (${offResyncs} resync events)\n` +
+            `   PULSE_BUS_CHUNK=1  →  ${onResyncs > 0 ? "COARSE resync" : "PRECISE (chunked under cap)"}  (${onResyncs} resync events)`,
         );
-        expect(rows.some((r) => r.mode.startsWith("COARSE"))).toBe(true); // big enough tx must degrade
+        expect(offResyncs).toBeGreaterThan(0); // without chunking, the cap is exceeded → coarse
+        expect(onResyncs).toBe(0); // chunking keeps it precise (the default fix)
       } finally {
         unsub();
-        await b.stop();
+        await Promise.all([b.stop(), aOff.stop(), aOn.stop()]);
       }
     },
     180_000,
