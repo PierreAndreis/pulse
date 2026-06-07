@@ -58,6 +58,9 @@ const ANIMAL = [
   "Moth", "Crane", "Bison", "Orca", "Raven", "Newt", "Quail", "Yak", "Ibis", "Seal",
 ];
 
+const EMOJIS = ["🎉", "❤️", "🔥", "👍", "😮"]; // number keys 1–5
+const EMOTE_MS = 1700; // how long a floating reaction lives
+
 /** A friendly, deterministic name from the id (no extra data to broadcast). */
 function nameFor(id: string): string {
   const h = hash(id);
@@ -150,6 +153,14 @@ export function CursorPresence() {
   const [, setFrame] = useState(0);
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
   const [followId, setFollowId] = useState<string | null>(() => sessionStorage.getItem(FOLLOW_KEY));
+  const [chatting, setChatting] = useState(false);
+  const [chatText, setChatText] = useState("");
+  const chattingRef = useRef(false);
+  chattingRef.current = chatting;
+  const chatInput = useRef<HTMLInputElement>(null);
+  const emotes = useRef<{ key: number; x: number; y: number; emoji: string; color: string; t: number }[]>([]);
+  const emoteSeq = useRef(0);
+  const prevEmoteAt = useRef(new Map<string, number>());
   const me = useRef(clientId());
   const color = useRef(colorFor(me.current));
   const country = useRef("");
@@ -182,13 +193,23 @@ export function CursorPresence() {
     window.scrollTo({ top: t.scrollY * scrollMax(), behavior: "smooth" });
   }
 
+  function spawnEmote(x: number, y: number, emoji: string, col: string) {
+    emotes.current.push({ key: emoteSeq.current++, x, y, emoji, color: col, t: Date.now() });
+  }
+  function sendReact(emoji: string) {
+    const p = ownPos.current ?? { x: 0.5, y: 0.5 };
+    spawnEmote(p.x, p.y, emoji, color.current); // instant local feedback
+    void pulse.presence.react.call({ clientId: me.current, emote: emoji }).catch(() => {});
+  }
+
   // Own selection uses the visitor's presence color; also defines the follow-border pulse.
   useEffect(() => {
     const style = document.createElement("style");
     const tint = color.current.replace(")", " / 0.4)");
     style.textContent =
       `::selection{background:${tint};} ::-moz-selection{background:${tint};}` +
-      `@keyframes pulseFollowBorder{0%,100%{opacity:.45}50%{opacity:.9}}`;
+      `@keyframes pulseFollowBorder{0%,100%{opacity:.45}50%{opacity:.9}}` +
+      `@keyframes emoteFloat{0%{transform:translateY(0) scale(.6);opacity:0}15%{opacity:1;transform:translateY(-6px) scale(1.2)}100%{transform:translateY(-70px) scale(1);opacity:0}}`;
     document.head.appendChild(style);
     return () => style.remove();
   }, []);
@@ -240,6 +261,11 @@ export function CursorPresence() {
       for (const c of rows) {
         if (c.clientId === me.current || c.channel !== channel) continue;
         pushTrail(c.clientId, c.x, c.y, now);
+        // Animate a remote reaction the first time we see its timestamp.
+        if (c.emote && c.emoteAt > (prevEmoteAt.current.get(c.clientId) ?? 0)) {
+          prevEmoteAt.current.set(c.clientId, c.emoteAt);
+          spawnEmote(c.x, c.y, c.emote, c.color);
+        }
       }
     }
     function pushTrail(id: string, x: number, y: number, t: number) {
@@ -266,6 +292,18 @@ export function CursorPresence() {
       if (followIdRef.current) stopFollow();
     };
     const onKey = (e: KeyboardEvent) => {
+      if (chattingRef.current) return; // the chat input owns its keys
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "/") {
+        e.preventDefault();
+        setChatting(true);
+        return;
+      }
+      if (/^[1-5]$/.test(e.key)) {
+        sendReact(EMOJIS[Number(e.key) - 1]!);
+        return;
+      }
       if (e.key === "Escape" && followIdRef.current) stopFollow();
       else if (
         followIdRef.current &&
@@ -306,12 +344,15 @@ export function CursorPresence() {
         const cur = window.scrollY;
         if (Math.abs(target - cur) > 0.5) window.scrollTo(0, cur + (target - cur) * FOLLOW_EASE);
       }
-      const cutoff = Date.now() - TRAIL_FADE_MS;
+      const tnow = Date.now();
+      const cutoff = tnow - TRAIL_FADE_MS;
       for (const [id, arr] of trails.current) {
         const kept = arr.filter((p) => p.t > cutoff);
         if (kept.length) trails.current.set(id, kept);
         else trails.current.delete(id);
       }
+      if (emotes.current.some((em) => tnow - em.t > EMOTE_MS))
+        emotes.current = emotes.current.filter((em) => tnow - em.t <= EMOTE_MS);
       setFrame((f) => (f + 1) % 1_000_000);
       raf = requestAnimationFrame(loop);
     };
@@ -362,6 +403,31 @@ export function CursorPresence() {
     followScroll.current = t.scrollY;
     followActive.current = true;
   }, [cursors, followId, channel]);
+
+  // Focus the chat field when chat opens.
+  useEffect(() => {
+    if (chatting) chatInput.current?.focus();
+  }, [chatting]);
+
+  function onChatChange(v: string) {
+    setChatText(v);
+    void pulse.presence.say.call({ clientId: me.current, message: v }).catch(() => {});
+  }
+  function commitChat() {
+    setChatting(false);
+    setChatText("");
+    // Leave the bubble up briefly for others, then clear it.
+    const keep = chatText.trim().length > 0;
+    setTimeout(
+      () => void pulse.presence.say.call({ clientId: me.current, message: "" }).catch(() => {}),
+      keep ? 5000 : 0,
+    );
+  }
+  function cancelChat() {
+    setChatting(false);
+    setChatText("");
+    void pulse.presence.say.call({ clientId: me.current, message: "" }).catch(() => {});
+  }
 
   function toggleFollow(id: string) {
     if (followId === id) {
@@ -451,6 +517,29 @@ export function CursorPresence() {
           <svg width="20" height="22" viewBox="0 0 20 22" fill="none" style={{ display: "block" }}>
             <path d="M1 1l6.5 18 2.7-7.3 7.3-2.7L1 1z" fill={c.color} stroke="rgba(0,0,0,0.4)" strokeWidth="1" />
           </svg>
+          {c.message && (
+            <span
+              style={{
+                position: "absolute",
+                left: 16,
+                top: -10,
+                maxWidth: 240,
+                padding: "5px 10px",
+                borderRadius: 12,
+                borderBottomLeftRadius: 3,
+                background: c.color,
+                color: "#000",
+                fontSize: 13,
+                fontWeight: 500,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                fontFamily: "ui-sans-serif, system-ui, sans-serif",
+                boxShadow: "0 3px 12px rgba(0,0,0,0.35)",
+              }}
+            >
+              {c.message}
+            </span>
+          )}
           <span
             style={{
               position: "absolute",
@@ -536,6 +625,74 @@ export function CursorPresence() {
         </div>
       )}
 
+      {/* Floating emoji reactions. */}
+      {emotes.current.map((em) => (
+        <div
+          key={em.key}
+          style={{ position: "fixed", left: 0, top: 0, transform: `translate(${em.x * 100}vw, ${em.y * 100}vh)`, pointerEvents: "none" }}
+        >
+          <span
+            style={{
+              position: "absolute",
+              left: -4,
+              top: -8,
+              fontSize: 26,
+              animation: `emoteFloat ${EMOTE_MS}ms ease-out forwards`,
+              filter: `drop-shadow(0 2px 8px ${em.color})`,
+            }}
+          >
+            {em.emoji}
+          </span>
+        </div>
+      ))}
+
+      {/* Local cursor-chat input (press "/"). */}
+      {chatting && (
+        <div
+          style={{
+            position: "fixed",
+            left: 0,
+            top: 0,
+            transform: `translate(${(ownPos.current?.x ?? 0.5) * 100}vw, ${(ownPos.current?.y ?? 0.5) * 100}vh)`,
+            pointerEvents: "auto",
+          }}
+        >
+          <input
+            ref={chatInput}
+            value={chatText}
+            maxLength={140}
+            placeholder="Say something…  ↵"
+            onChange={(e) => onChatChange(e.target.value)}
+            onBlur={commitChat}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitChat();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                cancelChat();
+              }
+            }}
+            style={{
+              position: "absolute",
+              left: 16,
+              top: -10,
+              width: 220,
+              padding: "6px 11px",
+              borderRadius: 12,
+              borderBottomLeftRadius: 3,
+              border: `2px solid ${color.current}`,
+              background: "#111",
+              color: "#fff",
+              fontSize: 13,
+              outline: "none",
+              fontFamily: "ui-sans-serif, system-ui, sans-serif",
+            }}
+          />
+        </div>
+      )}
+
       {/* Presence panel: who's here — jump (↗) or follow. */}
       <div
         style={{
@@ -595,6 +752,9 @@ export function CursorPresence() {
             </div>
           );
         })}
+        <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.1)", opacity: 0.6, fontSize: 11 }}>
+          / chat · 1–5 react
+        </div>
       </div>
     </div>
   );

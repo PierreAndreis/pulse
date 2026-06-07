@@ -14,6 +14,9 @@ declare module "@onveloz/pulse-schema" {
       updatedAt: number;
       channel: string;
       scrollY: number;
+      message: string;
+      emote: string;
+      emoteAt: number;
       selStart: number;
       selEnd: number;
     };

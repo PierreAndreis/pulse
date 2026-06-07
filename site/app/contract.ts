@@ -33,6 +33,16 @@ export const contract = {
         }),
       )
       .output(v.null()),
+    // Live cursor chat: set ("" clears the bubble).
+    say: oc
+      .mutation()
+      .input(v.object({ clientId: v.string(), message: v.string() }))
+      .output(v.null()),
+    // Emoji reaction: a momentary burst everyone animates.
+    react: oc
+      .mutation()
+      .input(v.object({ clientId: v.string(), emote: v.string() }))
+      .output(v.null()),
     // Best-effort removal on tab close.
     leave: oc.mutation().input(v.object({ clientId: v.string() })).output(v.null()),
   },

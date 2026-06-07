@@ -39,6 +39,9 @@ export const move = os.presence.move.handler(async ({ ctx, input }) => {
       scrollY: input.scrollY,
       selStart: -1,
       selEnd: -1,
+      message: "",
+      emote: "",
+      emoteAt: 0,
     });
   }
   // Opportunistic GC: collect() reads the whole table, so drop long-stale rows
@@ -62,6 +65,21 @@ export const select = os.presence.select.handler(async ({ ctx, input }) => {
     });
   }
   // No row yet ⇒ the visitor hasn't moved; nothing to attach a selection to.
+  return null;
+});
+
+export const say = os.presence.say.handler(async ({ ctx, input }) => {
+  const all = await ctx.db.query("cursors").collect();
+  const mine = all.find((c) => c.clientId === input.clientId);
+  if (mine) await ctx.db.patch(mine._id, { message: input.message, updatedAt: Date.now() });
+  return null;
+});
+
+export const react = os.presence.react.handler(async ({ ctx, input }) => {
+  const now = Date.now();
+  const all = await ctx.db.query("cursors").collect();
+  const mine = all.find((c) => c.clientId === input.clientId);
+  if (mine) await ctx.db.patch(mine._id, { emote: input.emote, emoteAt: now, updatedAt: now });
   return null;
 });
 
