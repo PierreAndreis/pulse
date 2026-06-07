@@ -8,7 +8,7 @@ import { navigate } from "./router.js";
 type Cursor = Doc<"cursors">;
 
 const REPORT_MS = 60; // ~16 Hz publish of my own position
-const POLL_MS = 200; // read everyone ~5 Hz (see note in the effect re: SSE)
+const POLL_MS = 200; // read everyone ~5 Hz (proxy buffers SSE; see effect note)
 const REMOTE_GLIDE_MS = 220; // CSS interpolation between polled positions
 const HEARTBEAT_MS = 4000; // republish even when idle so we stay present
 const SEL_REPORT_MS = 120; // selection changes are bursty; coalesce them
@@ -267,12 +267,12 @@ export function CursorPresence() {
 
     publish(); // establish presence immediately (also on route-change remounts)
 
-    // Presence is delivered by POLLING, not the reactive SSE subscription: the
-    // engine sits behind a proxy that buffers `text/event-stream`, so server
-    // pushes don't reach the browser in real time (verified — the stream opens
-    // but never flushes). One-shot RPC works fine through the proxy, so we read
-    // the full list on a short interval; remote cursors CSS-glide between samples
-    // so movement still looks smooth.
+    // Presence is delivered by POLLING the list. Ideally this would be the engine's
+    // reactive SSE subscription — and the engine streams correctly (verified with
+    // curl/node) — but Veloz's proxy buffers the browser's `/sync` response when the
+    // connection is busy, so live frames never reach the running app (both the SDK
+    // and a hand-rolled reader deadlock). Until that's fixed at the infra layer,
+    // a short poll + CSS glide on remote cursors keeps it smooth and reliable.
     const pull = () =>
       void pulse.presence.list
         .call()
@@ -534,6 +534,7 @@ export function CursorPresence() {
       {here.map((c) => (
         <div
           key={c.clientId}
+          data-cid={c.clientId}
           onClick={() => jumpTo(c.clientId)}
           title={`Jump to ${nameFor(c.clientId)}`}
           style={{

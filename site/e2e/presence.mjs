@@ -79,6 +79,17 @@ const run = async () => {
   const cntA = await poll(pa, H.panelCount);
   ok("panel count >= 2 on A", (cntA ?? 0) >= 2, `count=${cntA}`);
 
+  // Low-latency tracking: B sweeps; A should reflect several distinct positions
+  // within a couple seconds (poll cadence ~200ms).
+  const seen = new Set();
+  for (let i = 0; i < 8; i++) {
+    await pb.mouse.move(300 + i * 35, 300 + i * 12, { steps: 2 });
+    await pb.waitForTimeout(180);
+    const pos = await pa.evaluate((cid) => document.querySelector(`div[data-cid="${cid}"]`)?.style.transform ?? null, cidB);
+    if (pos) seen.add(pos);
+  }
+  ok("A tracks B's movement (low latency)", seen.size >= 4, `${seen.size} distinct positions for B`);
+
   // Own cursor must NOT render to self (desktop: no self arrow/name of own name).
   const ownNameA = await pa.evaluate(() => {
     const ADJ = ["Swift","Calm","Bold","Bright","Brave","Clever","Cosmic","Fuzzy","Gentle","Jolly","Lucky","Mellow","Nimble","Quiet","Rapid","Sly","Sunny","Witty","Zen","Electric"];
@@ -112,7 +123,7 @@ const run = async () => {
   // Follow: B follows A specifically (its panel row, by exact client id — names
   // can collide), then A navigates.
   const followClicked = await pb.evaluate((cid) => {
-    const row = document.querySelector(`div[data-cid="${cid}"]`);
+    const row = [...document.querySelectorAll(`div[data-cid="${cid}"]`)].find((d) => d.querySelector('button[title="Follow"]'));
     const btn = row?.querySelector('button[title="Follow"]');
     if (btn) { btn.click(); return true; }
     return false;
