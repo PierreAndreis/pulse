@@ -25,49 +25,20 @@ use tower_http::cors::CorsLayer;
 
 use uuid::Uuid;
 
-use pulse_core::{ChangeSet, Lsn, ReadSet, TableId};
-use pulse_jsruntime::{Worker, WorkerConfig, WorkerError};
-use pulse_reactor::{InMemoryReactor, InterestSink, ReExecutor, Reactor, Subscription};
+use pulse_core::{ReadSet, TableId};
+use pulse_engine::{
+    Coordinator, ExecError, ExecOutcome, Executor, InterestRegistry, Invalidation, Publisher,
+};
+use pulse_jsruntime::{Worker, WorkerConfig};
+use pulse_reactor::{InMemoryReactor, InterestSink, ReExecutor, Reactor};
 
+/// The thin axum surface: every handler deserializes and delegates to the
+/// [`Coordinator`], which owns the request and cross-node orchestration. `node_id`
+/// and `broadcast` are kept only for the `/metrics` display.
 struct AppState {
-    worker: Arc<Worker>,
-    reactor: Arc<dyn Reactor>,
-    /// OLTP pool, used to publish change-sets to the cross-node bus.
-    pool: pulse_sql::PgPool,
-    /// This node's id — bus messages it originates are skipped on receipt.
+    coord: Arc<Coordinator>,
     node_id: String,
-    /// Latest sampled WAL position, refreshed by a background task. Mutations stamp
-    /// their change-set's commit watermark from this instead of querying the WAL on
-    /// every write — WAL only advances, so the watermark stays monotonic.
-    wal_lsn: Arc<std::sync::atomic::AtomicU64>,
-    /// Force global broadcast instead of interest routing (PULSE_BUS_BROADCAST) —
-    /// the benchmark baseline and a routing kill-switch.
     broadcast: bool,
-    /// Chunk oversized change-sets into precise messages instead of degrading to a
-    /// coarse resync (PULSE_BUS_CHUNK; default on).
-    chunk: bool,
-    /// Interest freshness window (PULSE_INTEREST_TTL_SECS) used for routing.
-    ttl_secs: i64,
-    /// Cross-node bus metrics (events + latency decomposition), exposed at `/metrics`.
-    metrics: Arc<BusMetrics>,
-}
-
-/// Counters for the cross-node "network layer": how many bus events arrived, and a
-/// latency decomposition — commit→deliver (bus propagation) vs deliver→applied
-/// (remote re-exec). Sums in µs; the benchmark divides by the counts for averages.
-#[derive(Default)]
-struct BusMetrics {
-    /// All bus events received (the network-layer work the fan-out bench counts).
-    events: std::sync::atomic::AtomicU64,
-    /// Concrete `Changes` events (those carrying a publish timestamp → a lag sample).
-    changes: std::sync::atomic::AtomicU64,
-    /// Σ commit→deliver propagation latency over `changes` events (µs).
-    lag_us_sum: std::sync::atomic::AtomicU64,
-    /// Σ deliver→applied (match + re-exec + push) duration over all events (µs).
-    apply_us_sum: std::sync::atomic::AtomicU64,
-    /// Coarse resync events received (ResyncTables/Resync) — a change-set that blew
-    /// past the NOTIFY payload cap and degraded to table-/global-scoped re-eval.
-    resyncs: std::sync::atomic::AtomicU64,
 }
 
 /// Microseconds since the Unix epoch (wall clock), for same-host bus-latency math.
@@ -78,7 +49,8 @@ fn now_us() -> i64 {
         .unwrap_or(0)
 }
 
-/// Re-executes procedures for the reactor, over the JS-runtime worker.
+/// Adapts the JS-runtime worker to the reactor's `ReExecutor` (value + read-set;
+/// the write-set is dropped — re-execution is reads only).
 struct WorkerReExecutor {
     worker: Arc<Worker>,
 }
@@ -99,20 +71,98 @@ impl ReExecutor for WorkerReExecutor {
     }
 }
 
-/// Registers this node's table interest on the change bus when the reactor begins
-/// watching a new table — so a publisher routes the table's changes to this node.
-struct BusInterestSink {
-    pool: pulse_sql::PgPool,
-    node_id: String,
+/// Adapts the worker to the coordinator's `Executor` (value + read-set + write-set,
+/// plus the existence check that drives the NOT_FOUND pre-check).
+struct WorkerExecutor {
+    worker: Arc<Worker>,
 }
 
 #[async_trait]
-impl InterestSink for BusInterestSink {
-    async fn on_tables_added(&self, tables: Vec<TableId>) {
-        let names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
-        if let Err(e) = pulse_cdc::register_interest(&self.pool, &self.node_id, &names).await {
+impl Executor for WorkerExecutor {
+    fn contains(&self, path: &[String]) -> bool {
+        self.worker.find(path).is_some()
+    }
+    async fn execute(
+        &self,
+        path: Vec<String>,
+        input: Value,
+        headers: HashMap<String, String>,
+        mutation_id: Option<String>,
+    ) -> Result<ExecOutcome, ExecError> {
+        self.worker
+            .execute(path, input, headers, mutation_id)
+            .await
+            .map(|res| ExecOutcome {
+                value: res.value,
+                read_set: res.read_set,
+                changes: res.changes,
+            })
+            .map_err(|e| ExecError {
+                code: e.code,
+                data: e.data,
+                message: e.message,
+            })
+    }
+}
+
+/// Publishes committed change-sets to other nodes over the routed change bus —
+/// the coordinator's `Publisher`. Best-effort: a failed publish is logged, not
+/// surfaced (local delivery already happened; resync recovers a missed message).
+struct BusPublisher {
+    pool: pulse_sql::PgPool,
+    node_id: String,
+    opts: pulse_cdc::PublishOpts,
+}
+
+#[async_trait]
+impl Publisher for BusPublisher {
+    async fn publish(&self, change_set: &pulse_core::ChangeSet) {
+        match self.pool.acquire().await {
+            Ok(mut conn) => {
+                if let Err(e) =
+                    pulse_cdc::publish_on(&mut conn, &self.node_id, change_set, self.opts).await
+                {
+                    tracing::warn!("change bus publish failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("change bus publish: pool acquire failed: {e}"),
+        }
+    }
+}
+
+/// This node's interest on the change bus, satisfying two seams over one adapter:
+/// the reactor's `InterestSink` (register the instant a table is first watched) and
+/// the coordinator's `InterestRegistry` (heartbeat refresh + prune dead nodes).
+struct BusInterest {
+    pool: pulse_sql::PgPool,
+    node_id: String,
+    ttl_secs: i64,
+}
+
+impl BusInterest {
+    async fn register(&self, tables: &[String]) {
+        if let Err(e) = pulse_cdc::register_interest(&self.pool, &self.node_id, tables).await {
             tracing::warn!("interest register failed: {e}");
         }
+    }
+}
+
+#[async_trait]
+impl InterestSink for BusInterest {
+    async fn on_tables_added(&self, tables: Vec<TableId>) {
+        let names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
+        self.register(&names).await;
+    }
+}
+
+#[async_trait]
+impl InterestRegistry for BusInterest {
+    async fn refresh(&self, tables: Vec<TableId>) {
+        let names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
+        self.register(&names).await;
+    }
+    async fn prune(&self) {
+        let _ = pulse_cdc::prune_interest(&self.pool, self.ttl_secs).await;
     }
 }
 
@@ -157,13 +207,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Cross-node bus tuning knobs (great defaults; override for your deployment).
     let interest_ttl_secs = num_env("PULSE_INTEREST_TTL_SECS", 30) as i64;
-    let mut heartbeat_ms = num_env("PULSE_HEARTBEAT_MS", 10_000);
+    let configured_heartbeat = num_env("PULSE_HEARTBEAT_MS", 10_000);
     // The heartbeat must refresh interest well within the TTL, or a live node's
     // interest lapses and it silently misses invalidations — clamp to TTL/3.
-    let max_heartbeat = (interest_ttl_secs.max(1) as u64) * 1000 / 3;
-    if heartbeat_ms > max_heartbeat {
-        tracing::warn!("PULSE_HEARTBEAT_MS {heartbeat_ms} > ttl/3; clamping to {max_heartbeat}");
-        heartbeat_ms = max_heartbeat.max(1);
+    let heartbeat_ms = pulse_engine::clamp_heartbeat(interest_ttl_secs, configured_heartbeat);
+    if heartbeat_ms != configured_heartbeat {
+        tracing::warn!(
+            "PULSE_HEARTBEAT_MS {configured_heartbeat} > ttl/3; clamping to {heartbeat_ms}"
+        );
     }
     let wal_sample_ms = num_env("PULSE_WAL_SAMPLE_MS", 100).max(1);
     let sse_buffer = num_env("PULSE_SSE_BUFFER", pulse_reactor::DEFAULT_SSE_BUFFER as u64) as usize;
@@ -222,13 +273,19 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = pulse_cdc::ensure_interest_table(&pool).await {
         tracing::error!("failed to ensure interest table: {e}");
     }
-    let interest_sink = Arc::new(BusInterestSink {
+    let broadcast = env_or("PULSE_BUS_BROADCAST", "0") == "1";
+    let chunk = env_or("PULSE_BUS_CHUNK", "1") == "1";
+
+    // One adapter satisfies both interest seams: the reactor's `InterestSink`
+    // (register on first watch) and the coordinator's `InterestRegistry` (heartbeat).
+    let interest = Arc::new(BusInterest {
         pool: pool.clone(),
         node_id: node_id.clone(),
+        ttl_secs: interest_ttl_secs,
     });
     let reactor: Arc<dyn Reactor> = Arc::new(
         InMemoryReactor::new(reexec)
-            .with_interest(interest_sink)
+            .with_interest(interest.clone())
             .with_sse_buffer(sse_buffer),
     );
 
@@ -252,63 +309,61 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // The coordinator owns the request + cross-node orchestration over four seams:
+    // the worker (Executor), the reactor, the bus publisher, and the interest registry.
+    let executor = Arc::new(WorkerExecutor {
+        worker: worker.clone(),
+    });
+    let publisher = Arc::new(BusPublisher {
+        pool: pool.clone(),
+        node_id: node_id.clone(),
+        opts: pulse_cdc::PublishOpts {
+            broadcast,
+            chunk,
+            ttl_secs: interest_ttl_secs,
+        },
+    });
+    let coord = Arc::new(Coordinator::new(
+        reactor.clone(),
+        executor,
+        publisher,
+        interest,
+        wal_lsn.clone(),
+    ));
+
     // Heartbeat: keep this node's interest rows fresh and prune dead nodes'. The
     // interval must stay well under INTEREST_TTL_SECS so interest never lapses.
     {
-        let pool = pool.clone();
-        let node_id = node_id.clone();
-        let reactor = reactor.clone();
+        let coord = coord.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(heartbeat_ms));
             loop {
                 tick.tick().await;
-                let tables: Vec<String> = reactor
-                    .interest_tables()
-                    .await
-                    .into_iter()
-                    .map(|t| t.0)
-                    .collect();
-                let _ = pulse_cdc::register_interest(&pool, &node_id, &tables).await;
-                let _ = pulse_cdc::prune_interest(&pool, interest_ttl_secs).await;
+                coord.on_heartbeat().await;
             }
         });
     }
 
-    let broadcast = env_or("PULSE_BUS_BROADCAST", "0") == "1";
-    let chunk = env_or("PULSE_BUS_CHUNK", "1") == "1";
-    let metrics = Arc::new(BusMetrics::default());
+    // Cross-node bus listener: translate each wire event into a neutral
+    // `Invalidation` (computing the commit→deliver lag at the edge, where the wall
+    // clock lives) and hand it to the coordinator, which applies + accounts for it.
     match pulse_cdc::start_listener(&database_url, node_id.clone()).await {
         Ok(mut rx) => {
-            let reactor = reactor.clone();
-            let metrics = metrics.clone();
+            let coord = coord.clone();
             tokio::spawn(async move {
-                use std::sync::atomic::Ordering::Relaxed;
                 while let Some(event) = rx.recv().await {
-                    // Each event crossed the network to this node — the unit of
-                    // cross-node "network layer" work. Decompose its latency:
-                    // commit→deliver (bus propagation) and deliver→applied (re-exec).
-                    metrics.events.fetch_add(1, Relaxed);
-                    let started = std::time::Instant::now();
-                    match event {
-                        pulse_cdc::BusEvent::Changes { cs, origin_us } => {
-                            let lag = (now_us() - origin_us).max(0) as u64;
-                            metrics.lag_us_sum.fetch_add(lag, Relaxed);
-                            metrics.changes.fetch_add(1, Relaxed);
-                            reactor.apply_change_set(cs).await;
-                        }
-                        pulse_cdc::BusEvent::ResyncTables(tables) => {
-                            metrics.resyncs.fetch_add(1, Relaxed);
-                            let ts = tables.into_iter().map(TableId::new).collect();
-                            reactor.invalidate_tables(ts).await;
-                        }
-                        pulse_cdc::BusEvent::Resync => {
-                            metrics.resyncs.fetch_add(1, Relaxed);
-                            reactor.invalidate_all().await;
-                        }
-                    }
-                    metrics
-                        .apply_us_sum
-                        .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                    let (inv, lag) = match event {
+                        pulse_cdc::BusEvent::Changes { cs, origin_us } => (
+                            Invalidation::Changes(cs),
+                            Some((now_us() - origin_us).max(0) as u64),
+                        ),
+                        pulse_cdc::BusEvent::ResyncTables(tables) => (
+                            Invalidation::Tables(tables.into_iter().map(TableId::new).collect()),
+                            None,
+                        ),
+                        pulse_cdc::BusEvent::Resync => (Invalidation::All, None),
+                    };
+                    coord.apply_invalidation(inv, lag).await;
                 }
             });
             tracing::info!("change bus listener started (node {node_id}, broadcast={broadcast})");
@@ -317,15 +372,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(AppState {
-        worker,
-        reactor,
-        pool: pool.clone(),
+        coord,
         node_id,
-        wal_lsn,
         broadcast,
-        chunk,
-        ttl_secs: interest_ttl_secs,
-        metrics,
     });
 
     let app = Router::new()
@@ -355,7 +404,7 @@ async fn health() -> &'static str {
 /// propagation), `applyMs` = deliver→applied (match + re-exec + push).
 async fn node_metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
     use std::sync::atomic::Ordering::Relaxed;
-    let m = &state.metrics;
+    let m = state.coord.metrics();
     let events = m.events.load(Relaxed);
     let changes = m.changes.load(Relaxed);
     let avg_ms = |sum: u64, n: u64| {
@@ -401,7 +450,7 @@ fn status_for(code: &str) -> StatusCode {
     }
 }
 
-fn error_body(err: &WorkerError) -> Value {
+fn error_body(err: &ExecError) -> Value {
     json!({ "error": { "code": err.code, "data": err.data, "message": err.message } })
 }
 
@@ -421,18 +470,9 @@ async fn rpc(
     headers: HeaderMap,
     Json(req): Json<RpcRequest>,
 ) -> (StatusCode, Json<Value>) {
-    if state.worker.find(&req.path).is_none() {
-        let err = WorkerError {
-            code: "NOT_FOUND".to_string(),
-            data: Value::Null,
-            message: Some(format!("no procedure at `{}`", req.path.join("."))),
-        };
-        return (StatusCode::NOT_FOUND, Json(error_body(&err)));
-    }
-
     match state
-        .worker
-        .execute(
+        .coord
+        .handle_rpc(
             req.path,
             req.input,
             collect_headers(&headers),
@@ -440,48 +480,16 @@ async fn rpc(
         )
         .await
     {
-        Ok(res) => {
-            if !res.changes.is_empty() {
-                // Propagate off the RPC's critical path: capture the commit LSN
-                // (after the tx already committed, so it never lengthens the
-                // SERIALIZABLE transaction), then apply locally and publish to the
-                // bus. The LSN is a monotonic watermark, so a post-commit read of
-                // the WAL position is sufficient.
-                // Stamp the watermark from the sampled WAL position — no per-write
-                // WAL round-trip. Local apply and the cross-node publish then run
-                // off the RPC's critical path.
-                let commit_lsn = Lsn(state.wal_lsn.load(std::sync::atomic::Ordering::Relaxed));
-                let reactor = state.reactor.clone();
-                let pool = state.pool.clone();
-                let node_id = state.node_id.clone();
-                let opts = pulse_cdc::PublishOpts {
-                    broadcast: state.broadcast,
-                    chunk: state.chunk,
-                    ttl_secs: state.ttl_secs,
-                };
-                let change_set = ChangeSet {
-                    commit_lsn,
-                    changes: res.changes,
-                };
-                tokio::spawn(async move {
-                    // Local apply (this node's subscribers) in parallel with the
-                    // routed cross-node publish; the latter needs one pooled conn.
-                    let local = {
-                        let reactor = reactor.clone();
-                        let cs = change_set.clone();
-                        tokio::spawn(async move { reactor.apply_change_set(cs).await })
-                    };
-                    if let Ok(mut conn) = pool.acquire().await {
-                        if let Err(e) =
-                            pulse_cdc::publish_on(&mut conn, &node_id, &change_set, opts).await
-                        {
-                            tracing::warn!("change bus publish failed: {e}");
-                        }
-                    }
-                    let _ = local.await;
-                });
+        Ok(ok) => {
+            // A mutation's change-set propagates off the RPC's critical path: local
+            // apply in parallel with the routed cross-node publish. Spawning here
+            // (a latency concern) is the handler's job; the orchestration is the
+            // coordinator's.
+            if let Some(change_set) = ok.propagate {
+                let coord = state.coord.clone();
+                tokio::spawn(async move { coord.propagate(change_set).await });
             }
-            (StatusCode::OK, Json(json!({ "result": res.value })))
+            (StatusCode::OK, Json(json!({ "result": ok.value })))
         }
         Err(err) => (status_for(&err.code), Json(error_body(&err))),
     }
@@ -497,7 +505,7 @@ async fn sync(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SyncQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.reactor.register_client(q.client_id).await;
+    let rx = state.coord.register_client(q.client_id).await;
     let stream = ReceiverStream::new(rx)
         .map(|push| Ok(Event::default().id(push.id.to_string()).data(push.body)));
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -518,41 +526,18 @@ async fn subscribe(
     headers: HeaderMap,
     Json(req): Json<SubscribeReq>,
 ) -> (StatusCode, Json<Value>) {
-    let hdrs = collect_headers(&headers);
     match state
-        .worker
-        .execute(req.path.clone(), req.input.clone(), hdrs.clone(), None)
+        .coord
+        .handle_subscribe(
+            req.client_id,
+            req.sub,
+            req.path,
+            req.input,
+            collect_headers(&headers),
+        )
         .await
     {
-        Ok(res) => {
-            state
-                .reactor
-                .add_subscription(Subscription {
-                    client_id: req.client_id.clone(),
-                    sub: req.sub.clone(),
-                    path: req.path,
-                    input: req.input,
-                    headers: hdrs,
-                    read_set: res.read_set,
-                    last: Some(res.value.clone()),
-                    last_lsn: Lsn::ZERO,
-                })
-                .await;
-            // Initial push reflects no committed change yet → LSN zero.
-            state
-                .reactor
-                .push(&req.client_id, &req.sub, &res.value, Lsn::ZERO)
-                .await;
-            // Catch-up: interest is now registered (add_subscription announced it),
-            // so re-evaluate once to pick up any remote write that landed between the
-            // initial query snapshot and interest registration. A dedup'd no-op when
-            // nothing was missed (the common case).
-            state
-                .reactor
-                .refresh_subscription(&req.client_id, &req.sub)
-                .await;
-            (StatusCode::OK, Json(json!({ "result": "ok" })))
-        }
+        Ok(()) => (StatusCode::OK, Json(json!({ "result": "ok" }))),
         Err(err) => (status_for(&err.code), Json(error_body(&err))),
     }
 }
@@ -569,8 +554,8 @@ async fn unsubscribe(
     Json(req): Json<UnsubscribeReq>,
 ) -> StatusCode {
     state
-        .reactor
-        .remove_subscription(&req.client_id, &req.sub)
+        .coord
+        .handle_unsubscribe(&req.client_id, &req.sub)
         .await;
     StatusCode::OK
 }
@@ -607,7 +592,7 @@ mod tests {
 
     #[test]
     fn error_body_shape() {
-        let err = WorkerError {
+        let err = ExecError {
             code: "NOT_FOUND".to_string(),
             data: json!({ "k": "v", "n": 1 }),
             message: Some("nope".to_string()),
@@ -625,7 +610,7 @@ mod tests {
         );
 
         // message: None serializes to JSON null; arbitrary data passes through.
-        let err = WorkerError {
+        let err = ExecError {
             code: "BAD_REQUEST".to_string(),
             data: json!([1, 2, 3]),
             message: None,

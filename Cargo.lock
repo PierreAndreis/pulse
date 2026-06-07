@@ -1792,6 +1792,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulse-engine"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "pulse-core",
+ "pulse-reactor",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pulse-jsruntime"
 version = "0.0.0"
 dependencies = [
@@ -1827,6 +1839,7 @@ dependencies = [
  "futures",
  "pulse-cdc",
  "pulse-core",
+ "pulse-engine",
  "pulse-jsruntime",
  "pulse-reactor",
  "pulse-sql",

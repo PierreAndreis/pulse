@@ -8,6 +8,7 @@ members = [
     "crates/pulse-reactor",
     "crates/pulse-sse",
     "crates/pulse-jsruntime",
+    "crates/pulse-engine",
     "crates/pulse-server",
 ]
 
@@ -27,6 +28,7 @@ pulse-cdc = { path = "crates/pulse-cdc" }
 pulse-reactor = { path = "crates/pulse-reactor" }
 pulse-sse = { path = "crates/pulse-sse" }
 pulse-jsruntime = { path = "crates/pulse-jsruntime" }
+pulse-engine = { path = "crates/pulse-engine" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
