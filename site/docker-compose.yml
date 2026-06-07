@@ -1,0 +1,16 @@
+# Local Postgres for `pulse dev`. Production uses Veloz-managed Postgres.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: pulse
+      POSTGRES_DB: pulse
+    ports:
+      - "54330:5432"
+    command: ["postgres", "-c", "wal_level=logical"]
+    volumes:
+      - pulse_site_pg:/var/lib/postgresql/data
+
+volumes:
+  pulse_site_pg:

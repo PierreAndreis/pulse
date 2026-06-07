@@ -10,44 +10,12 @@
     />
     <meta property="og:title" content="Pulse" />
     <meta property="og:description" content="Reativo e offline-first. Sobre o seu Postgres." />
-    <meta property="og:image" content="./assets/og.png" />
-    <link rel="icon" href="./assets/pulse-logo.png" />
-    <link rel="stylesheet" href="./styles.css" />
+    <meta property="og:image" content="/assets/og.png" />
+    <link rel="icon" href="/assets/pulse-logo.png" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="wrap">
-      <div class="title">
-        <h1>Pulse</h1>
-        <span class="tag">[alpha]</span>
-      </div>
-      <p class="tagline">Reativo e offline-first. Sobre o seu Postgres.</p>
-
-      <div class="cmd">
-        <code><span class="prompt">$ </span><span id="cmd-text">npx @onveloz/pulse new</span></code>
-        <button class="copy" id="copy" aria-label="Copiar">Copiar</button>
-      </div>
-
-      <div class="links">
-        <a href="./docs.html">Docs</a>
-        <a href="https://github.com/PierreAndreis/pulse">GitHub</a>
-      </div>
-    </main>
-
-    <script>
-      const btn = document.getElementById("copy");
-      btn.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(document.getElementById("cmd-text").textContent);
-          btn.textContent = "Copiado";
-          btn.classList.add("done");
-          setTimeout(() => {
-            btn.textContent = "Copiar";
-            btn.classList.remove("done");
-          }, 1600);
-        } catch {
-          /* clipboard indisponível */
-        }
-      });
-    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -1,0 +1,40 @@
+# Pulse engine service: the Rust reactor binary + a Bun worker that loads the
+# typed app (schema + handlers). The frontend is a separate static service —
+# this image is only the backend the browser's SSE/RPC talk to.
+# Trixie (Debian 13) for glibc ≥ 2.39, which the prebuilt engine binary needs.
+FROM node:22-trixie-slim
+
+WORKDIR /app
+
+# bun runs the worker (resolves the app's `.js`→`.ts` imports); psql applies the
+# schema on boot; ca-certificates lets the engine downloader reach GitHub.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl unzip postgresql-client ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && curl -fsSL https://bun.sh/install | bash \
+  && ln -s /root/.bun/bin/bun /usr/local/bin/bun
+
+# Cache the engine binary in-image at a stable path so build and runtime agree.
+ENV PULSE_ENGINE_CACHE=/app/.engine
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Pre-download the verified linux engine binary at build time (fails the build if
+# no binary matches this platform, rather than discovering it at boot).
+RUN node -e "import('@onveloz/pulse-engine').then(m=>m.ensureEngine()).then(p=>{if(!p)throw new Error('no engine binary for this platform');console.log('engine cached at',p)})"
+
+COPY app ./app
+
+# The data model the worker imports, and the DDL the entrypoint applies.
+RUN npx pulse gen app/schema.ts && npx pulse migrate app/schema.ts --out /app/schema.sql
+
+ENV PULSE_WORKER_BIN=bun \
+    PULSE_APP=/app/app/app.ts \
+    PULSE_WORKER_SCRIPT=/app/node_modules/@onveloz/pulse-runtime-node/dist/worker.js
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 8787
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -14,12 +14,40 @@
       "branch": "main",
       "build": {
         "method": "nixpacks",
-        "outputDir": "."
+        "framework": "vite",
+        "command": "npm run build",
+        "outputDir": "dist"
+      },
+      "env": {
+        "VITE_PULSE_ENGINE_URL": {
+          "description": "Public URL of the Pulse engine service (SSE + RPC). Inlined at build time.",
+          "required": true,
+          "example": "https://pulse-engine.runveloz.com"
+        }
+      }
+    },
+    "engine": {
+      "name": "pulse-engine",
+      "type": "web",
+      "root": ".",
+      "branch": "main",
+      "build": {
+        "method": "dockerfile",
+        "dockerfile": "Dockerfile.engine"
       },
       "runtime": {
-        "port": 3000
-      }
+        "port": 8787
+      },
+      "env": {
+        "DATABASE_URL": {
+          "description": "Postgres connection string for the Pulse engine (pulse-db).",
+          "required": true,
+          "example": "postgresql://user:pass@host:5432/db"
+        }
+      },
+      "id": "svc_bdfdaO72mOG_"
     }
   },
-  "created": "2026-06-02T04:39:54.592Z"
+  "created": "2026-06-02T04:39:54.592Z",
+  "updated": "2026-06-07T03:50:00.059Z"
 }
