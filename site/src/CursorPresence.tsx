@@ -10,8 +10,7 @@ type Cursor = Doc<"cursors">;
 const REPORT_MS = 60; // ~16 Hz publish of my own position
 const REMOTE_GLIDE_MS = 90; // CSS interpolation between (reactive) updates
 const SUB_DELAY_MS = 300; // subscribe shortly after opening /sync (see note)
-const WATCHDOG_MS = 1500; // cadence of the SSE-liveness fallback check
-const STALE_MS = 2500; // no live frame for this long ⇒ poll once to converge
+const WATCHDOG_MS = 1500; // cadence of the SSE-down fallback poll
 const HEARTBEAT_MS = 4000; // republish even when idle so we stay present
 const SEL_REPORT_MS = 120; // selection changes are bursty; coalesce them
 const TRAIL_FADE_MS = 1500; // a drawn trail point fully fades after this
@@ -276,9 +275,13 @@ export function CursorPresence() {
     // deadlocks until Axum's 15s keep-alive). Subscribing eagerly flushes headers
     // in ~1 frame and live pushes flow from then on. The one-shot seed paints the
     // first frame instantly; the watchdog poll only fires if the stream goes quiet.
-    let lastLive = 0;
+    // `sseHealthy` is true once a stream is open and delivering; it only flips
+    // false if the stream drops. An idle room (no peers moving) produces no data
+    // frames, but the stream is still healthy — so we must NOT poll just because
+    // no data arrived recently, or it looks like polling even when reactive.
+    let sseHealthy = false;
     const onLive = (rows: Cursor[]) => {
-      lastLive = Date.now();
+      sseHealthy = true;
       (window as unknown as { __pulseLiveFrames?: number }).__pulseLiveFrames =
         ((window as unknown as { __pulseLiveFrames?: number }).__pulseLiveFrames ?? 0) + 1;
       applyRows(rows);
@@ -324,6 +327,7 @@ export function CursorPresence() {
           /* dropped or aborted */
         } finally {
           if (subTimer) clearTimeout(subTimer);
+          sseHealthy = false; // stream ended → reconnect (and let the watchdog cover the gap)
         }
         if (!alive) break;
         await new Promise((r) => setTimeout(r, 1000)); // reconnect backoff
@@ -332,14 +336,15 @@ export function CursorPresence() {
     // Instant first paint; never clobber a live frame.
     void pulse.presence.list
       .call()
-      .then((rows) => alive && lastLive === 0 && applyRows(rows as Cursor[]))
+      .then((rows) => alive && !sseHealthy && applyRows(rows as Cursor[]))
       .catch(() => {});
-    // Fallback: if SSE goes quiet, converge via a one-shot poll.
+    // Fallback ONLY while SSE is down (not merely idle): converge via polling
+    // until the stream is healthy again.
     const watchdog = setInterval(() => {
-      if (!alive || Date.now() - lastLive < STALE_MS) return;
+      if (!alive || sseHealthy) return;
       void pulse.presence.list
         .call()
-        .then((rows) => alive && applyRows(rows as Cursor[]))
+        .then((rows) => alive && !sseHealthy && applyRows(rows as Cursor[]))
         .catch(() => {});
     }, WATCHDOG_MS);
 

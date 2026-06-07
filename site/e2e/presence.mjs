@@ -111,9 +111,10 @@ const run = async () => {
   await pa.mouse.move(280, 260, { steps: 2 }); // ensure ownPos for the bubble anchor
   await pa.waitForTimeout(150);
   await pa.keyboard.press("/");
-  await pa.waitForTimeout(350); // let the input mount + focus
-  await pa.keyboard.type("hello-from-A", { delay: 30 });
-  await pa.waitForTimeout(300);
+  await pa.waitForSelector('input[placeholder^="Say"]', { timeout: 3000 });
+  await pa.click('input[placeholder^="Say"]'); // guarantee focus under re-render load
+  await pa.fill('input[placeholder^="Say"]', "hello-from-A"); // fires React onChange → say()
+  await pa.waitForTimeout(200);
   await pa.keyboard.press("Enter");
   await pa.waitForTimeout(300);
   const bSeesChat = await poll(pb, () => [...document.querySelectorAll("span")].some((s) => (s.textContent || "").includes("hello-from-A")));
