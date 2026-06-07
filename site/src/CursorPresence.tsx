@@ -7,7 +7,9 @@ import { navigate } from "./router.js";
 
 type Cursor = Doc<"cursors">;
 
-const REPORT_MS = 45; // ~22 Hz — fast enough for smooth trails, still throttled
+const REPORT_MS = 60; // ~16 Hz publish of my own position
+const POLL_MS = 200; // read everyone ~5 Hz (see note in the effect re: SSE)
+const REMOTE_GLIDE_MS = 220; // CSS interpolation between polled positions
 const HEARTBEAT_MS = 4000; // republish even when idle so we stay present
 const SEL_REPORT_MS = 120; // selection changes are bursty; coalesce them
 const TRAIL_FADE_MS = 1500; // a drawn trail point fully fades after this
@@ -65,7 +67,9 @@ const EMOTE_MS = 1700; // how long a floating reaction lives
 /** A friendly, deterministic name from the id (no extra data to broadcast). */
 function nameFor(id: string): string {
   const h = hash(id);
-  return `${ADJ[h % ADJ.length]} ${ANIMAL[(h >> 5) % ANIMAL.length]}`;
+  // `>>> 5` (unsigned) — a signed `>> 5` goes negative for high hashes and
+  // indexes ANIMAL out of bounds → "undefined".
+  return `${ADJ[h % ADJ.length]} ${ANIMAL[(h >>> 5) % ANIMAL.length]}`;
 }
 
 /** ISO-3166 alpha-2 → flag emoji (regional indicators). "" → globe. */
@@ -262,11 +266,20 @@ export function CursorPresence() {
     };
 
     publish(); // establish presence immediately (also on route-change remounts)
-    void pulse.presence.list
-      .call()
-      .then((rows) => alive && applyRows(rows as Cursor[]))
-      .catch(() => {});
-    const unsub = pulse.presence.list.subscribe({}, (rows) => applyRows(rows as Cursor[]));
+
+    // Presence is delivered by POLLING, not the reactive SSE subscription: the
+    // engine sits behind a proxy that buffers `text/event-stream`, so server
+    // pushes don't reach the browser in real time (verified — the stream opens
+    // but never flushes). One-shot RPC works fine through the proxy, so we read
+    // the full list on a short interval; remote cursors CSS-glide between samples
+    // so movement still looks smooth.
+    const pull = () =>
+      void pulse.presence.list
+        .call()
+        .then((rows) => alive && applyRows(rows as Cursor[]))
+        .catch(() => {});
+    pull();
+    const pollTimer = setInterval(pull, POLL_MS);
 
     function applyRows(rows: Cursor[]) {
       setCursors(rows);
@@ -385,7 +398,7 @@ export function CursorPresence() {
 
     return () => {
       alive = false;
-      unsub();
+      clearInterval(pollTimer);
       clearInterval(publishTimer);
       cancelAnimationFrame(raf);
       document.removeEventListener("selectionchange", onSelect);
@@ -528,7 +541,7 @@ export function CursorPresence() {
             left: 0,
             top: 0,
             transform: `translate(${c.x * 100}vw, ${c.y * 100}vh)`,
-            transition: "transform 90ms linear",
+            transition: `transform ${REMOTE_GLIDE_MS}ms linear`,
             willChange: "transform",
             pointerEvents: "auto",
             cursor: "pointer",
@@ -779,6 +792,7 @@ export function CursorPresence() {
           return (
             <div
               key={c.clientId}
+              data-cid={c.clientId}
               style={{
                 display: "flex",
                 alignItems: "center",

@@ -9,7 +9,8 @@
     "gen": "pulse gen app/schema.ts",
     "migrate": "pulse migrate app/schema.ts --out schema.sql",
     "db": "docker compose up -d",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "e2e": "node e2e/presence.mjs"
   },
   "dependencies": {
     "@onveloz/pulse-client": "^0.1.5",
@@ -29,6 +30,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^6.0.2",
+    "playwright": "^1.60.0",
     "typescript": "^5.9.3",
     "vite": "^8.0.15"
   }
