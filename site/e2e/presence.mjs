@@ -90,6 +90,13 @@ const run = async () => {
   }
   ok("A tracks B's movement (low latency)", seen.size >= 4, `${seen.size} distinct positions for B`);
 
+  // Reactivity: updates arrive via the SSE subscription (not just the watchdog poll).
+  await pa.evaluate(() => (window.__pulseLiveFrames = 0));
+  for (let i = 0; i < 8; i++) { await pb.mouse.move(320 + i * 25, 320 + i * 8, { steps: 2 }); await pb.waitForTimeout(120); }
+  await pa.waitForTimeout(300);
+  const liveFrames = await pa.evaluate(() => window.__pulseLiveFrames ?? 0);
+  ok("A receives live SSE frames (truly reactive)", liveFrames >= 4, `${liveFrames} live frames in ~1.3s`);
+
   // Own cursor must NOT render to self (desktop: no self arrow/name of own name).
   const ownNameA = await pa.evaluate(() => {
     const ADJ = ["Swift","Calm","Bold","Bright","Brave","Clever","Cosmic","Fuzzy","Gentle","Jolly","Lucky","Mellow","Nimble","Quiet","Rapid","Sly","Sunny","Witty","Zen","Electric"];

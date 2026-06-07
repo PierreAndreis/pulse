@@ -2,14 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { getStroke } from "perfect-freehand";
 import type { Doc } from "@onveloz/pulse-schema";
-import { pulse } from "./client.js";
+import { pulse, engineUrl } from "./client.js";
 import { navigate } from "./router.js";
 
 type Cursor = Doc<"cursors">;
 
 const REPORT_MS = 60; // ~16 Hz publish of my own position
-const POLL_MS = 200; // read everyone ~5 Hz (proxy buffers SSE; see effect note)
-const REMOTE_GLIDE_MS = 220; // CSS interpolation between polled positions
+const REMOTE_GLIDE_MS = 90; // CSS interpolation between (reactive) updates
+const SUB_DELAY_MS = 300; // subscribe shortly after opening /sync (see note)
+const WATCHDOG_MS = 1500; // cadence of the SSE-liveness fallback check
+const STALE_MS = 2500; // no live frame for this long ⇒ poll once to converge
 const HEARTBEAT_MS = 4000; // republish even when idle so we stay present
 const SEL_REPORT_MS = 120; // selection changes are bursty; coalesce them
 const TRAIL_FADE_MS = 1500; // a drawn trail point fully fades after this
@@ -267,19 +269,79 @@ export function CursorPresence() {
 
     publish(); // establish presence immediately (also on route-change remounts)
 
-    // Presence is delivered by POLLING the list. Ideally this would be the engine's
-    // reactive SSE subscription — and the engine streams correctly (verified with
-    // curl/node) — but Veloz's proxy buffers the browser's `/sync` response when the
-    // connection is busy, so live frames never reach the running app (both the SDK
-    // and a hand-rolled reader deadlock). Until that's fixed at the infra layer,
-    // a short poll + CSS glide on remote cursors keeps it smooth and reliable.
-    const pull = () =>
+    // Reactive by default, over the engine's SSE. The subtlety: the engine flushes
+    // the stream's headers only once it has something to send — and that first
+    // payload is the subscription's initial snapshot. So we must POST /subscribe
+    // WITHOUT awaiting the /sync fetch (the SDK awaits headers first, which
+    // deadlocks until Axum's 15s keep-alive). Subscribing eagerly flushes headers
+    // in ~1 frame and live pushes flow from then on. The one-shot seed paints the
+    // first frame instantly; the watchdog poll only fires if the stream goes quiet.
+    let lastLive = 0;
+    const onLive = (rows: Cursor[]) => {
+      lastLive = Date.now();
+      (window as unknown as { __pulseLiveFrames?: number }).__pulseLiveFrames =
+        ((window as unknown as { __pulseLiveFrames?: number }).__pulseLiveFrames ?? 0) + 1;
+      applyRows(rows);
+    };
+    const sseId = `sse_${me.current}`;
+    const ac = new AbortController();
+    const registerSub = () =>
+      fetch(`${engineUrl}/subscribe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientId: sseId, sub: "presence.list", path: ["presence", "list"], input: {} }),
+      }).catch(() => {});
+    void (async () => {
+      while (alive) {
+        let subTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const streamP = fetch(`${engineUrl}/sync?clientId=${sseId}`, { headers: { accept: "text/event-stream" }, signal: ac.signal });
+          subTimer = setTimeout(() => void registerSub(), SUB_DELAY_MS); // not gated on headers
+          const res = await streamP;
+          if (!res.ok || !res.body) throw new Error(`sse ${res.status}`);
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let buf = "";
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            let i;
+            while ((i = buf.indexOf("\n\n")) >= 0) {
+              const raw = buf.slice(0, i);
+              buf = buf.slice(i + 2);
+              const data = raw.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("");
+              if (!data) continue;
+              try {
+                const payload = JSON.parse(data) as { data?: Cursor[] };
+                if (alive && payload.data) onLive(payload.data);
+              } catch {
+                /* keep-alive / unparseable */
+              }
+            }
+          }
+        } catch {
+          /* dropped or aborted */
+        } finally {
+          if (subTimer) clearTimeout(subTimer);
+        }
+        if (!alive) break;
+        await new Promise((r) => setTimeout(r, 1000)); // reconnect backoff
+      }
+    })();
+    // Instant first paint; never clobber a live frame.
+    void pulse.presence.list
+      .call()
+      .then((rows) => alive && lastLive === 0 && applyRows(rows as Cursor[]))
+      .catch(() => {});
+    // Fallback: if SSE goes quiet, converge via a one-shot poll.
+    const watchdog = setInterval(() => {
+      if (!alive || Date.now() - lastLive < STALE_MS) return;
       void pulse.presence.list
         .call()
         .then((rows) => alive && applyRows(rows as Cursor[]))
         .catch(() => {});
-    pull();
-    const pollTimer = setInterval(pull, POLL_MS);
+    }, WATCHDOG_MS);
 
     function applyRows(rows: Cursor[]) {
       setCursors(rows);
@@ -398,7 +460,13 @@ export function CursorPresence() {
 
     return () => {
       alive = false;
-      clearInterval(pollTimer);
+      ac.abort();
+      void fetch(`${engineUrl}/unsubscribe`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clientId: sseId, sub: "presence.list" }),
+      }).catch(() => {});
+      clearInterval(watchdog);
       clearInterval(publishTimer);
       cancelAnimationFrame(raf);
       document.removeEventListener("selectionchange", onSelect);
