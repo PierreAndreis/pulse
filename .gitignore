@@ -13,6 +13,9 @@ build
 .next
 out
 
+# Coverage reports
+/coverage
+
 # Env / secrets
 .env
 .env.*
