@@ -50,6 +50,9 @@ puts the reactive programming model and end-to-end-typed DX on top of it:
   merge concurrent and offline edits instead of clobbering.
 - 📊 **Real SQL when you need it.** Heavy analytical queries run on an isolated
   pool; `ctx.sql` is the raw escape hatch for joins, CTEs, and window functions.
+- 📈 **Scales out.** Run many engine nodes on one Postgres; the change bus routes
+  each write only to the nodes interested in the tables it touched — O(1) per
+  write, not O(nodes). Tunable with [great defaults](docs/TUNING.md).
 
 ## Table of contents
 
@@ -64,8 +67,11 @@ puts the reactive programming model and end-to-end-typed DX on top of it:
 
 A write travels **node → Postgres → reactor → SSE**. The Rust engine owns the
 Postgres pools, lowers the document API to SQL, and captures each procedure's
-**read-set** and **write-set**; a committed write's change-set is matched against
-every live subscription's read-set, so only truly-affected queries re-run.
+**read-set** and **write-set**; a committed write's change-set is matched — via a
+table index plus per-row predicates — against only the subscriptions it could
+affect, so just those queries re-run. Across multiple engine nodes it scales out
+over a Postgres `LISTEN/NOTIFY` bus that routes each change **only to the nodes
+interested in the tables it touched**.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and
 [`docs/decisions/`](docs/decisions) for the architecture decision records.
