@@ -150,6 +150,9 @@ export function CursorPresence() {
   const color = useRef(colorFor(me.current));
   const country = useRef("");
   const trails = useRef(new Map<string, Pt[]>());
+  const ownPos = useRef<{ x: number; y: number } | null>(null);
+  // Touch devices have no hover pointer, so we draw the visitor's own cursor.
+  const coarse = useRef(window.matchMedia?.("(pointer: coarse)").matches ?? false);
 
   useEffect(() => {
     let alive = true;
@@ -194,6 +197,7 @@ export function CursorPresence() {
       const x = e.clientX / window.innerWidth;
       const y = e.clientY / window.innerHeight;
       pending = { x, y };
+      ownPos.current = { x, y };
       pushTrail(me.current, x, y, Date.now()); // own trail is immediate
     };
     const moveTimer = setInterval(() => {
@@ -355,6 +359,47 @@ export function CursorPresence() {
             </span>
           </div>
         ))}
+
+      {/* This visitor's own cursor — only on touch devices (no native pointer). */}
+      {coarse.current && ownPos.current && (
+        <svg
+          width="20"
+          height="22"
+          viewBox="0 0 20 22"
+          fill="none"
+          style={{
+            position: "fixed",
+            left: 0,
+            top: 0,
+            transform: `translate(${ownPos.current.x * 100}vw, ${ownPos.current.y * 100}vh)`,
+            display: "block",
+          }}
+        >
+          <path d="M1 1l6.5 18 2.7-7.3 7.3-2.7L1 1z" fill={color.current} stroke="rgba(0,0,0,0.4)" strokeWidth="1" />
+        </svg>
+      )}
+
+      {/* Live presence count. */}
+      <div
+        style={{
+          position: "fixed",
+          left: 16,
+          bottom: 14,
+          padding: "5px 11px",
+          borderRadius: 999,
+          background: "rgba(255,255,255,0.06)",
+          border: "1px solid rgba(255,255,255,0.12)",
+          color: "rgba(255,255,255,0.75)",
+          fontSize: 12,
+          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+        }}
+      >
+        <span style={{ width: 7, height: 7, borderRadius: 999, background: "#3ddc84", display: "inline-block" }} />
+        {cursors.filter((c) => c.clientId !== me.current).length + 1} here
+      </div>
     </div>
   );
 }
