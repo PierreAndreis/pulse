@@ -11,5 +11,10 @@ export default defineSchema({
     country: v.string(), // ISO-3166 alpha-2 from IP geo (e.g. "US"); "" if unknown
     color: v.string(), // hex, assigned per visitor
     updatedAt: v.number(), // epoch ms of the last move
+    // Shared text selection: absolute character offsets into the page's text
+    // (see CursorPresence). -1/-1 means "no selection". Offsets are layout-
+    // independent, so each viewer rebuilds the highlight rects for its own layout.
+    selStart: v.number(),
+    selEnd: v.number(),
   }),
 });

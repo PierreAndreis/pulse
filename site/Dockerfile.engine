@@ -27,7 +27,14 @@ RUN node -e "import('@onveloz/pulse-engine').then(m=>m.ensureEngine()).then(p=>{
 COPY app ./app
 
 # The data model the worker imports, and the DDL the entrypoint applies.
-RUN npx pulse gen app/schema.ts && npx pulse migrate app/schema.ts --out /app/schema.sql
+# Also derive a reset script (drop each table) from the generated DDL so a schema
+# change — e.g. a new column — takes effect on boot. Presence is ephemeral (rows
+# expire in seconds and clients re-report immediately), so recreating the tables
+# is safe and keeps the live schema in lockstep with the app.
+RUN npx pulse gen app/schema.ts \
+  && npx pulse migrate app/schema.ts --out /app/schema.sql \
+  && grep -oE 'create table if not exists [a-z_]+' /app/schema.sql \
+     | awk '{print "drop table if exists " $6 " cascade;"}' > /app/reset.sql
 
 ENV PULSE_WORKER_BIN=bun \
     PULSE_APP=/app/app/app.ts \

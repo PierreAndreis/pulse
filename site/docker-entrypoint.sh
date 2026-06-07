@@ -11,7 +11,9 @@ PULSE_SERVER_BIN="$(node -e "import('@onveloz/pulse-engine').then(m=>m.ensureEng
 export PULSE_SERVER_BIN
 [ -x "$PULSE_SERVER_BIN" ] || { echo "engine binary missing: '$PULSE_SERVER_BIN'" >&2; exit 1; }
 
-# Idempotent schema provisioning (CREATE TABLE IF NOT EXISTS …) before boot.
+# Reset + (re)create the ephemeral presence tables so the live schema always
+# matches the app (drop is safe — rows are short-lived and clients re-report).
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /app/reset.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /app/schema.sql
 
 exec "$PULSE_SERVER_BIN"

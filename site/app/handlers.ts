@@ -33,6 +33,8 @@ export const move = os.presence.move.handler(async ({ ctx, input }) => {
       country: input.country,
       color: input.color,
       updatedAt: now,
+      selStart: -1,
+      selEnd: -1,
     });
   }
   // Opportunistic GC: collect() reads the whole table, so drop long-stale rows
@@ -41,6 +43,21 @@ export const move = os.presence.move.handler(async ({ ctx, input }) => {
   for (const c of all) {
     if (c.clientId !== input.clientId && c.updatedAt < cutoff) await ctx.db.delete(c._id);
   }
+  return null;
+});
+
+export const select = os.presence.select.handler(async ({ ctx, input }) => {
+  const now = Date.now();
+  const all = await ctx.db.query("cursors").collect();
+  const mine = all.find((c) => c.clientId === input.clientId);
+  if (mine) {
+    await ctx.db.patch(mine._id, {
+      selStart: input.selStart,
+      selEnd: input.selEnd,
+      updatedAt: now,
+    });
+  }
+  // No row yet ⇒ the visitor hasn't moved; nothing to attach a selection to.
   return null;
 });
 

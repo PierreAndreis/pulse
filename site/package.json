@@ -17,6 +17,7 @@
     "@onveloz/pulse-react": "^0.1.5",
     "@onveloz/pulse-schema": "^0.1.5",
     "@onveloz/pulse-server": "^0.1.5",
+    "perfect-freehand": "^1.2.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

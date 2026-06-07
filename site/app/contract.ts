@@ -20,6 +20,17 @@ export const contract = {
         }),
       )
       .output(v.null()),
+    // Share this visitor's current text selection (character offsets; -1/-1 = none).
+    select: oc
+      .mutation()
+      .input(
+        v.object({
+          clientId: v.string(),
+          selStart: v.number(),
+          selEnd: v.number(),
+        }),
+      )
+      .output(v.null()),
     // Best-effort removal on tab close.
     leave: oc.mutation().input(v.object({ clientId: v.string() })).output(v.null()),
   },
