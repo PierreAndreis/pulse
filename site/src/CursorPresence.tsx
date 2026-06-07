@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { getStroke } from "perfect-freehand";
 import type { Doc } from "@onveloz/pulse-schema";
 import { pulse } from "./client.js";
@@ -12,6 +13,8 @@ const TRAIL_FADE_MS = 1500; // a drawn trail point fully fades after this
 const TRAIL_MAX = 80; // hard cap on points kept per cursor
 const TRAIL_SIZE = 14; // stroke thickness (px) at full pressure
 const FOLLOW_KEY = "pulse:follow"; // survives a follow-driven page navigation
+const JUMP_KEY = "pulse:jump"; // one-shot scroll target across a jump navigation
+const FOLLOW_EASE = 0.18; // per-frame lerp toward the followed scroll position
 
 const STROKE_OPTS = {
   size: TRAIL_SIZE,
@@ -35,11 +38,30 @@ function clientId(): string {
   return id;
 }
 
-/** Deterministic, readable color from the id. */
-function colorFor(id: string): string {
+function hash(id: string): number {
   let h = 0;
   for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return `hsl(${h % 360} 85% 62%)`;
+  return h;
+}
+
+/** Deterministic, readable color from the id. */
+function colorFor(id: string): string {
+  return `hsl(${hash(id) % 360} 85% 62%)`;
+}
+
+const ADJ = [
+  "Swift", "Calm", "Bold", "Bright", "Brave", "Clever", "Cosmic", "Fuzzy", "Gentle", "Jolly",
+  "Lucky", "Mellow", "Nimble", "Quiet", "Rapid", "Sly", "Sunny", "Witty", "Zen", "Electric",
+];
+const ANIMAL = [
+  "Otter", "Falcon", "Panda", "Fox", "Lynx", "Heron", "Koala", "Wolf", "Tapir", "Gecko",
+  "Moth", "Crane", "Bison", "Orca", "Raven", "Newt", "Quail", "Yak", "Ibis", "Seal",
+];
+
+/** A friendly, deterministic name from the id (no extra data to broadcast). */
+function nameFor(id: string): string {
+  const h = hash(id);
+  return `${ADJ[h % ADJ.length]} ${ANIMAL[(h >> 5) % ANIMAL.length]}`;
 }
 
 /** ISO-3166 alpha-2 → flag emoji (regional indicators). "" → globe. */
@@ -137,18 +159,36 @@ export function CursorPresence() {
   const coarse = useRef(window.matchMedia?.("(pointer: coarse)").matches ?? false);
   const followIdRef = useRef(followId);
   followIdRef.current = followId;
-  const programmatic = useRef(false);
+  const followScroll = useRef(0); // followed visitor's scroll fraction
+  const followActive = useRef(false); // following AND on the same page
+  const cursorsRef = useRef<Cursor[]>([]);
+  cursorsRef.current = cursors;
 
   function stopFollow() {
     sessionStorage.removeItem(FOLLOW_KEY);
+    followActive.current = false;
     setFollowId(null);
   }
 
-  // The visitor's own text selection uses their presence color (not browser blue).
+  // One-shot jump to a visitor: navigate to their page if needed, else smooth-scroll.
+  function jumpTo(id: string) {
+    const t = cursorsRef.current.find((c) => c.clientId === id);
+    if (!t) return;
+    if (t.channel && t.channel !== channel) {
+      sessionStorage.setItem(JUMP_KEY, String(t.scrollY));
+      window.location.href = t.channel;
+      return;
+    }
+    window.scrollTo({ top: t.scrollY * scrollMax(), behavior: "smooth" });
+  }
+
+  // Own selection uses the visitor's presence color; also defines the follow-border pulse.
   useEffect(() => {
     const style = document.createElement("style");
-    const tint = color.current.replace(")", " / 0.4)"); // hsl(... / 0.4)
-    style.textContent = `::selection{background:${tint};} ::-moz-selection{background:${tint};}`;
+    const tint = color.current.replace(")", " / 0.4)");
+    style.textContent =
+      `::selection{background:${tint};} ::-moz-selection{background:${tint};}` +
+      `@keyframes pulseFollowBorder{0%,100%{opacity:.45}50%{opacity:.9}}`;
     document.head.appendChild(style);
     return () => style.remove();
   }, []);
@@ -158,6 +198,16 @@ export function CursorPresence() {
     void lookupCountry().then((c) => {
       if (alive) country.current = c;
     });
+
+    // Consume a one-shot jump target left by a cross-page jump.
+    const jumpRaw = sessionStorage.getItem(JUMP_KEY);
+    if (jumpRaw) {
+      sessionStorage.removeItem(JUMP_KEY);
+      const frac = Number(jumpRaw);
+      if (!Number.isNaN(frac)) {
+        setTimeout(() => window.scrollTo({ top: frac * scrollMax(), behavior: "smooth" }), 350);
+      }
+    }
 
     const pos = { x: 0.5, y: 0.5 };
     let dirty = false;
@@ -178,8 +228,6 @@ export function CursorPresence() {
         .catch(() => {});
     };
 
-    // Seed current state immediately (correct first paint regardless of the
-    // subscription's initial snapshot timing).
     void pulse.presence.list
       .call()
       .then((rows) => alive && applyRows(rows as Cursor[]))
@@ -211,9 +259,21 @@ export function CursorPresence() {
       pushTrail(me.current, pos.x, pos.y, Date.now());
     };
     const onScroll = () => {
-      dirty = true;
-      if (!programmatic.current && followIdRef.current) stopFollow();
+      dirty = true; // broadcast my (possibly follow-driven) scroll position
     };
+    // Any deliberate scroll input hands control back to the viewer.
+    const userTookOver = () => {
+      if (followIdRef.current) stopFollow();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && followIdRef.current) stopFollow();
+      else if (
+        followIdRef.current &&
+        ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(e.key)
+      )
+        stopFollow();
+    };
+
     const publishTimer = setInterval(() => {
       if (dirty || Date.now() - lastPublish > HEARTBEAT_MS) publish();
     }, REPORT_MS);
@@ -238,9 +298,14 @@ export function CursorPresence() {
     };
     document.addEventListener("selectionchange", onSelect);
 
-    // Animation loop: prune faded trail points and re-render.
+    // Animation loop: eased follow-scroll, trail pruning, re-render.
     let raf = 0;
     const loop = () => {
+      if (followActive.current) {
+        const target = followScroll.current * scrollMax();
+        const cur = window.scrollY;
+        if (Math.abs(target - cur) > 0.5) window.scrollTo(0, cur + (target - cur) * FOLLOW_EASE);
+      }
       const cutoff = Date.now() - TRAIL_FADE_MS;
       for (const [id, arr] of trails.current) {
         const kept = arr.filter((p) => p.t > cutoff);
@@ -253,14 +318,13 @@ export function CursorPresence() {
     raf = requestAnimationFrame(loop);
 
     const onResize = () => setSize({ w: window.innerWidth, h: window.innerHeight });
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && followIdRef.current) stopFollow();
-    };
     const leave = () => {
       void pulse.presence.leave.call({ clientId: me.current }).catch(() => {});
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", userTookOver, { passive: true });
+    window.addEventListener("touchstart", userTookOver, { passive: true });
     window.addEventListener("resize", onResize);
     window.addEventListener("keydown", onKey);
     window.addEventListener("pagehide", leave);
@@ -273,6 +337,8 @@ export function CursorPresence() {
       document.removeEventListener("selectionchange", onSelect);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", userTookOver);
+      window.removeEventListener("touchstart", userTookOver);
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("pagehide", leave);
@@ -280,10 +346,12 @@ export function CursorPresence() {
     };
   }, [channel]);
 
-  // Follow: track the followed visitor — scroll with them, and navigate to their
-  // page if they're on a different channel.
+  // Follow: drive the eased scroll target, and navigate to the leader's page.
   useEffect(() => {
-    if (!followId) return;
+    if (!followId) {
+      followActive.current = false;
+      return;
+    }
     const t = cursors.find((c) => c.clientId === followId);
     if (!t) return;
     if (t.channel && t.channel !== channel) {
@@ -291,10 +359,8 @@ export function CursorPresence() {
       window.location.href = t.channel;
       return;
     }
-    programmatic.current = true;
-    window.scrollTo({ top: t.scrollY * scrollMax(), behavior: "auto" });
-    const id = setTimeout(() => (programmatic.current = false), 80);
-    return () => clearTimeout(id);
+    followScroll.current = t.scrollY;
+    followActive.current = true;
   }, [cursors, followId, channel]);
 
   function toggleFollow(id: string) {
@@ -313,6 +379,20 @@ export function CursorPresence() {
 
   return (
     <div aria-hidden style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 9999 }}>
+      {/* Pulsing border while following. */}
+      {followed && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            border: `3px solid ${followed.color}`,
+            boxSizing: "border-box",
+            pointerEvents: "none",
+            animation: "pulseFollowBorder 1.6s ease-in-out infinite",
+          }}
+        />
+      )}
+
       {/* Remote text-selection highlights (this channel only). */}
       {here
         .filter((c) => c.selStart >= 0 && c.selEnd > c.selStart)
@@ -351,10 +431,12 @@ export function CursorPresence() {
         })}
       </svg>
 
-      {/* Other visitors' cursors (this channel). */}
+      {/* Other visitors' cursors (this channel). Click to jump to them. */}
       {here.map((c) => (
         <div
           key={c.clientId}
+          onClick={() => jumpTo(c.clientId)}
+          title={`Jump to ${nameFor(c.clientId)}`}
           style={{
             position: "fixed",
             left: 0,
@@ -362,6 +444,8 @@ export function CursorPresence() {
             transform: `translate(${c.x * 100}vw, ${c.y * 100}vh)`,
             transition: "transform 90ms linear",
             willChange: "transform",
+            pointerEvents: "auto",
+            cursor: "pointer",
           }}
         >
           <svg width="20" height="22" viewBox="0 0 20 22" fill="none" style={{ display: "block" }}>
@@ -374,8 +458,8 @@ export function CursorPresence() {
               top: 16,
               display: "inline-flex",
               alignItems: "center",
-              gap: 4,
-              padding: "2px 7px",
+              gap: 5,
+              padding: "2px 8px",
               borderRadius: 999,
               background: c.color,
               color: "#000",
@@ -383,9 +467,10 @@ export function CursorPresence() {
               fontWeight: 600,
               whiteSpace: "nowrap",
               fontFamily: "ui-sans-serif, system-ui, sans-serif",
+              boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
             }}
           >
-            {flag(c.country)} {c.country || "??"}
+            {nameFor(c.clientId)} {flag(c.country)}
           </span>
         </div>
       ))}
@@ -431,7 +516,7 @@ export function CursorPresence() {
             boxShadow: "0 4px 20px rgba(0,0,0,0.35)",
           }}
         >
-          Following {flag(followed.country)} {followed.country || "anon"}
+          Following {nameFor(followed.clientId)} {flag(followed.country)}
           <button
             onClick={stopFollow}
             style={{
@@ -451,14 +536,14 @@ export function CursorPresence() {
         </div>
       )}
 
-      {/* Presence panel: who's on this page, click to follow. */}
+      {/* Presence panel: who's here — jump (↗) or follow. */}
       <div
         style={{
           position: "fixed",
           left: 16,
           bottom: 14,
           pointerEvents: "auto",
-          minWidth: 120,
+          minWidth: 160,
           padding: "8px 10px",
           borderRadius: 12,
           background: "rgba(20,20,22,0.85)",
@@ -476,38 +561,60 @@ export function CursorPresence() {
         {here.map((c) => {
           const isFollowing = followId === c.clientId;
           return (
-            <button
+            <div
               key={c.clientId}
-              onClick={() => toggleFollow(c.clientId)}
-              title={isFollowing ? "Stop following" : "Follow — scroll & navigate together"}
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: 7,
-                width: "100%",
-                padding: "3px 5px",
+                gap: 6,
+                padding: "3px 4px",
                 margin: "1px 0",
                 borderRadius: 7,
-                border: "none",
-                cursor: "pointer",
                 background: isFollowing ? c.color : "transparent",
                 color: isFollowing ? "#000" : "rgba(255,255,255,0.85)",
-                fontFamily: "inherit",
-                fontSize: 12,
-                textAlign: "left",
               }}
             >
-              <span style={{ width: 8, height: 8, borderRadius: 999, background: c.color, display: "inline-block" }} />
-              {flag(c.country)} {c.country || "anon"}
-              <span style={{ marginLeft: "auto", opacity: 0.7, fontSize: 11 }}>
-                {isFollowing ? "following" : "follow"}
+              <span style={{ width: 8, height: 8, borderRadius: 999, background: c.color, display: "inline-block", flex: "0 0 auto" }} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {nameFor(c.clientId)} {flag(c.country)}
               </span>
-            </button>
+              <button
+                onClick={() => jumpTo(c.clientId)}
+                title="Jump to"
+                style={{ marginLeft: "auto", ...iconBtn(isFollowing) }}
+              >
+                ↗
+              </button>
+              <button
+                onClick={() => toggleFollow(c.clientId)}
+                title={isFollowing ? "Stop following" : "Follow"}
+                style={iconBtn(isFollowing)}
+              >
+                {isFollowing ? "■" : "⦿"}
+              </button>
+            </div>
           );
         })}
       </div>
     </div>
   );
+}
+
+function iconBtn(active: boolean): CSSProperties {
+  return {
+    pointerEvents: "auto",
+    cursor: "pointer",
+    border: "none",
+    borderRadius: 6,
+    width: 20,
+    height: 20,
+    fontSize: 12,
+    lineHeight: "20px",
+    padding: 0,
+    background: active ? "rgba(0,0,0,0.2)" : "rgba(255,255,255,0.08)",
+    color: active ? "#000" : "rgba(255,255,255,0.85)",
+    fontFamily: "inherit",
+  };
 }
 
 /** perfect-freehand outline points → a smooth filled SVG path (quadratic midpoints). */
