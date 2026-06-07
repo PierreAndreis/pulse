@@ -155,6 +155,7 @@ export function CursorPresence() {
   const [followId, setFollowId] = useState<string | null>(() => sessionStorage.getItem(FOLLOW_KEY));
   const [chatting, setChatting] = useState(false);
   const [chatText, setChatText] = useState("");
+  const [ownMessage, setOwnMessage] = useState("");
   const chattingRef = useRef(false);
   chattingRef.current = chatting;
   const chatInput = useRef<HTMLInputElement>(null);
@@ -414,18 +415,24 @@ export function CursorPresence() {
     void pulse.presence.say.call({ clientId: me.current, message: v }).catch(() => {});
   }
   function commitChat() {
+    const msg = chatText.trim();
     setChatting(false);
     setChatText("");
-    // Leave the bubble up briefly for others, then clear it.
-    const keep = chatText.trim().length > 0;
-    setTimeout(
-      () => void pulse.presence.say.call({ clientId: me.current, message: "" }).catch(() => {}),
-      keep ? 5000 : 0,
-    );
+    setOwnMessage(msg); // show my own bubble too
+    if (msg) {
+      // Leave the bubble up briefly for everyone, then clear it.
+      setTimeout(() => {
+        setOwnMessage("");
+        void pulse.presence.say.call({ clientId: me.current, message: "" }).catch(() => {});
+      }, 5000);
+    } else {
+      void pulse.presence.say.call({ clientId: me.current, message: "" }).catch(() => {});
+    }
   }
   function cancelChat() {
     setChatting(false);
     setChatText("");
+    setOwnMessage("");
     void pulse.presence.say.call({ clientId: me.current, message: "" }).catch(() => {});
   }
 
@@ -645,6 +652,41 @@ export function CursorPresence() {
           </span>
         </div>
       ))}
+
+      {/* Your own message bubble, so you see what you said too. */}
+      {ownMessage && !chatting && (
+        <div
+          style={{
+            position: "fixed",
+            left: 0,
+            top: 0,
+            transform: `translate(${(ownPos.current?.x ?? 0.5) * 100}vw, ${(ownPos.current?.y ?? 0.5) * 100}vh)`,
+            pointerEvents: "none",
+          }}
+        >
+          <span
+            style={{
+              position: "absolute",
+              left: 16,
+              top: -10,
+              maxWidth: 240,
+              padding: "5px 10px",
+              borderRadius: 12,
+              borderBottomLeftRadius: 3,
+              background: color.current,
+              color: "#000",
+              fontSize: 13,
+              fontWeight: 500,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              fontFamily: "ui-sans-serif, system-ui, sans-serif",
+              boxShadow: "0 3px 12px rgba(0,0,0,0.35)",
+            }}
+          >
+            {ownMessage}
+          </span>
+        </div>
+      )}
 
       {/* Local cursor-chat input (press "/"). */}
       {chatting && (
