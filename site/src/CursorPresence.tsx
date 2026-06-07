@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 import { getStroke } from "perfect-freehand";
 import type { Doc } from "@onveloz/pulse-schema";
 import { pulse } from "./client.js";
+import { navigate } from "./router.js";
 
 type Cursor = Doc<"cursors">;
 
@@ -73,18 +74,28 @@ function flag(cc: string): string {
   return String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
 }
 
+function localeCountry(): string {
+  const region = navigator.language?.split("-")[1];
+  return region && /^[A-Za-z]{2}$/.test(region) ? region.toUpperCase() : "";
+}
+
 async function lookupCountry(): Promise<string> {
+  const cached = sessionStorage.getItem("pulse:cc");
+  if (cached !== null) return cached; // resolved once per session
+  let cc = "";
   try {
-    const r = await fetch("https://ipapi.co/country/", { signal: AbortSignal.timeout(2500) });
+    // geojs is CORS-enabled (ipapi.co blocks cross-origin fetch).
+    const r = await fetch("https://get.geojs.io/v1/ip/country.json", { signal: AbortSignal.timeout(2500) });
     if (r.ok) {
-      const t = (await r.text()).trim();
-      if (/^[A-Za-z]{2}$/.test(t)) return t.toUpperCase();
+      const j = (await r.json()) as { country?: string };
+      if (j.country && /^[A-Za-z]{2}$/.test(j.country)) cc = j.country.toUpperCase();
     }
   } catch {
     /* fall through to locale */
   }
-  const region = navigator.language?.split("-")[1];
-  return region && /^[A-Za-z]{2}$/.test(region) ? region.toUpperCase() : "";
+  if (!cc) cc = localeCountry();
+  sessionStorage.setItem("pulse:cc", cc);
+  return cc;
 }
 
 const scrollMax = () => Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
@@ -188,7 +199,7 @@ export function CursorPresence() {
     if (!t) return;
     if (t.channel && t.channel !== channel) {
       sessionStorage.setItem(JUMP_KEY, String(t.scrollY));
-      window.location.href = t.channel;
+      navigate(t.channel);
       return;
     }
     window.scrollTo({ top: t.scrollY * scrollMax(), behavior: "smooth" });
@@ -250,6 +261,7 @@ export function CursorPresence() {
         .catch(() => {});
     };
 
+    publish(); // establish presence immediately (also on route-change remounts)
     void pulse.presence.list
       .call()
       .then((rows) => alive && applyRows(rows as Cursor[]))
@@ -384,7 +396,8 @@ export function CursorPresence() {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("pagehide", leave);
-      leave();
+      // Note: no leave() here — a route-change remount keeps the same visitor.
+      // Real tab close is handled by the pagehide listener above.
     };
   }, [channel]);
 
@@ -398,7 +411,7 @@ export function CursorPresence() {
     if (!t) return;
     if (t.channel && t.channel !== channel) {
       sessionStorage.setItem(FOLLOW_KEY, followId);
-      window.location.href = t.channel;
+      navigate(t.channel);
       return;
     }
     followScroll.current = t.scrollY;
