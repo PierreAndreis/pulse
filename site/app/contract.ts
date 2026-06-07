@@ -17,6 +17,8 @@ export const contract = {
           y: v.number(),
           country: v.string(),
           color: v.string(),
+          channel: v.string(),
+          scrollY: v.number(),
         }),
       )
       .output(v.null()),

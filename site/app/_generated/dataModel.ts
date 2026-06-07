@@ -12,6 +12,8 @@ declare module "@onveloz/pulse-schema" {
       country: string;
       color: string;
       updatedAt: number;
+      channel: string;
+      scrollY: number;
       selStart: number;
       selEnd: number;
     };

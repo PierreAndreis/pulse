@@ -24,6 +24,8 @@ export const move = os.presence.move.handler(async ({ ctx, input }) => {
       country: input.country,
       color: input.color,
       updatedAt: now,
+      channel: input.channel,
+      scrollY: input.scrollY,
     });
   } else {
     await ctx.db.insert("cursors", {
@@ -33,6 +35,8 @@ export const move = os.presence.move.handler(async ({ ctx, input }) => {
       country: input.country,
       color: input.color,
       updatedAt: now,
+      channel: input.channel,
+      scrollY: input.scrollY,
       selStart: -1,
       selEnd: -1,
     });
