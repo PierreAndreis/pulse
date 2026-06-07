@@ -1,6 +1,17 @@
 # Architecture Spec — Reactive Postgres Platform (working name: **Pulse**)
 
-> Status: design / pre-implementation. This document is the source of truth used to scaffold the repo.
+> **Status: design spec (the target) — not a description of the running system.**
+> Sections 1–9 are the original pre-implementation design used to scaffold the repo;
+> they read in the present tense but describe where Pulse is *headed*, and several
+> headline choices were built differently. **For what is actually shipped — and every
+> deviation — read [§10 (Implementation Status & Deviations)](#10-implementation-status--deviations-living)
+> and the [ADRs](decisions/).** The largest deviations as of today:
+>
+> - **Change source:** an engine-captured, **interest-routed `LISTEN/NOTIFY` bus** (`pulse-cdc`) — *not* WAL/`pgoutput` logical replication (yet). The commit LSN is **sampled** (`pg_current_wal_insert_lsn`), not read from a replication slot.
+> - **Q/M runtime:** a **Node/Bun worker** over NDJSON/stdio — *not* an embedded V8/`deno_core` isolate pool, and **no determinism sandbox** (no frozen time / seeded RNG / net-fs block) yet.
+> - **Topology:** a **single Postgres with two pools** (OLTP + OLAP) — *not* a primary→replica split, and **no PgBouncer**. A replica is an optional deployment choice (`PULSE_OLAP_DATABASE_URL`).
+> - **Procedure kinds:** `reactive` / `mutation` / `analytical` / `action` — the reactive kind is **`reactive`**, *not* `query`.
+> - **Delivery/consistency:** **no SSE `Last-Event-ID` replay / ring buffer** and **no per-client `lastMutationID`** watermark yet (exactly-once is via idempotency keys; the §5.4 rebase-by-watermark story is aspirational).
 
 ---
 
@@ -8,7 +19,7 @@
 
 **Pulse** is a reactive, local-first application platform built on **standard Postgres** as the database of record, a **Rust** reactivity/sync engine, and a **TypeScript** SDK for both authoring server functions and consuming them on the client.
 
-You write server functions in TypeScript (`query` / `mutation` / `action`), define your schema in TypeScript, and call them from the client through a fully type-inferred, oRPC-style API that plugs into TanStack Query. Reactive queries update in realtime over SSE. Heavy analytical queries run on the same API surface but on an isolated execution path. The client cache is local-first with an offline mutation queue and rebase-based reconciliation.
+You write server functions in TypeScript (`reactive` / `mutation` / `analytical` / `action`), define your schema in TypeScript, and call them from the client through a fully type-inferred, oRPC-style API that plugs into TanStack Query. Reactive queries update in realtime over SSE. Heavy analytical queries run on the same API surface but on an isolated execution path. The client cache is local-first with an offline mutation queue and rebase-based reconciliation.
 
 ### What it is
 
