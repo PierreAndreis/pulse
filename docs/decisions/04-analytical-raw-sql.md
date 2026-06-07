@@ -1,6 +1,6 @@
 # 04. Analytical Raw `ctx.sql` via `to_jsonb` Wrapping
 
-- **Status:** Accepted — implemented as the M6 raw-SQL slice pulled forward (see ARCHITECTURE.md §11 "Analytical raw SQL"). One part is an explicit, documented **deviation**: analytical procedures run on the OLTP pool today, not the dedicated read-replica/`statement_timeout` path the architecture describes (ARCHITECTURE.md §6, §15 "OLAP isolation"). That isolation is pending.
+- **Status:** Accepted — implemented as the M6 raw-SQL slice pulled forward (see ARCHITECTURE.md §11 "Analytical raw SQL"). OLAP isolation has since landed: analytical procedures route to a dedicated `olap_pool` (`connect_with` + `PoolConfig`) with its own connection budget and a longer `statement_timeout` (ARCHITECTURE.md §10 "M6 — actions + OLAP isolation"); pointing it at a read *replica* is a deployment choice via `PULSE_OLAP_DATABASE_URL`.
 
 ## Context & Problem
 

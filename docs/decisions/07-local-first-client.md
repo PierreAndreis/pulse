@@ -1,6 +1,6 @@
 # 07. Local-first client: offline queue, optimistic overlay + rebase, persistence
 
-- **Status:** Accepted — partial implementation; deviates from `docs/ARCHITECTURE.md` §5.3–5.5 in several ways noted below. The modules (`LocalStore`, `OfflineQueue`, `LocalFirst`, `KVStore`) exist and are internally consistent, but are **not yet wired into `createClient`** (which only constructs `SyncClient`), and the spec's `lastMutationID` watermark / write-checkpoint guard / `online`+reload flush triggers are not implemented.
+- **Status:** Accepted — partial implementation; deviates from `docs/ARCHITECTURE.md` §5.3–5.5 in several ways noted below. The modules (`LocalStore`, `OfflineQueue`, `LocalFirst`, `KVStore`) exist and are **now wired into `createClient`** (it constructs a `LocalFirst` coordinator): `mutate` applies optimism, durably enqueues, flushes when reachable, and replays the queue on reload (see ARCHITECTURE.md §10 "M5"). Still pending per the spec: the transactional `lastMutationID` watermark and the write-checkpoint guard.
 
 ## Context & Problem
 

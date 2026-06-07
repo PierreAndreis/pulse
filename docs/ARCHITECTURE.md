@@ -554,9 +554,10 @@ The guiding principle: **get one reactive query updating one browser end-to-end 
 - **Verify:** schema change generates and applies a reviewed migration; chaos test (kill engine mid-stream) → slot replay, no dropped invalidations.
 
 ### Later (post-v1 seams already left in place)
-- Incremental view maintenance / differential dataflow for hot query shapes (replace re-execution).
-- Hasura-style multiplexing for popular parameterized queries at scale.
-- Contract-first OpenAPI emission; horizontal scale-out of the engine (sharded subscription registry).
+- Incremental view maintenance / differential dataflow for hot query shapes (replace re-execution) — still the open recompute frontier (see §10, ADR 10).
+- Hasura-style multiplexing for popular parameterized queries at scale — identical-`(path,input,headers)` subscriptions already coalesce to one re-exec; full *parameterized* multiplexing remains.
+- Contract-first OpenAPI emission.
+- A **sharded subscription registry** for very large per-table fan-out. (Basic horizontal scale-out — the cross-node interest-routed bus — is done, see §10 / ADR 09; this is the remaining piece.)
 
 ---
 
