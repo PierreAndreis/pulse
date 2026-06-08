@@ -29,7 +29,9 @@ const STROKE_OPTS = {
   last: false,
 };
 
-type Pt = { x: number; y: number; t: number };
+// `x`/`y` are viewport fractions at capture; `s` is the page scroll (px) at that
+// moment, so a drawn point can be re-anchored to the content it was drawn on.
+type Pt = { x: number; y: number; t: number; s: number };
 
 /** Stable per-tab id, kept across reloads in this session. */
 function clientId(): string {
@@ -353,7 +355,9 @@ export function CursorPresence() {
       const now = Date.now();
       for (const c of rows) {
         if (c.clientId === me.current || c.channel !== channel) continue;
-        pushTrail(c.clientId, c.x, c.y, now);
+        // Re-anchor a remote's points into *my* document: their scroll fraction
+        // maps to a pixel offset against my scrollable height (≈ same layout).
+        pushTrail(c.clientId, c.x, c.y, now, c.scrollY * scrollMax());
         // Animate a remote reaction the first time we see its timestamp.
         if (c.emote && c.emoteAt > (prevEmoteAt.current.get(c.clientId) ?? 0)) {
           prevEmoteAt.current.set(c.clientId, c.emoteAt);
@@ -361,11 +365,11 @@ export function CursorPresence() {
         }
       }
     }
-    function pushTrail(id: string, x: number, y: number, t: number) {
+    function pushTrail(id: string, x: number, y: number, t: number, s: number) {
       const arr = trails.current.get(id) ?? [];
       const last = arr[arr.length - 1];
       if (last && last.x === x && last.y === y) return;
-      arr.push({ x, y, t });
+      arr.push({ x, y, t, s });
       if (arr.length > TRAIL_MAX) arr.splice(0, arr.length - TRAIL_MAX);
       trails.current.set(id, arr);
     }
@@ -375,7 +379,7 @@ export function CursorPresence() {
       pos.y = e.clientY / window.innerHeight;
       ownPos.current = { x: pos.x, y: pos.y };
       dirty = true;
-      pushTrail(me.current, pos.x, pos.y, Date.now());
+      pushTrail(me.current, pos.x, pos.y, Date.now(), window.scrollY);
     };
     const onScroll = () => {
       dirty = true; // broadcast my (possibly follow-driven) scroll position
@@ -592,8 +596,11 @@ export function CursorPresence() {
           if (pts.length < 2) return null;
           if (id !== me.current && !here.some((c) => c.clientId === id)) return null;
           const col = id === me.current ? color.current : here.find((c) => c.clientId === id)?.color ?? color.current;
+          // Scroll-aware: a point captured at scroll `p.s` sits at viewport y
+          // `p.y*h` shifted by how far we've scrolled since — so the drawing
+          // sticks to the page content (and clips off-screen once scrolled past).
           const stroke = getStroke(
-            pts.map((p) => [p.x * w, p.y * h]),
+            pts.map((p) => [p.x * w, p.y * h + (p.s - window.scrollY)]),
             STROKE_OPTS,
           );
           const newest = pts[pts.length - 1]!.t;
