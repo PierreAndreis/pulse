@@ -719,6 +719,30 @@ fn pk_of(row: &PgRow) -> PrimaryKey {
     PrimaryKey::single(kv)
 }
 
+/// Coerce a column's value, read as Postgres `::text`, into a filterable
+/// `KeyValue` — mirroring the document builder's read decoding. Ids decode to
+/// their raw uuid so they compare equal to predicate values. Returns `None` for
+/// an absent value or a class we don't index (float/jsonb/timestamptz/null), so
+/// a filter on such a column degrades to a table-wildcard.
+///
+/// Shared by the in-engine capture path (`row_to_values`) and the WAL/`pgoutput`
+/// consumer so both produce byte-identical `RowValues` — the same `ReadSet`
+/// matcher must fire whether a change came from an in-engine `RETURNING` row or
+/// from logical replication.
+pub fn text_to_key_value(text: Option<&str>, col: &Column) -> Option<KeyValue> {
+    let s = text?;
+    if col.id_ref.is_some() {
+        return Uuid::parse_str(s).ok().map(KeyValue::Uuid);
+    }
+    match col.type_class {
+        PgTypeClass::Int8 => s.parse::<i64>().ok().map(KeyValue::Int),
+        PgTypeClass::Bool => Some(KeyValue::Bool(s == "true" || s == "t")),
+        PgTypeClass::Uuid => Uuid::parse_str(s).ok().map(KeyValue::Uuid),
+        PgTypeClass::Text => Some(KeyValue::Text(s.to_string())),
+        _ => None,
+    }
+}
+
 /// The filterable columns of a row as a `RowValues` image (ids decoded to raw
 /// uuids so they compare equal to predicate values). Float/jsonb/timestamptz and
 /// nulls are omitted — a filter on such a column degrades to a table-wildcard.
@@ -726,19 +750,7 @@ fn row_to_values(row: &PgRow, t: &Table) -> RowValues {
     let mut out = RowValues::new();
     for col in &t.columns {
         let text: Option<String> = row.try_get(col.column.as_str()).ok().flatten();
-        let Some(s) = text else { continue };
-        let kv = if col.id_ref.is_some() {
-            Uuid::parse_str(&s).ok().map(KeyValue::Uuid)
-        } else {
-            match col.type_class {
-                PgTypeClass::Int8 => s.parse::<i64>().ok().map(KeyValue::Int),
-                PgTypeClass::Bool => Some(KeyValue::Bool(s == "true" || s == "t")),
-                PgTypeClass::Uuid => Uuid::parse_str(&s).ok().map(KeyValue::Uuid),
-                PgTypeClass::Text => Some(KeyValue::Text(s)),
-                _ => None,
-            }
-        };
-        if let Some(kv) = kv {
+        if let Some(kv) = text_to_key_value(text.as_deref(), col) {
             out.insert(col.field.clone(), kv);
         }
     }
@@ -1220,6 +1232,38 @@ mod tests {
             nullable: true,
             id_ref: id_ref.map(str::to_string),
         }
+    }
+
+    // Slice 0: lock the text→KeyValue coercion shared by row_to_values (in-engine
+    // capture) and the WAL/pgoutput decoder, so both build identical RowValues.
+    #[test]
+    fn text_to_key_value_covers_each_class() {
+        let u = Uuid::nil();
+        // id_ref columns decode to the raw uuid (matches predicate-bound ids).
+        let id = col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels"));
+        assert_eq!(
+            text_to_key_value(Some(&u.to_string()), &id),
+            Some(KeyValue::Uuid(u))
+        );
+        // int8 (parse failure → None, degrades to wildcard).
+        let n = col("n", "n", PgTypeClass::Int8, None);
+        assert_eq!(text_to_key_value(Some("42"), &n), Some(KeyValue::Int(42)));
+        assert_eq!(text_to_key_value(Some("nan"), &n), None);
+        // bool: Postgres `::text` yields `t`/`f`; the engine also accepts `true`.
+        let b = col("done", "done", PgTypeClass::Bool, None);
+        assert_eq!(text_to_key_value(Some("t"), &b), Some(KeyValue::Bool(true)));
+        assert_eq!(text_to_key_value(Some("true"), &b), Some(KeyValue::Bool(true)));
+        assert_eq!(text_to_key_value(Some("f"), &b), Some(KeyValue::Bool(false)));
+        // text passes through.
+        let t = col("body", "body", PgTypeClass::Text, None);
+        assert_eq!(
+            text_to_key_value(Some("hi"), &t),
+            Some(KeyValue::Text("hi".into()))
+        );
+        // unindexed classes and absent values → None.
+        let f = col("amount", "amount", PgTypeClass::Float8, None);
+        assert_eq!(text_to_key_value(Some("1.5"), &f), None);
+        assert_eq!(text_to_key_value(None, &t), None);
     }
 
     /// `messages` with an `_id` and a `channelId` id-ref to `channels`.
