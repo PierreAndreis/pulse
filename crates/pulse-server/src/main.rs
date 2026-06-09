@@ -178,6 +178,17 @@ fn num_env(key: &str, default: u64) -> u64 {
     parse_num(std::env::var(key).ok(), default)
 }
 
+/// A stable advisory-lock key derived from the slot name (FNV-1a) so every node
+/// computes the same key and contends for the same single-consumer slot.
+fn wal_lock_key(slot: &str) -> i64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in slot.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h as i64
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -369,6 +380,59 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("change bus listener started (node {node_id}, broadcast={broadcast})");
         }
         Err(e) => tracing::error!("failed to start change bus listener: {e}"),
+    }
+
+    // WAL/CDC consumer (opt-in via PULSE_WAL=1): drain a logical replication slot
+    // so writes made OUTSIDE the engine (raw SQL, other services, triggers) also
+    // invalidate subscriptions. Mode B — the engine keeps its synchronous
+    // in-engine apply; the WAL stream carries out-of-band writes plus echoes of
+    // in-engine writes, which `apply_wal` dedups. Requires `wal_level=logical`
+    // and a role that owns the single-consumer slot.
+    if env_or("PULSE_WAL", "0") == "1" {
+        let role = env_or("PULSE_ROLE", "all-in-one");
+        let consumes = matches!(role.as_str(), "all-in-one" | "change-router");
+        match (consumes, worker.catalog()) {
+            (false, _) => tracing::info!("PULSE_WAL=1 but role `{role}` does not consume the WAL"),
+            (true, None) => {
+                tracing::error!("PULSE_WAL=1 but the catalog is not ready; skipping WAL consumer")
+            }
+            (true, Some(catalog)) => {
+                let slot = env_or("PULSE_WAL_SLOT", pulse_cdc::wal::DEFAULT_SLOT);
+                let publication = env_or("PULSE_WAL_PUBLICATION", pulse_cdc::wal::DEFAULT_PUBLICATION);
+                let poll_ms = num_env("PULSE_WAL_POLL_MS", 50).max(1);
+                if let Err(e) = pulse_cdc::wal::ensure_publication(&pool, &publication).await {
+                    tracing::error!("WAL: ensure_publication failed: {e}");
+                }
+                if let Err(e) = pulse_cdc::wal::ensure_slot(&pool, &slot).await {
+                    tracing::error!("WAL: ensure_slot failed: {e}");
+                }
+                // Single-consumer: only the node holding the advisory lock drains it.
+                match pulse_cdc::wal::try_acquire_leadership(&database_url, wal_lock_key(&slot)).await
+                {
+                    Ok(Some(guard)) => {
+                        let mut rx = pulse_cdc::wal::start_wal_consumer(
+                            pool.clone(),
+                            slot.clone(),
+                            publication,
+                            catalog,
+                            std::time::Duration::from_millis(poll_ms),
+                        );
+                        let coord = coord.clone();
+                        tokio::spawn(async move {
+                            let _guard = guard; // hold leadership for the consumer's life
+                            while let Some(cs) = rx.recv().await {
+                                coord.apply_wal(cs, None).await;
+                            }
+                        });
+                        tracing::info!("WAL consumer started (slot={slot}, poll={poll_ms}ms)");
+                    }
+                    Ok(None) => {
+                        tracing::info!("WAL consumer: another node holds the slot; standing by")
+                    }
+                    Err(e) => tracing::error!("WAL: leadership acquire failed: {e}"),
+                }
+            }
+        }
     }
 
     let state = Arc::new(AppState {

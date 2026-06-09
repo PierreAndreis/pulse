@@ -365,6 +365,13 @@ impl Worker {
         &self.procedures
     }
 
+    /// The introspected catalog (snake↔camel fields, id_ref, type classes), set
+    /// from the manifest before the worker reports Ready. The WAL/CDC consumer
+    /// needs it to build row images identical to the in-engine capture path.
+    pub fn catalog(&self) -> Option<Catalog> {
+        self.inner.catalog.get().cloned()
+    }
+
     pub fn find(&self, path: &[String]) -> Option<&ProcInfo> {
         self.procedures.iter().find(|p| p.path == path)
     }
