@@ -3,6 +3,8 @@
 //! into `ChangeSet`s — the out-of-band-write invalidation the in-engine
 //! write-set path is blind to. Insert (tracer), Update (old-image on a filter
 //! move), and Delete (pre-image) are each exercised end-to-end.
+use std::time::{Duration, Instant};
+
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::{runners::AsyncRunner, ImageExt};
@@ -216,5 +218,108 @@ async fn out_of_band_delete_carries_the_pre_image() {
         del.old.as_ref().and_then(|r| r.get("channelId")),
         Some(&KeyValue::Uuid(channel)),
         "delete pre-image must carry the leaving row's filter columns"
+    );
+}
+
+// ── Mode A vs Mode B benchmark ───────────────────────────────────────────────
+// Mode A routes EVERY invalidation through the WAL slot (polled), so its added
+// latency over Mode B (synchronous in-engine apply, ~0 added) is exactly the
+// WAL-visibility latency measured here. We also measure the cost Mode A pays
+// continuously — the empty-poll round-trip — and the decode throughput.
+//
+//   cargo test -p pulse-cdc --test wal -- --ignored --nocapture bench
+
+fn report(label: &str, mut samples: Vec<Duration>) {
+    samples.sort_unstable();
+    let n = samples.len();
+    let us = |d: Duration| d.as_secs_f64() * 1e3; // → ms
+    let at = |p: f64| us(samples[((n as f64 * p) as usize).min(n - 1)]);
+    let mean = us(samples.iter().sum::<Duration>() / n as u32);
+    println!(
+        "{label:<34} n={n:<4} min={:>7.3} p50={:>7.3} p95={:>7.3} p99={:>7.3} max={:>7.3} mean={:>7.3}  (ms)",
+        us(samples[0]),
+        at(0.50),
+        at(0.95),
+        at(0.99),
+        us(samples[n - 1]),
+        mean,
+    );
+}
+
+#[tokio::test]
+#[ignore = "benchmark; run with --ignored --nocapture bench"]
+async fn bench_wal_invalidation_latency() {
+    let Some(_) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let fx = fixture("bench").await;
+    let insert = |body: &'static str| {
+        let pool = fx.pool.clone();
+        let table = fx.table.clone();
+        async move {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (_id, channel_id, body) VALUES ($1,$2,$3)"
+            ))
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(body)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // Warm up: slot creation + first decode context.
+    insert("warmup").await;
+    while fx.drain().await.is_empty() {}
+
+    const N: usize = 300;
+
+    // (1) Mode A floor: commit → change visible via a tight poll loop. This is
+    // the minimum latency WAL routing adds over Mode B's synchronous apply.
+    let mut tight = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = Instant::now();
+        insert("x").await;
+        loop {
+            if !fx.drain().await.is_empty() {
+                break;
+            }
+        }
+        tight.push(t0.elapsed());
+    }
+    report("Mode A floor: commit→visible", tight);
+
+    // (2) Empty-poll cost: what Mode A pays every poll while idle (no changes).
+    let mut empty = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = Instant::now();
+        let got = fx.drain().await;
+        empty.push(t0.elapsed());
+        assert!(got.is_empty());
+    }
+    report("Mode A idle: empty poll", empty);
+
+    // (3) Decode throughput: drain a batch of B changes in one poll, per-change
+    // CPU cost of the pgoutput decode + RowValues build.
+    const BATCH: usize = 500;
+    for _ in 0..BATCH {
+        insert("batch").await;
+    }
+    let t0 = Instant::now();
+    let drained = fx.drain().await;
+    let elapsed = t0.elapsed();
+    let per_ns = elapsed.as_nanos() as f64 / drained.len().max(1) as f64;
+    println!(
+        "decode+drain: {} changes in {:.3} ms ({:.0} ns/change)",
+        drained.len(),
+        elapsed.as_secs_f64() * 1e3,
+        per_ns,
+    );
+    println!(
+        "\nMode B adds ~0 invalidation latency (synchronous in-engine apply) but \
+         must dedup the WAL echo; Mode A's added latency is the 'commit→visible' \
+         row above, paid uniformly for in-engine and out-of-band writes."
     );
 }
