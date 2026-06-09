@@ -78,11 +78,10 @@ impl Table {
         self.by_column.get(column).map(|&i| &self.columns[i])
     }
 
-    /// Build a `Table` from columns in tests, computing the private `by_field` /
-    /// `by_column` indexes the same way introspection does. Test-only so `ops.rs`
-    /// can hand-build catalogs without a live Postgres.
-    #[cfg(test)]
-    pub(crate) fn from_columns(name: &str, columns: Vec<Column>) -> Self {
+    /// Build a `Table` from columns, computing the private `by_field` /
+    /// `by_column` indexes the same way introspection does. Lets tests and the
+    /// WAL decoder hand-build catalogs without a live Postgres.
+    pub fn from_columns(name: &str, columns: Vec<Column>) -> Self {
         let by_field = columns
             .iter()
             .enumerate()

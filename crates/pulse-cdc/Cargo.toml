@@ -7,12 +7,16 @@ description = "Change bus: cross-node ChangeSet propagation (Postgres LISTEN/NOT
 
 [dependencies]
 pulse-core = { workspace = true }
+# The WAL/CDC consumer decodes pgoutput into the same RowValues the in-engine
+# capture path builds, reusing pulse-sql's catalog + text→KeyValue coercion.
+pulse-sql = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 testcontainers = "0.27.3"

@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use pulse_core::{Change, ChangeSet, Lsn};
 
 mod interest;
+pub mod wal;
 pub use interest::{
     clear_interest, ensure_interest_table, interested_nodes, prune_interest, register_interest,
 };
