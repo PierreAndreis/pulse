@@ -14,6 +14,27 @@ tells you to. All are environment variables on the engine process.
 | `PULSE_HEARTBEAT_MS` | `10000` | How often a node refreshes its interest + prunes dead nodes. Auto-clamped to ≤ `TTL/3`. | Lower for faster dead-node cleanup / new-table pickup; it must stay well under the TTL or a live node's interest lapses. |
 | `PULSE_WAL_SAMPLE_MS` | `100` | How often the commit-watermark (`commitLsn`) is sampled from the WAL, off the write path. | Lower for finer watermark granularity (at a small extra query rate); raise to reduce background queries. |
 
+## WAL/CDC consumer (out-of-band writes)
+
+Off by default. When enabled, one node drains a logical replication slot so writes
+made **outside** the engine (raw `psql`, other services, triggers) also invalidate
+subscriptions — the engine's own write-set capture only sees its own mutations. The
+engine keeps its synchronous in-engine apply (Mode B); the WAL stream carries
+out-of-band writes plus echoes of in-engine writes, which are deduped. Requires
+`wal_level=logical` and a superuser (for `CREATE PUBLICATION … FOR ALL TABLES`).
+
+| Env | Default | What it does | When to change |
+|---|---|---|---|
+| `PULSE_WAL` | `0` (off) | Master switch for the logical-slot consumer. | Turn **on** to reflect out-of-band Postgres writes in live subscriptions. |
+| `PULSE_ROLE` | `all-in-one` | Which role this node plays. Only `all-in-one` / `change-router` consume the WAL slot. | Set per node when splitting roles across a cluster. |
+| `PULSE_WAL_SLOT` | `pulse_slot` | The logical slot name (single-consumer; one node holds it via an advisory lock). | Change to run isolated consumers against one database. |
+| `PULSE_WAL_PUBLICATION` | `pulse_pub` | The `FOR ALL TABLES` publication the slot decodes. | Rarely. |
+| `PULSE_WAL_POLL_MS` | `50` | How often the slot is drained. Lower → lower out-of-band invalidation latency at a higher idle query rate (~0.9 ms/poll); raise to reduce background load. | Tune to the out-of-band write latency you need. |
+
+For precise old-image invalidation of out-of-band `UPDATE`/`DELETE` (e.g. a row moving
+across a filter), set `REPLICA IDENTITY FULL` on reactive tables; otherwise old images
+carry only the primary key and the matcher conservatively over-invalidates.
+
 ## Reactor / delivery
 
 | Env | Default | What it does | When to change |
