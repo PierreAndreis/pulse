@@ -1,15 +1,16 @@
-//! WAL/CDC consumer against a live Postgres: a raw INSERT made *outside* the
-//! engine (direct SQL, no Pulse mutation) is captured from the logical slot and
-//! decoded into a `ChangeSet` — the out-of-band-write invalidation the in-engine
-//! write-set path is blind to.
+//! WAL/CDC consumer against a live Postgres: writes made *outside* the engine
+//! (direct SQL, no Pulse mutation) are captured from a logical slot and decoded
+//! into `ChangeSet`s — the out-of-band-write invalidation the in-engine
+//! write-set path is blind to. Insert (tracer), Update (old-image on a filter
+//! move), and Delete (pre-image) are each exercised end-to-end.
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::{runners::AsyncRunner, ImageExt};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use pulse_cdc::wal::{ensure_publication, ensure_slot, poll_change_sets, WalDecoder};
-use pulse_core::{ChangeOp, KeyValue, TableId};
+use pulse_cdc::wal::{ensure_slot, poll_change_sets, WalDecoder};
+use pulse_core::{Change, ChangeOp, KeyValue, TableId};
 use pulse_sql::{Catalog, Column, PgTypeClass, Table};
 
 static URL: OnceCell<Option<String>> = OnceCell::const_new();
@@ -32,18 +33,6 @@ async fn url() -> Option<&'static str> {
     .as_deref()
 }
 
-fn messages_catalog() -> Catalog {
-    let cols = vec![
-        col("_id", "_id", PgTypeClass::Uuid, Some("messages")),
-        col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels")),
-        col("body", "body", PgTypeClass::Text, None),
-    ];
-    let mut c = Catalog::default();
-    c.tables
-        .insert("messages".into(), Table::from_columns("messages", cols));
-    c
-}
-
 fn col(column: &str, field: &str, type_class: PgTypeClass, id_ref: Option<&str>) -> Column {
     Column {
         column: column.into(),
@@ -54,63 +43,178 @@ fn col(column: &str, field: &str, type_class: PgTypeClass, id_ref: Option<&str>)
     }
 }
 
-#[tokio::test]
-async fn out_of_band_insert_is_captured_from_the_wal() {
-    let Some(url) = url().await else {
-        eprintln!("skip: docker unavailable");
-        return;
-    };
-    let pool = PgPool::connect(url).await.unwrap();
+/// Per-test fixture: a uniquely-named table (so parallel tests don't share a
+/// slot's stream), its own `pgoutput` slot + publication, and a matching
+/// catalog. `REPLICA IDENTITY FULL` so Update/Delete carry old images.
+struct Fixture {
+    pool: PgPool,
+    table: String,
+    slot: String,
+    publication: String,
+    catalog: Catalog,
+}
 
-    // A minimal `messages` table (REPLICA IDENTITY FULL so updates/deletes carry
-    // old images too — used by later slices; harmless here).
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS messages (\
+async fn fixture(tag: &str) -> Fixture {
+    let pool = PgPool::connect(url().await.unwrap()).await.unwrap();
+    let table = format!("m_{tag}");
+    let slot = format!("slot_{tag}");
+    let publication = format!("pub_{tag}");
+
+    sqlx::query(&format!(
+        "CREATE TABLE {table} (\
             _id uuid PRIMARY KEY, \
-            _creation_time bigint NOT NULL DEFAULT 0, \
             channel_id uuid NOT NULL, \
-            author_id uuid NOT NULL, \
-            body text NOT NULL)",
-    )
+            body text NOT NULL)"
+    ))
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("ALTER TABLE messages REPLICA IDENTITY FULL")
+    sqlx::query(&format!("ALTER TABLE {table} REPLICA IDENTITY FULL"))
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query(&format!(
+        "CREATE PUBLICATION {publication} FOR TABLE {table}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    ensure_slot(&pool, &slot).await.unwrap();
 
-    ensure_publication(&pool, "pulse_pub").await.unwrap();
-    ensure_slot(&pool, "pulse_slot").await.unwrap();
+    let catalog = {
+        let cols = vec![
+            col("_id", "_id", PgTypeClass::Uuid, Some(&table)),
+            col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels")),
+            col("body", "body", PgTypeClass::Text, None),
+        ];
+        let mut c = Catalog::default();
+        c.tables.insert(table.clone(), Table::from_columns(&table, cols));
+        c
+    };
 
-    // A raw write — NOT through the engine. This is the change the in-engine
-    // write-set capture can never see.
-    let id = Uuid::new_v4();
-    let channel = Uuid::new_v4();
-    sqlx::query("INSERT INTO messages (_id, channel_id, author_id, body) VALUES ($1,$2,$3,$4)")
-        .bind(id)
-        .bind(channel)
-        .bind(Uuid::new_v4())
-        .bind("from-psql")
-        .execute(&pool)
-        .await
-        .unwrap();
+    Fixture { pool, table, slot, publication, catalog }
+}
 
-    let mut decoder = WalDecoder::new(messages_catalog());
-    let sets = poll_change_sets(&pool, "pulse_slot", "pulse_pub", &mut decoder)
-        .await
-        .unwrap();
+impl Fixture {
+    /// Drain the slot and return every decoded change across the committed sets.
+    async fn drain(&self) -> Vec<Change> {
+        let mut decoder = WalDecoder::new(self.catalog.clone());
+        let sets = poll_change_sets(&self.pool, &self.slot, &self.publication, &mut decoder)
+            .await
+            .unwrap();
+        sets.into_iter().flat_map(|cs| cs.changes).collect()
+    }
+}
 
-    // Exactly one committed transaction, one Insert on messages, with the row
-    // image the reactor's matcher consumes (ids decoded to raw uuids).
-    let changes: Vec<_> = sets.iter().flat_map(|cs| &cs.changes).collect();
-    assert_eq!(changes.len(), 1, "expected one captured change, got {changes:?}");
-    let c = changes[0];
-    assert_eq!(c.table, TableId::new("messages"));
+#[tokio::test]
+async fn out_of_band_insert_is_captured_from_the_wal() {
+    let Some(_) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let fx = fixture("insert").await;
+
+    // A raw write — NOT through the engine.
+    let (id, channel) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(&format!(
+        "INSERT INTO {} (_id, channel_id, body) VALUES ($1,$2,$3)",
+        fx.table
+    ))
+    .bind(id)
+    .bind(channel)
+    .bind("from-psql")
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    let changes = fx.drain().await;
+    assert_eq!(changes.len(), 1, "expected one change, got {changes:?}");
+    let c = &changes[0];
+    assert_eq!(c.table, TableId::new(fx.table.clone()));
     assert_eq!(c.op, ChangeOp::Insert);
     let new = c.new.as_ref().expect("insert carries a new image");
+    // id_ref columns decode to raw uuids; text passes through — identical to the
+    // in-engine row_to_values image, so the same matcher fires.
     assert_eq!(new.get("channelId"), Some(&KeyValue::Uuid(channel)));
     assert_eq!(new.get("body"), Some(&KeyValue::Text("from-psql".into())));
+    assert!(c.old.is_none());
+}
 
-    drop(pool);
+#[tokio::test]
+async fn out_of_band_update_carries_both_images() {
+    let Some(_) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let fx = fixture("update").await;
+    let (id, chan_a, chan_b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(&format!(
+        "INSERT INTO {} (_id, channel_id, body) VALUES ($1,$2,'x')",
+        fx.table
+    ))
+    .bind(id)
+    .bind(chan_a)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    // Move the row across the channel filter (A → B): the old image is what lets
+    // a channel-A subscription drop the row, so it MUST be captured.
+    sqlx::query(&format!("UPDATE {} SET channel_id = $1 WHERE _id = $2", fx.table))
+        .bind(chan_b)
+        .bind(id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let changes = fx.drain().await;
+    let upd = changes
+        .iter()
+        .find(|c| c.op == ChangeOp::Update)
+        .expect("an update change");
+    assert_eq!(
+        upd.old.as_ref().and_then(|r| r.get("channelId")),
+        Some(&KeyValue::Uuid(chan_a)),
+        "pre-image must carry the old channel"
+    );
+    assert_eq!(
+        upd.new.as_ref().and_then(|r| r.get("channelId")),
+        Some(&KeyValue::Uuid(chan_b)),
+        "post-image must carry the new channel"
+    );
+}
+
+#[tokio::test]
+async fn out_of_band_delete_carries_the_pre_image() {
+    let Some(_) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let fx = fixture("delete").await;
+    let (id, channel) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(&format!(
+        "INSERT INTO {} (_id, channel_id, body) VALUES ($1,$2,'doomed')",
+        fx.table
+    ))
+    .bind(id)
+    .bind(channel)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!("DELETE FROM {} WHERE _id = $1", fx.table))
+        .bind(id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let changes = fx.drain().await;
+    let del = changes
+        .iter()
+        .find(|c| c.op == ChangeOp::Delete)
+        .expect("a delete change");
+    assert!(del.new.is_none(), "delete has no post-image");
+    assert_eq!(
+        del.old.as_ref().and_then(|r| r.get("channelId")),
+        Some(&KeyValue::Uuid(channel)),
+        "delete pre-image must carry the leaving row's filter columns"
+    );
 }
