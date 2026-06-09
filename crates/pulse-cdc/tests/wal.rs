@@ -221,6 +221,71 @@ async fn out_of_band_delete_carries_the_pre_image() {
     );
 }
 
+#[tokio::test]
+async fn wal_consumer_streams_out_of_band_inserts() {
+    let Some(_) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let fx = fixture("stream").await;
+    let mut rx = pulse_cdc::wal::start_wal_consumer(
+        fx.pool.clone(),
+        fx.slot.clone(),
+        fx.publication.clone(),
+        fx.catalog.clone(),
+        Duration::from_millis(20),
+    );
+
+    let (id, channel) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(&format!(
+        "INSERT INTO {} (_id, channel_id, body) VALUES ($1,$2,'streamed')",
+        fx.table
+    ))
+    .bind(id)
+    .bind(channel)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+
+    let cs = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a ChangeSet arrives within the poll window")
+        .expect("consumer channel open");
+    let c = &cs.changes[0];
+    assert_eq!(c.op, ChangeOp::Insert);
+    assert_eq!(
+        c.new.as_ref().and_then(|r| r.get("channelId")),
+        Some(&KeyValue::Uuid(channel))
+    );
+}
+
+#[tokio::test]
+async fn wal_leadership_is_single_holder_with_failover() {
+    let Some(url) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let key = 0x7012_3457; // unique to this test
+    let a = pulse_cdc::wal::try_acquire_leadership(url, key).await.unwrap();
+    assert!(a.is_some(), "first acquirer becomes the WAL consumer");
+    let b = pulse_cdc::wal::try_acquire_leadership(url, key).await.unwrap();
+    assert!(b.is_none(), "a second node is locked out of the slot");
+
+    drop(a); // closes the connection → Postgres releases the session lock
+
+    // Failover: another node can take over once the holder drops (small delay
+    // while Postgres notices the disconnect).
+    let mut took_over = None;
+    for _ in 0..100 {
+        if let Some(g) = pulse_cdc::wal::try_acquire_leadership(url, key).await.unwrap() {
+            took_over = Some(g);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(took_over.is_some(), "leadership fails over after the holder drops");
+}
+
 // ── Mode A vs Mode B benchmark ───────────────────────────────────────────────
 // Mode A routes EVERY invalidation through the WAL slot (polled), so its added
 // latency over Mode B (synchronous in-engine apply, ~0 added) is exactly the

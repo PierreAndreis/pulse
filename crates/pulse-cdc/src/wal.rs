@@ -17,9 +17,12 @@
 //! `RowValues` to an in-engine `RETURNING` row — the one matcher fires for both.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use pulse_core::{Change, ChangeOp, ChangeSet, KeyValue, Lsn, PrimaryKey, RowValues, TableId};
 use pulse_sql::{text_to_key_value, Catalog, PgPool};
+use sqlx::Connection;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Default names; overridable by the host when it wires the consumer.
@@ -336,6 +339,67 @@ pub async fn poll_change_sets(
         }
     }
     Ok(out)
+}
+
+/// A held WAL-consumer leadership: a logical slot is single-consumer, so exactly
+/// one node may drain it. Backed by a session-level advisory lock on a dedicated
+/// connection; dropping the guard closes the connection, which releases the lock
+/// so another node can take over (failover).
+pub struct WalLeadership {
+    _conn: sqlx::PgConnection,
+}
+
+/// Try to become the WAL consumer for `key` (derive it from the slot name).
+/// Returns `None` if another node already holds it. Uses a dedicated connection
+/// (NOT a pool connection — a pooled session lock would not release on return).
+pub async fn try_acquire_leadership(
+    database_url: &str,
+    key: i64,
+) -> Result<Option<WalLeadership>, WalError> {
+    let mut conn = sqlx::PgConnection::connect(database_url).await?;
+    let (got,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut conn)
+        .await?;
+    if got {
+        Ok(Some(WalLeadership { _conn: conn }))
+    } else {
+        let _ = conn.close().await;
+        Ok(None)
+    }
+}
+
+/// Spawn the WAL consumer: drain the slot every `poll_interval` and emit each
+/// committed `ChangeSet` on the returned channel. The host feeds these to
+/// `Coordinator::apply_wal` (which dedups echoes of its own in-engine writes).
+/// Only the leader should call this (see [`try_acquire_leadership`]).
+pub fn start_wal_consumer(
+    pool: PgPool,
+    slot: String,
+    publication: String,
+    catalog: Catalog,
+    poll_interval: Duration,
+) -> mpsc::Receiver<ChangeSet> {
+    let (tx, rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        // One decoder across polls: each get_binary_changes call re-emits the
+        // Relation messages it needs, and transactions never split across calls.
+        let mut decoder = WalDecoder::new(catalog);
+        loop {
+            match poll_change_sets(&pool, &slot, &publication, &mut decoder).await {
+                Ok(sets) => {
+                    for cs in sets {
+                        if tx.send(cs).await.is_err() {
+                            return; // receiver dropped → host shutting down
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "WAL poll failed; retrying"),
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    });
+    rx
 }
 
 #[cfg(test)]
