@@ -141,11 +141,15 @@ fn channel_filter(channel: &str) -> ReadSet {
 }
 
 fn insert_into(channel: &str) -> Change {
+    insert_into_key(channel, 1)
+}
+
+fn insert_into_key(channel: &str, key: i64) -> Change {
     let mut new = HashMap::new();
     new.insert("channelId".to_string(), KeyValue::Text(channel.into()));
     Change {
         table: TableId::new("messages"),
-        key: PrimaryKey::single(KeyValue::Int(1)),
+        key: PrimaryKey::single(KeyValue::Int(key)),
         op: ChangeOp::Insert,
         new: Some(new),
         old: None,
@@ -244,6 +248,55 @@ async fn mutation_propagation_stamps_lsn_publishes_and_applies_locally() {
         recv(&mut rx).await.is_some(),
         "matched subscriber pushed locally"
     );
+}
+
+#[tokio::test]
+async fn mode_b_dedups_wal_echo_but_applies_out_of_band_writes() {
+    // A subscriber on c1; FreshReExec pushes on every matching apply.
+    let exec = Arc::new(FakeExecutor::reads(
+        &["messages", "list"],
+        json!([]),
+        channel_filter("c1"),
+    ));
+    let r = rig(exec);
+    let mut rx = r.coord.register_client("a".into()).await;
+    r.reactor
+        .add_subscription(Subscription {
+            client_id: "a".into(),
+            sub: "messages.list::c1".into(),
+            path: vec!["messages".into(), "list".into()],
+            input: json!({ "channelId": "c1" }),
+            headers: HashMap::new(),
+            read_set: channel_filter("c1"),
+            last: Some(json!({ "n": 0 })),
+            last_lsn: Lsn::ZERO,
+        })
+        .await;
+
+    // In-engine write: applied synchronously (subscriber pushed once) and
+    // recorded in the dedup window.
+    let change = insert_into_key("c1", 1);
+    r.coord.propagate(stamp(vec![change.clone()])).await;
+    assert!(recv(&mut rx).await.is_some(), "in-engine write pushes locally");
+
+    // The WAL echo of that same commit must be dropped — no second push.
+    r.coord.apply_wal(stamp(vec![change.clone()]), Some(0)).await;
+    assert!(
+        recv(&mut rx).await.is_none(),
+        "WAL echo of an in-engine write is deduped (Mode B)"
+    );
+    assert_eq!(r.coord.metrics().deduped.load(SeqCst), 1);
+
+    // A genuine out-of-band write (a different row, same channel) is NOT in the
+    // dedup window → it invalidates the subscription like any other change.
+    r.coord
+        .apply_wal(stamp(vec![insert_into_key("c1", 2)]), Some(0))
+        .await;
+    assert!(
+        recv(&mut rx).await.is_some(),
+        "out-of-band WAL write re-runs the matching subscription"
+    );
+    assert_eq!(r.coord.metrics().deduped.load(SeqCst), 1, "no extra dedup");
 }
 
 #[tokio::test]

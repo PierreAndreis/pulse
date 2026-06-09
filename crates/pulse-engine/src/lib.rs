@@ -14,10 +14,10 @@
 //! orchestration becomes testable in-memory (an in-memory reactor plus fakes for
 //! the three host seams) with no Postgres and no worker process.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -111,7 +111,18 @@ pub struct BusMetrics {
     pub lag_us_sum: AtomicU64,
     pub apply_us_sum: AtomicU64,
     pub resyncs: AtomicU64,
+    /// WAL changes dropped because they echo an in-engine write already applied
+    /// locally (Mode B: the engine keeps the synchronous fast-path; the WAL
+    /// stream carries only out-of-band writes, plus echoes we filter here).
+    pub deduped: AtomicU64,
 }
+
+/// How long an in-engine change stays in the dedup window — long enough to cover
+/// the WAL poll round-trip the echo arrives on, short enough to stay tiny. A
+/// false miss only costs a wasted re-exec; a false dedup (an out-of-band write
+/// byte-identical to a just-applied in-engine one) produces the same result the
+/// local apply already pushed, so it is harmless either way.
+const DEDUP_TTL: Duration = Duration::from_secs(5);
 
 /// A successful RPC: the value to return now, plus (for a mutation) the stamped
 /// change-set to propagate off the response path via [`Coordinator::propagate`].
@@ -145,6 +156,8 @@ pub struct Coordinator {
     /// per-write WAL round-trip — WAL only advances, so it stays monotonic.
     wal_lsn: Arc<AtomicU64>,
     metrics: Arc<BusMetrics>,
+    /// Recently applied in-engine changes, for deduping their WAL echo (Mode B).
+    applied: Mutex<VecDeque<(Change, Instant)>>,
 }
 
 impl Coordinator {
@@ -162,6 +175,7 @@ impl Coordinator {
             interest,
             wal_lsn,
             metrics: Arc::new(BusMetrics::default()),
+            applied: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -206,6 +220,11 @@ impl Coordinator {
     /// nodes — the local apply running in parallel with the routed publish, the
     /// shape the host runs off the RPC's critical path (`tokio::spawn`).
     pub async fn propagate(&self, change_set: ChangeSet) {
+        // Mode B: remember these changes so their WAL echo (the same commit,
+        // seen again when the slot is polled) is deduped in `apply_wal` rather
+        // than re-applied. Recorded before the local apply so the marker is in
+        // place no matter how fast the echo arrives.
+        self.remember_applied(&change_set.changes);
         let reactor = self.reactor.clone();
         let local = {
             let cs = change_set.clone();
@@ -213,6 +232,53 @@ impl Coordinator {
         };
         self.publisher.publish(&change_set).await;
         let _ = local.await;
+    }
+
+    /// Record in-engine-applied changes in the dedup window (pruning expired).
+    fn remember_applied(&self, changes: &[Change]) {
+        let mut applied = self.applied.lock().unwrap();
+        let now = Instant::now();
+        applied.retain(|(_, t)| now.duration_since(*t) < DEDUP_TTL);
+        for c in changes {
+            applied.push_back((c.clone(), now));
+        }
+    }
+
+    /// Apply a change-set sourced from the WAL/CDC consumer. Out-of-band writes
+    /// (raw SQL, other services) invalidate subscriptions like any other change;
+    /// echoes of this node's own in-engine writes are dropped (Mode B), since
+    /// `propagate` already applied them synchronously. Because both paths build
+    /// row images through the same `text_to_key_value`, an echo is byte-equal to
+    /// its recorded in-engine `Change`.
+    pub async fn apply_wal(&self, change_set: ChangeSet, lag_us: Option<u64>) {
+        let kept: Vec<Change> = {
+            let mut applied = self.applied.lock().unwrap();
+            let now = Instant::now();
+            applied.retain(|(_, t)| now.duration_since(*t) < DEDUP_TTL);
+            change_set
+                .changes
+                .into_iter()
+                .filter(|c| match applied.iter().position(|(ac, _)| ac == c) {
+                    Some(pos) => {
+                        applied.remove(pos); // consume the marker — one echo per write
+                        self.metrics.deduped.fetch_add(1, Relaxed);
+                        false
+                    }
+                    None => true,
+                })
+                .collect()
+        };
+        if kept.is_empty() {
+            return;
+        }
+        self.apply_invalidation(
+            Invalidation::Changes(ChangeSet {
+                commit_lsn: change_set.commit_lsn,
+                changes: kept,
+            }),
+            lag_us,
+        )
+        .await;
     }
 
     /// Register a reactive subscription: run it for the initial value + read-set,
