@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use pulse_core::{AggFunc, ChangeSet, KeyValue, Lsn, ReadSet, RowValues, TableId};
+use pulse_core::{AggFunc, ChangeSet, KeyValue, Lsn, PrimaryKey, ReadSet, RowValues, TableId};
 
 /// One server→client SSE event: a monotonic per-client `id` (for `Last-Event-ID`
 /// resume) and the JSON body.
@@ -521,15 +521,30 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
     let filter = &filters[0];
     let agg = filter.aggregate.as_ref()?;
     let last = sub.last.as_ref()?;
+
+    // Coalesce multiple changes to the same row in this commit into ONE net
+    // transition — first pre-image, last post-image. A row inserted-then-deleted in
+    // the same tx is a no-op, not a transient member; an updated-twice row collapses
+    // to its endpoints. count/sum sum deltas so they tolerate intermediate states,
+    // but min/max would otherwise latch onto a phantom extreme that never persisted.
+    let mut net: HashMap<&PrimaryKey, (Option<&RowValues>, Option<&RowValues>)> = HashMap::new();
+    for c in &cs.changes {
+        if &c.table != table {
+            continue;
+        }
+        let slot = net
+            .entry(&c.key)
+            .or_insert((c.old.as_ref(), c.new.as_ref()));
+        slot.1 = c.new.as_ref(); // keep the last post-image; .0 stays the first pre-image
+    }
+    let nets: Vec<(Option<&RowValues>, Option<&RowValues>)> = net.into_values().collect();
+
     match agg.func {
         // bare count(*): +1 per row entering the filter, −1 per row leaving it.
         AggFunc::Count if agg.field.is_none() && !agg.distinct => {
             let mut delta: i64 = 0;
-            for c in &cs.changes {
-                if &c.table != table {
-                    continue;
-                }
-                let (old_m, new_m) = filter.membership(c);
+            for (old, new) in &nets {
+                let (old_m, new_m) = filter.membership_images(*old, *new);
                 delta += new_m as i64 - old_m as i64;
             }
             Some(json!(last.as_i64()? + delta))
@@ -549,19 +564,24 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
                 }
             };
             let mut delta: i64 = 0;
-            for c in &cs.changes {
-                if &c.table != table {
-                    continue;
-                }
-                match filter.membership(c) {
-                    (false, true) => delta += int(c.new.as_ref())?, // entered
-                    (true, false) => delta -= int(c.old.as_ref())?, // left
-                    (true, true) => delta += int(c.new.as_ref())? - int(c.old.as_ref())?, // stayed
-                    (false, false) => {}                            // outside
+            for (old, new) in &nets {
+                match filter.membership_images(*old, *new) {
+                    (false, true) => delta += int(*new)?,             // entered
+                    (true, false) => delta -= int(*old)?,             // left
+                    (true, true) => delta += int(*new)? - int(*old)?, // stayed
+                    (false, false) => {}                              // outside
                 }
             }
-            // Match the re-exec output shape (sum is a bare json number).
-            Some(json!(base + delta as f64))
+            // A computed sum of exactly 0 is ambiguous: the set may be empty (SQL
+            // `sum` → NULL) or its values may cancel to 0, and without a row count we
+            // can't tell — so fall back and let the re-exec decide. Any *non-zero*
+            // result proves a non-empty set, so it's safe to push (matches the
+            // re-exec's bare-number shape).
+            let result = base + delta as f64;
+            if result == 0.0 {
+                return None;
+            }
+            Some(json!(result))
         }
         // max(field) / min(field): a *rising* extreme (a row entering or growing
         // to/above the current extreme) is cheap to maintain from the delta — the
@@ -591,22 +611,19 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
 
             let mut best: Option<f64> = None; // extreme among rows in-set after the change
             let mut lost = false; // the row holding `cur` left or moved off the extreme
-            for c in &cs.changes {
-                if &c.table != table {
-                    continue;
-                }
-                match filter.membership(c) {
+            for (old, new) in &nets {
+                match filter.membership_images(*old, *new) {
                     (false, true) => {
-                        let v = val(c.new.as_ref())?;
+                        let v = val(*new)?;
                         best = Some(best.map_or(v, |b| toward(b, v)));
                     }
                     (true, false) => {
-                        if holds(val(c.old.as_ref())?) {
+                        if holds(val(*old)?) {
                             lost = true;
                         }
                     }
                     (true, true) => {
-                        let (o, n) = (val(c.old.as_ref())?, val(c.new.as_ref())?);
+                        let (o, n) = (val(*old)?, val(*new)?);
                         best = Some(best.map_or(n, |b| toward(b, n))); // n is still in-set
                         if holds(o) && !holds(n) {
                             lost = true;
@@ -1169,6 +1186,44 @@ mod tests {
 
         assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
         assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15.0));
+    }
+
+    #[tokio::test]
+    async fn ivm_sum_falls_back_when_result_is_zero() {
+        // A computed sum of 0 is ambiguous — the set may be empty (SQL `sum` → NULL)
+        // or its values may cancel to 0 — so both cases must fall back to the re-exec
+        // rather than push a `0` that should be `NULL`.
+        // (a) Emptying delete: sum {8} − 8 → 0.
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        sum_sub(&reactor, "a", "A", 8.0).await;
+        reactor
+            .apply_change_set(cs_of(vec![delete_amount("A", 8)]))
+            .await;
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            1,
+            "emptying delete (sum→0) must fall back, not push 0"
+        );
+
+        // (b) Cancel-to-zero while non-empty: sum 5, a −5 row enters → 0.
+        let reexec2 = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor2 = InMemoryReactor::new(reexec2.clone());
+        let _rx2 = reactor2.register_client("a".into()).await;
+        sum_sub(&reactor2, "a", "A", 5.0).await;
+        reactor2
+            .apply_change_set(cs_of(vec![insert_amount("A", 2, -5)]))
+            .await;
+        assert_eq!(
+            reexec2.calls.load(Ordering::SeqCst),
+            1,
+            "cancel-to-zero must fall back to re-exec"
+        );
     }
 
     #[tokio::test]
@@ -2365,6 +2420,163 @@ mod tests {
             }
             let per = start.elapsed().as_nanos() as f64 / ITERS as f64;
             println!("  hot={hot:>7}  match={per:>8.0} ns/change");
+        }
+    }
+
+    // ── Property test: `try_ivm` is never wrong ──────────────────────────────
+    // For a random initial set and a random change sequence, whenever `try_ivm`
+    // returns a value it must equal a brute-force recompute of the aggregate over
+    // the rows satisfying the filter (channelId == "A"). `try_ivm` may return None
+    // (fall back — the re-exec is the source of truth), but it must NEVER return a
+    // wrong value. This is the core IVM correctness contract.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        type World = BTreeMap<u8, (String, i64)>;
+
+        fn prow(ch: &str, amt: i64) -> RowValues {
+            let mut m = RowValues::new();
+            m.insert("channelId".to_string(), KeyValue::Text(ch.to_string()));
+            m.insert("amount".to_string(), KeyValue::Int(amt));
+            m
+        }
+
+        fn psub(func: AggFunc, field: Option<&str>, last: Value) -> Subscription {
+            let mut rs = ReadSet::new();
+            rs.add_filter(
+                TableId::new("messages"),
+                Filter {
+                    conds: vec![Cond {
+                        field: "channelId".into(),
+                        op: FilterOp::Eq,
+                        value: KeyValue::Text("A".into()),
+                    }],
+                    read_cols: Some(vec!["amount".into()]),
+                    aggregate: Some(pulse_core::Aggregate {
+                        func,
+                        field: field.map(|s| s.to_string()),
+                        distinct: false,
+                    }),
+                },
+            );
+            Subscription {
+                client_id: "p".into(),
+                sub: "s".into(),
+                path: vec![],
+                input: json!({}),
+                headers: HashMap::new(),
+                read_set: rs,
+                last: Some(last),
+                last_lsn: Lsn::ZERO,
+            }
+        }
+
+        // Replay ops onto `initial`, returning (changes, post-world). An op is
+        // (key, Some((channel, amount))) = upsert, or (key, None) = delete. Old/new
+        // images are derived from the simulated world so the changeset is valid.
+        fn replay(initial: &World, ops: &[(u8, Option<(String, i64)>)]) -> (Vec<Change>, World) {
+            let mut world = initial.clone();
+            let mut changes = Vec::new();
+            for (k, act) in ops {
+                let before = world.get(k).cloned();
+                match act {
+                    Some((ch, amt)) => {
+                        world.insert(*k, (ch.clone(), *amt));
+                        changes.push(Change {
+                            table: TableId::new("messages"),
+                            key: PrimaryKey::single(KeyValue::Int(*k as i64)),
+                            op: if before.is_some() {
+                                ChangeOp::Update
+                            } else {
+                                ChangeOp::Insert
+                            },
+                            old: before.as_ref().map(|(c, a)| prow(c, *a)),
+                            new: Some(prow(ch, *amt)),
+                        });
+                    }
+                    None => {
+                        if let Some((c, a)) = before {
+                            world.remove(k);
+                            changes.push(Change {
+                                table: TableId::new("messages"),
+                                key: PrimaryKey::single(KeyValue::Int(*k as i64)),
+                                op: ChangeOp::Delete,
+                                old: Some(prow(&c, a)),
+                                new: None,
+                            });
+                        }
+                    }
+                }
+            }
+            (changes, world)
+        }
+
+        fn amounts_in_a(world: &World) -> Vec<i64> {
+            world
+                .values()
+                .filter(|(c, _)| c == "A")
+                .map(|(_, a)| *a)
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+            #[test]
+            fn try_ivm_is_never_wrong(
+                initial in prop::collection::btree_map(0u8..8, ("A|B", -6i64..12), 0..6),
+                ops in prop::collection::vec((0u8..8, prop::option::of(("A|B", -6i64..12))), 0..10),
+            ) {
+                let (changes, post) = replay(&initial, &ops);
+                let cs = cs_of(changes);
+                let pre = amounts_in_a(&initial);
+                let post_a = amounts_in_a(&post);
+
+                // count(*): always maintainable; an empty set is 0 (not NULL).
+                {
+                    let sub = psub(AggFunc::Count, None, json!(pre.len() as i64));
+                    if let Some(v) = try_ivm(&sub, &cs) {
+                        prop_assert_eq!(v, json!(post_a.len() as i64), "count");
+                    }
+                }
+                // sum / min / max only seed a numeric `last` when the pre-set is
+                // non-empty (an empty aggregate is SQL NULL → `last` is null → falls
+                // back before any delta math).
+                if !pre.is_empty() {
+                    let truth_sum = if post_a.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(post_a.iter().sum::<i64>() as f64)
+                    };
+                    let sub = psub(AggFunc::Sum, Some("amount"), json!(pre.iter().sum::<i64>() as f64));
+                    if let Some(v) = try_ivm(&sub, &cs) {
+                        prop_assert_eq!(v, truth_sum, "sum");
+                    }
+
+                    for (func, is_max) in [(AggFunc::Max, true), (AggFunc::Min, false)] {
+                        let seed = if is_max {
+                            *pre.iter().max().unwrap()
+                        } else {
+                            *pre.iter().min().unwrap()
+                        };
+                        let truth = if post_a.is_empty() {
+                            Value::Null
+                        } else {
+                            let e = if is_max {
+                                *post_a.iter().max().unwrap()
+                            } else {
+                                *post_a.iter().min().unwrap()
+                            };
+                            json!(e as f64)
+                        };
+                        let sub = psub(func, Some("amount"), json!(seed as f64));
+                        if let Some(v) = try_ivm(&sub, &cs) {
+                            prop_assert_eq!(v, truth, "min/max");
+                        }
+                    }
+                }
+            }
         }
     }
 }

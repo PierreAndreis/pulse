@@ -111,11 +111,20 @@ impl Filter {
     /// Whether the change's `old`/`new` images satisfy this filter's conditions —
     /// the `(old_m, new_m)` enter/leave/stay signal incremental aggregates use.
     pub fn membership(&self, change: &Change) -> (bool, bool) {
+        self.membership_images(change.old.as_ref(), change.new.as_ref())
+    }
+
+    /// Membership before/after, computed directly from row images. Used when
+    /// several changes to one row in a commit are coalesced into a single net
+    /// transition (first pre-image, last post-image) before maintaining an
+    /// aggregate, so a row inserted-then-deleted in the same tx counts as a no-op.
+    pub fn membership_images(
+        &self,
+        old: Option<&RowValues>,
+        new: Option<&RowValues>,
+    ) -> (bool, bool) {
         let hit = |row: &RowValues| self.conds.iter().all(|c| eval(c, row));
-        (
-            change.old.as_ref().is_some_and(hit),
-            change.new.as_ref().is_some_and(hit),
-        )
+        (old.is_some_and(hit), new.is_some_and(hit))
     }
 }
 
