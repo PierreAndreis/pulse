@@ -12,6 +12,16 @@ describe("validators — parse", () => {
     expect(() => v.number().parse(Number.NaN)).toThrow(ValidationError);
   });
 
+  it("int accepts integers and rejects non-integers", () => {
+    expect(v.int().parse(3)).toBe(3);
+    expect(v.int().parse(-42)).toBe(-42);
+    expect(v.int().parse(0)).toBe(0);
+    expect(() => v.int().parse(1.5)).toThrow(ValidationError);
+    expect(() => v.int().parse(Number.NaN)).toThrow(ValidationError);
+    expect(() => v.int().parse("3")).toThrow(ValidationError);
+    expect(v.int().describe()).toEqual({ kind: "int" });
+  });
+
   it("handles object optional fields", () => {
     const val = v.object({ a: v.string(), b: v.optional(v.number()) });
     expect(val.parse({ a: "x" })).toEqual({ a: "x" });

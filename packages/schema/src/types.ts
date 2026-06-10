@@ -37,6 +37,7 @@ export class ValidationError extends Error {
 export type ValidatorDescription =
   | { kind: "string" }
   | { kind: "number" }
+  | { kind: "int" }
   | { kind: "boolean" }
   | { kind: "null" }
   | { kind: "any" }

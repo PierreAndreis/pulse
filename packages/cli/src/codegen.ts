@@ -11,6 +11,8 @@ export function tsType(desc: ValidatorDescription): string {
       return "string";
     case "number":
       return "number";
+    case "int":
+      return "number";
     case "boolean":
       return "boolean";
     case "null":

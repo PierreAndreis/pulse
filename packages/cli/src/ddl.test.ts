@@ -30,6 +30,18 @@ describe("pgType jsonb arms via generateDDL", () => {
   });
 });
 
+describe("pgType scalar arms via generateDDL", () => {
+  it("maps int to bigint and number to double precision", () => {
+    const ddl = generateDDL(
+      defineSchema({
+        nums: defineTable({ score: v.int(), ratio: v.number() }),
+      }),
+    );
+    expect(ddl).toContain("score bigint not null");
+    expect(ddl).toContain("ratio double precision not null");
+  });
+});
+
 describe("pgType union arms via generateDDL", () => {
   it("collapses an all-string-literal union to text", () => {
     const ddl = generateDDL(

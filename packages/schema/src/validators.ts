@@ -39,6 +39,20 @@ const number = (): Validator<number> =>
     describe: () => ({ kind: "number" }),
   });
 
+// An integer column (Postgres `bigint`). Unlike `number` (double precision), its
+// values are carried in the change image, so reactive `sum`/`min`/`max` over an
+// `int` field are maintained incrementally (IVM) instead of re-executing.
+const int = (): Validator<number> =>
+  makeValidator({
+    kind: "int",
+    parse: (value, ctx) => {
+      if (typeof value !== "number" || !Number.isInteger(value))
+        fail(ctx, `expected integer, got ${typeof value === "number" ? value : typeof value}`);
+      return value;
+    },
+    describe: () => ({ kind: "int" }),
+  });
+
 const boolean = (): Validator<boolean> =>
   makeValidator({
     kind: "boolean",
@@ -194,6 +208,7 @@ const collab = (): Validator<CollabField> =>
 export const v = {
   string,
   number,
+  int,
   boolean,
   null: nullValidator,
   any,

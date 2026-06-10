@@ -23,6 +23,8 @@ export function pgType(desc: ValidatorDescription): string {
       return "text";
     case "number":
       return "double precision";
+    case "int":
+      return "bigint";
     case "boolean":
       return "boolean";
     case "id":
