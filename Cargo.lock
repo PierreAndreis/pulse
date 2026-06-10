@@ -1826,6 +1826,7 @@ name = "pulse-reactor"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "proptest",
  "pulse-core",
  "serde_json",
  "tokio",
