@@ -11,7 +11,7 @@ use testcontainers_modules::testcontainers::{runners::AsyncRunner, ImageExt};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use pulse_cdc::wal::{ensure_slot, poll_change_sets, WalDecoder};
+use pulse_cdc::wal::{ensure_slot, poll_events, WalDecoder, WalEvent};
 use pulse_core::{Change, ChangeOp, KeyValue, TableId};
 use pulse_sql::{Catalog, Column, PgTypeClass, Table};
 
@@ -101,10 +101,16 @@ impl Fixture {
     /// Drain the slot and return every decoded change across the committed sets.
     async fn drain(&self) -> Vec<Change> {
         let mut decoder = WalDecoder::new(self.catalog.clone());
-        let sets = poll_change_sets(&self.pool, &self.slot, &self.publication, &mut decoder)
+        poll_events(&self.pool, &self.slot, &self.publication, &mut decoder)
             .await
-            .unwrap();
-        sets.into_iter().flat_map(|cs| cs.changes).collect()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e {
+                WalEvent::Changes(cs) => Some(cs.changes),
+                WalEvent::Resync(_) => None,
+            })
+            .flatten()
+            .collect()
     }
 }
 
@@ -247,15 +253,61 @@ async fn wal_consumer_streams_out_of_band_inserts() {
     .await
     .unwrap();
 
-    let cs = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
-        .expect("a ChangeSet arrives within the poll window")
+        .expect("an event arrives within the poll window")
         .expect("consumer channel open");
+    let WalEvent::Changes(cs) = ev else {
+        panic!("expected a Changes event, got {ev:?}");
+    };
     let c = &cs.changes[0];
     assert_eq!(c.op, ChangeOp::Insert);
     assert_eq!(
         c.new.as_ref().and_then(|r| r.get("channelId")),
         Some(&KeyValue::Uuid(channel))
+    );
+}
+
+#[tokio::test]
+async fn out_of_band_truncate_emits_a_resync() {
+    let Some(_) = url().await else {
+        eprintln!("skip: docker unavailable");
+        return;
+    };
+    let fx = fixture("truncate").await;
+    // Reuse one decoder so the relation oid (learned from the insert) is cached
+    // when the Truncate message arrives — exactly how the real consumer runs.
+    let mut decoder = WalDecoder::new(fx.catalog.clone());
+
+    sqlx::query(&format!(
+        "INSERT INTO {} (_id, channel_id, body) VALUES ($1,$2,'x')",
+        fx.table
+    ))
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    // First drain caches the relation (and yields the insert).
+    let _ = poll_events(&fx.pool, &fx.slot, &fx.publication, &mut decoder)
+        .await
+        .unwrap();
+
+    // A raw TRUNCATE — invisible to the engine's write-set capture, and with no
+    // per-row image, so it must surface as a coarse resync of the table.
+    sqlx::query(&format!("TRUNCATE {}", fx.table))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let events = poll_events(&fx.pool, &fx.slot, &fx.publication, &mut decoder)
+        .await
+        .unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WalEvent::Resync(tables) if tables.contains(&TableId::new(fx.table.clone())))),
+        "truncate must emit a Resync for the table, got {events:?}"
     );
 }
 

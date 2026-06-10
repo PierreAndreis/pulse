@@ -420,8 +420,20 @@ async fn main() -> anyhow::Result<()> {
                         let coord = coord.clone();
                         tokio::spawn(async move {
                             let _guard = guard; // hold leadership for the consumer's life
-                            while let Some(cs) = rx.recv().await {
-                                coord.apply_wal(cs, None).await;
+                            while let Some(ev) = rx.recv().await {
+                                match ev {
+                                    pulse_cdc::wal::WalEvent::Changes(cs) => {
+                                        coord.apply_wal(cs, None).await
+                                    }
+                                    pulse_cdc::wal::WalEvent::Resync(tables) => {
+                                        coord
+                                            .apply_invalidation(
+                                                Invalidation::Tables(tables.into_iter().collect()),
+                                                None,
+                                            )
+                                            .await
+                                    }
+                                }
                             }
                         });
                         tracing::info!("WAL consumer started (slot={slot}, poll={poll_ms}ms)");

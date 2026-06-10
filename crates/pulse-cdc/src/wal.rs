@@ -97,6 +97,15 @@ struct Relation {
 /// / binary) values, aligned with the relation's columns.
 type Tuple = Vec<Option<String>>;
 
+/// What the decoder yields. A precise per-commit change-set, or a coarse resync
+/// for tables a `TRUNCATE` emptied (the matcher has no per-row signal for a
+/// truncate, so every subscription on those tables must re-run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalEvent {
+    Changes(ChangeSet),
+    Resync(Vec<TableId>),
+}
+
 /// Stateful pgoutput decoder: caches relations and accumulates a transaction's
 /// changes, emitting one `ChangeSet` per commit (preserving the atomic-tx unit).
 pub struct WalDecoder {
@@ -114,9 +123,10 @@ impl WalDecoder {
         }
     }
 
-    /// Feed one pgoutput message. Returns `Some(ChangeSet)` when a transaction
-    /// commits with at least one reactive change; `None` otherwise.
-    pub fn feed(&mut self, data: &[u8]) -> Result<Option<ChangeSet>, WalError> {
+    /// Feed one pgoutput message. Returns `Some(WalEvent)` when a transaction
+    /// commits with reactive changes, or when a `TRUNCATE` is seen; `None`
+    /// otherwise.
+    pub fn feed(&mut self, data: &[u8]) -> Result<Option<WalEvent>, WalError> {
         let mut r = Reader::new(data);
         match r.u8()? {
             b'B' => {
@@ -132,10 +142,10 @@ impl WalDecoder {
                 if changes.is_empty() {
                     return Ok(None);
                 }
-                Ok(Some(ChangeSet {
+                Ok(Some(WalEvent::Changes(ChangeSet {
                     commit_lsn,
                     changes,
-                }))
+                })))
             }
             b'R' => {
                 self.read_relation(&mut r)?;
@@ -174,10 +184,29 @@ impl WalDecoder {
                 }
                 Ok(None)
             }
-            // Type / Origin / Message / Truncate — not reactive-relevant for the
-            // row matcher (Truncate handling is a later slice).
+            b'T' => self.read_truncate(&mut r),
+            // Type / Origin / Message — not reactive-relevant.
             _ => Ok(None),
         }
+    }
+
+    /// Decode a `Truncate`: Int32 nrelations, Int8 flags, then the relation oids.
+    /// Maps them to catalog table names → a coarse `Resync` (a truncate has no
+    /// per-row image for the matcher). Truncates of unknown/internal relations
+    /// are dropped.
+    fn read_truncate(&self, r: &mut Reader) -> Result<Option<WalEvent>, WalError> {
+        let n = r.i32()?;
+        let _flags = r.u8()?;
+        let mut tables = Vec::new();
+        for _ in 0..n.max(0) {
+            let relid = r.i32()?;
+            if let Some(rel) = self.relations.get(&relid) {
+                if self.catalog.table(&rel.table).is_some() {
+                    tables.push(TableId::new(rel.table.clone()));
+                }
+            }
+        }
+        Ok((!tables.is_empty()).then_some(WalEvent::Resync(tables)))
     }
 
     fn read_relation(&mut self, r: &mut Reader) -> Result<(), WalError> {
@@ -325,17 +354,18 @@ pub async fn poll_raw(pool: &PgPool, slot: &str, publication: &str) -> Result<Ve
     Ok(rows.into_iter().map(|(d,)| d).collect())
 }
 
-/// Drain the slot once and decode into committed `ChangeSet`s.
-pub async fn poll_change_sets(
+/// Drain the slot once and decode into `WalEvent`s (committed change-sets and
+/// truncate resyncs), in WAL order.
+pub async fn poll_events(
     pool: &PgPool,
     slot: &str,
     publication: &str,
     decoder: &mut WalDecoder,
-) -> Result<Vec<ChangeSet>, WalError> {
+) -> Result<Vec<WalEvent>, WalError> {
     let mut out = Vec::new();
     for buf in poll_raw(pool, slot, publication).await? {
-        if let Some(cs) = decoder.feed(&buf)? {
-            out.push(cs);
+        if let Some(ev) = decoder.feed(&buf)? {
+            out.push(ev);
         }
     }
     Ok(out)
@@ -379,17 +409,17 @@ pub fn start_wal_consumer(
     publication: String,
     catalog: Catalog,
     poll_interval: Duration,
-) -> mpsc::Receiver<ChangeSet> {
+) -> mpsc::Receiver<WalEvent> {
     let (tx, rx) = mpsc::channel(256);
     tokio::spawn(async move {
         // One decoder across polls: each get_binary_changes call re-emits the
         // Relation messages it needs, and transactions never split across calls.
         let mut decoder = WalDecoder::new(catalog);
         loop {
-            match poll_change_sets(&pool, &slot, &publication, &mut decoder).await {
-                Ok(sets) => {
-                    for cs in sets {
-                        if tx.send(cs).await.is_err() {
+            match poll_events(&pool, &slot, &publication, &mut decoder).await {
+                Ok(events) => {
+                    for ev in events {
+                        if tx.send(ev).await.is_err() {
                             return; // receiver dropped → host shutting down
                         }
                     }
@@ -508,7 +538,10 @@ mod tests {
             ))
             .unwrap()
             .is_none());
-        let cs = d.feed(&commit_msg(99)).unwrap().expect("commit emits a ChangeSet");
+        let ev = d.feed(&commit_msg(99)).unwrap().expect("commit emits an event");
+        let WalEvent::Changes(cs) = ev else {
+            panic!("expected a Changes event, got {ev:?}");
+        };
 
         assert_eq!(cs.commit_lsn, Lsn(99));
         assert_eq!(cs.changes.len(), 1);
