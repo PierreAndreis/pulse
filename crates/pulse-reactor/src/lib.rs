@@ -7,7 +7,7 @@
 //! [`Reactor::apply_change_set`] entry point — the seam a future WAL/CDC consumer
 //! (or a cross-node bus) plugs into without a second matching path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,6 +22,25 @@ use pulse_core::{ChangeSet, Lsn, ReadSet, TableId};
 pub struct SsePush {
     pub id: u64,
     pub body: String,
+}
+
+/// Outcome of a reconnect via [`Reactor::register_client_resume`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resume {
+    /// A fresh stream (no `Last-Event-ID` presented).
+    Fresh,
+    /// The buffer covered the gap: events after the resume point were replayed
+    /// onto the new stream ahead of live delivery.
+    Resumed,
+    /// The gap rolled past the buffer (or the client is unknown): a `resync`
+    /// control frame was enqueued and the client must re-subscribe.
+    Resync,
+}
+
+/// A `resync` control frame body — tells the client to re-subscribe (its missed
+/// events are no longer buffered).
+fn resync_frame(id: u64) -> String {
+    json!({ "id": id.to_string(), "seq": id, "type": "resync" }).to_string()
 }
 
 #[derive(Clone)]
@@ -97,6 +116,15 @@ pub trait ReExecutor: Send + Sync {
 #[async_trait]
 pub trait Reactor: Send + Sync {
     async fn register_client(&self, client_id: String) -> mpsc::Receiver<SsePush>;
+    /// Reconnect a client, optionally resuming from a `Last-Event-ID`. Returns a
+    /// fresh receiver plus whether the gap was replayed ([`Resume::Resumed`]),
+    /// needs a full re-subscribe ([`Resume::Resync`]), or is a fresh stream
+    /// ([`Resume::Fresh`]). Replayed events are enqueued ahead of any live push.
+    async fn register_client_resume(
+        &self,
+        client_id: String,
+        last_event_id: Option<u64>,
+    ) -> (mpsc::Receiver<SsePush>, Resume);
     async fn remove_client(&self, client_id: &str);
     async fn add_subscription(&self, sub: Subscription);
     async fn remove_subscription(&self, client_id: &str, sub: &str);
@@ -127,6 +155,10 @@ pub trait Reactor: Send + Sync {
 struct Client {
     tx: mpsc::Sender<SsePush>,
     seq: u64,
+    /// Bounded tail of recent pushes (newest at the back) for `Last-Event-ID`
+    /// resume. Capacity matches the SSE channel, so a covered reconnect's replay
+    /// always fits. Holds a contiguous id range `[seq-len+1 ..= seq]`.
+    buffer: VecDeque<SsePush>,
 }
 
 fn sub_key(client_id: &str, sub: &str) -> String {
@@ -315,23 +347,31 @@ impl InMemoryReactor {
     /// holding the global lock and wedge every other client's push + register/
     /// remove — head-of-line blocking the whole reactor on the slowest browser.
     async fn send(&self, client_id: &str, sub: &str, value: &Value, commit_lsn: Lsn) -> bool {
-        let (tx, id) = {
+        let (tx, push) = {
             let mut clients = self.clients.lock().await;
             let Some(client) = clients.get_mut(client_id) else {
                 return false;
             };
             client.seq += 1;
-            (client.tx.clone(), client.seq)
+            let id = client.seq;
+            // Body built under the lock (cheap CPU); only the bounded-channel
+            // `send().await` stays outside it (the no-head-of-line invariant).
+            let body = json!({
+                "sub": sub,
+                "id": id.to_string(),
+                "seq": id,
+                "commitLsn": commit_lsn.to_string(),
+                "data": value,
+            })
+            .to_string();
+            let push = SsePush { id, body };
+            client.buffer.push_back(push.clone());
+            while client.buffer.len() > self.sse_buffer {
+                client.buffer.pop_front();
+            }
+            (client.tx.clone(), push)
         };
-        let body = json!({
-            "sub": sub,
-            "id": id.to_string(),
-            "seq": id,
-            "commitLsn": commit_lsn.to_string(),
-            "data": value,
-        })
-        .to_string();
-        tx.send(SsePush { id, body }).await.is_ok()
+        tx.send(push).await.is_ok()
     }
 
     /// Re-execute the given subscriptions and push any changed result, stamped
@@ -465,11 +505,80 @@ impl InMemoryReactor {
 impl Reactor for InMemoryReactor {
     async fn register_client(&self, client_id: String) -> mpsc::Receiver<SsePush> {
         let (tx, rx) = mpsc::channel(self.sse_buffer);
-        self.clients
-            .lock()
-            .await
-            .insert(client_id, Client { tx, seq: 0 });
+        self.clients.lock().await.insert(
+            client_id,
+            Client {
+                tx,
+                seq: 0,
+                buffer: VecDeque::new(),
+            },
+        );
         rx
+    }
+
+    async fn register_client_resume(
+        &self,
+        client_id: String,
+        last_event_id: Option<u64>,
+    ) -> (mpsc::Receiver<SsePush>, Resume) {
+        let (tx, rx) = mpsc::channel(self.sse_buffer);
+        let Some(n) = last_event_id else {
+            // Fresh stream — no resume point.
+            self.clients.lock().await.insert(
+                client_id,
+                Client {
+                    tx,
+                    seq: 0,
+                    buffer: VecDeque::new(),
+                },
+            );
+            return (rx, Resume::Fresh);
+        };
+        let mut clients = self.clients.lock().await;
+        match clients.get_mut(&client_id) {
+            Some(client) => {
+                client.tx = tx.clone();
+                // The buffer holds a contiguous id range, so the gap after `n` is
+                // covered iff the oldest buffered id is ≤ n+1.
+                let covered = match client.buffer.front() {
+                    Some(oldest) => n + 1 >= oldest.id,
+                    None => n == client.seq, // empty buffer: only if fully caught up
+                };
+                if covered {
+                    // Replay every buffered event after the resume point, in order,
+                    // ahead of any live push (try_send: capacity ≥ buffer len).
+                    for p in client.buffer.iter().filter(|p| p.id > n) {
+                        let _ = tx.try_send(p.clone());
+                    }
+                    (rx, Resume::Resumed)
+                } else {
+                    client.seq += 1;
+                    let id = client.seq;
+                    let _ = tx.try_send(SsePush {
+                        id,
+                        body: resync_frame(id),
+                    });
+                    (rx, Resume::Resync)
+                }
+            }
+            None => {
+                // Unknown client presenting a resume point (server restarted, or a
+                // stale id) — nothing to replay; tell it to re-subscribe.
+                let _ = tx.try_send(SsePush {
+                    id: 1,
+                    body: resync_frame(1),
+                });
+                clients.insert(
+                    client_id,
+                    Client {
+                        tx,
+                        seq: 1,
+                        buffer: VecDeque::new(),
+                    },
+                );
+                (rx, Resume::Resync)
+            }
+        }
     }
 
     async fn remove_client(&self, client_id: &str) {
@@ -826,6 +935,101 @@ mod tests {
         )
         .await;
         assert!(ok.is_ok(), "a tiny SSE buffer must not wedge other clients");
+    }
+
+    // ── SSE resume (M5) ──────────────────────────────────────────────────────
+
+    fn reactor_for_resume() -> InMemoryReactor {
+        InMemoryReactor::new(Arc::new(UniqueReExec {
+            n: AtomicUsize::new(0),
+        }))
+    }
+
+    /// Slice 1: a reconnect with a Last-Event-ID replays the buffered events
+    /// after it, in order, and nothing else.
+    #[tokio::test]
+    async fn resume_replays_events_after_last_event_id() {
+        let reactor = reactor_for_resume();
+        let _rx = reactor.register_client("a".into()).await;
+        for i in 1..=3 {
+            reactor.push("a", "s", &json!({ "n": i }), Lsn::ZERO).await;
+        }
+        let (mut rx, outcome) = reactor.register_client_resume("a".into(), Some(1)).await;
+        assert_eq!(outcome, Resume::Resumed);
+        assert_eq!(rx.try_recv().unwrap().id, 2);
+        assert_eq!(rx.try_recv().unwrap().id, 3);
+        assert!(rx.try_recv().is_err(), "only the missed events are replayed");
+    }
+
+    /// Slice 2: the buffer is bounded by PULSE_SSE_BUFFER — a reconnect can
+    /// resume exactly the newest `cap` events.
+    #[tokio::test]
+    async fn resume_buffer_is_bounded() {
+        let reactor = reactor_for_resume().with_sse_buffer(4);
+        let mut rx0 = reactor.register_client("a".into()).await;
+        for i in 1..=10 {
+            reactor.push("a", "s", &json!({ "n": i }), Lsn::ZERO).await;
+            let _ = rx0.try_recv(); // drain live delivery so the channel never fills
+        }
+        // Only ids 7..=10 remain; resuming after 6 replays exactly those four.
+        let (mut rx, outcome) = reactor.register_client_resume("a".into(), Some(6)).await;
+        assert_eq!(outcome, Resume::Resumed);
+        let ids: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok().map(|p| p.id)).collect();
+        assert_eq!(ids, vec![7, 8, 9, 10]);
+    }
+
+    /// Slice 3: when the resume point rolled past the buffer, the client gets a
+    /// `resync` frame, not a partial/silent replay.
+    #[tokio::test]
+    async fn resume_past_the_buffer_requests_resync() {
+        let reactor = reactor_for_resume().with_sse_buffer(4);
+        let mut rx0 = reactor.register_client("a".into()).await;
+        for i in 1..=10 {
+            reactor.push("a", "s", &json!({ "n": i }), Lsn::ZERO).await;
+            let _ = rx0.try_recv(); // drain live delivery so the channel never fills
+        }
+        // id 5 was evicted (only 7..=10 remain) → the gap can't be replayed.
+        let (mut rx, outcome) = reactor.register_client_resume("a".into(), Some(5)).await;
+        assert_eq!(outcome, Resume::Resync);
+        let frame = rx.try_recv().unwrap();
+        assert!(frame.body.contains("\"type\":\"resync\""));
+        assert!(rx.try_recv().is_err(), "only the resync control frame");
+    }
+
+    /// Slice 4: replayed events precede live ones with no duplicate or gap.
+    #[tokio::test]
+    async fn resume_replay_precedes_live_pushes() {
+        let reactor = reactor_for_resume();
+        let _rx = reactor.register_client("a".into()).await;
+        for i in 1..=5 {
+            reactor.push("a", "s", &json!({ "n": i }), Lsn::ZERO).await;
+        }
+        let (mut rx, outcome) = reactor.register_client_resume("a".into(), Some(3)).await;
+        assert_eq!(outcome, Resume::Resumed);
+        // A live push after the resume continues the same monotonic stream.
+        reactor.push("a", "s", &json!({ "n": 6 }), Lsn::ZERO).await;
+        let ids: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok().map(|p| p.id)).collect();
+        assert_eq!(ids, vec![4, 5, 6], "replay 4,5 then live 6 — no dup, no gap");
+    }
+
+    /// Slice 5: an unknown client presenting a resume point (server restart, or a
+    /// stale id) degrades to `resync`.
+    #[tokio::test]
+    async fn resume_unknown_client_requests_resync() {
+        let reactor = reactor_for_resume();
+        let (mut rx, outcome) = reactor
+            .register_client_resume("never-seen".into(), Some(5))
+            .await;
+        assert_eq!(outcome, Resume::Resync);
+        assert!(rx.try_recv().unwrap().body.contains("resync"));
+    }
+
+    /// No Last-Event-ID is a fresh stream (the existing connect path).
+    #[tokio::test]
+    async fn resume_without_last_event_id_is_fresh() {
+        let reactor = reactor_for_resume();
+        let (_rx, outcome) = reactor.register_client_resume("a".into(), None).await;
+        assert_eq!(outcome, Resume::Fresh);
     }
 
     /// Re-executor that ALWAYS returns the same fixed value, regardless of how
