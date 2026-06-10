@@ -217,7 +217,7 @@ describe("SSE resume (Last-Event-ID / resync)", () => {
 
   test("a resync frame re-registers every subscription and adopts its id", async () => {
     vi.useFakeTimers();
-    const fetchMock = vi.fn(async () => {
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
       throw new Error("no network");
     });
     const { client } = makeClient({ fetch: fetchMock as unknown as ClientOptions["fetch"] });
