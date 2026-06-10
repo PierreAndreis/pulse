@@ -567,26 +567,29 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
         // to/above the current extreme) is cheap to maintain from the delta — the
         // monotonic high-water-mark case stays fully incremental. But *removing* or
         // *lowering* the row that holds the extreme needs the next-best value, which
-        // isn't in the change image, so we fall back. Integer fields only (same
-        // reasons as sum: only ints are carried in the change image, and it keeps the
-        // comparisons exact). An empty set's extreme is SQL NULL → non-int `last`
-        // falls back.
+        // isn't in the change image, so we fall back.
+        //
+        // Integer fields only: the change image carries no floats (KeyValue must stay
+        // Hash+Eq for primary keys), so a float/absent field → None → fall back. The
+        // engine reads scalar aggregates as f64 (fetch_scalar_opt_f64), so `last` and
+        // the output are f64 even for integer columns — matching sum and the re-exec
+        // shape; an empty set's extreme is SQL NULL → non-numeric `last` falls back.
         AggFunc::Max | AggFunc::Min if agg.field.is_some() && !agg.distinct => {
             let is_max = matches!(agg.func, AggFunc::Max);
             let field = agg.field.as_ref().unwrap();
-            let cur = last.as_i64()?; // Null (empty set) / non-int → fall back
-            let int = |row: Option<&RowValues>| -> Option<i64> {
+            let cur = last.as_f64()?; // Null (empty set) / non-numeric → fall back
+            let val = |row: Option<&RowValues>| -> Option<f64> {
                 match row?.get(field)? {
-                    KeyValue::Int(n) => Some(*n),
+                    KeyValue::Int(n) => Some(*n as f64),
                     _ => None,
                 }
             };
             // `toward(cur, v)` keeps the value closer to the extreme (the larger for
             // max, the smaller for min); `holds(v)` is true when v reaches the extreme.
-            let toward = |a: i64, b: i64| if is_max { a.max(b) } else { a.min(b) };
-            let holds = |v: i64| if is_max { v >= cur } else { v <= cur };
+            let toward = |a: f64, b: f64| if is_max { a.max(b) } else { a.min(b) };
+            let holds = |v: f64| if is_max { v >= cur } else { v <= cur };
 
-            let mut best: Option<i64> = None; // extreme among rows in-set after the change
+            let mut best: Option<f64> = None; // extreme among rows in-set after the change
             let mut lost = false; // the row holding `cur` left or moved off the extreme
             for c in &cs.changes {
                 if &c.table != table {
@@ -594,16 +597,16 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
                 }
                 match filter.membership(c) {
                     (false, true) => {
-                        let v = int(c.new.as_ref())?;
+                        let v = val(c.new.as_ref())?;
                         best = Some(best.map_or(v, |b| toward(b, v)));
                     }
                     (true, false) => {
-                        if holds(int(c.old.as_ref())?) {
+                        if holds(val(c.old.as_ref())?) {
                             lost = true;
                         }
                     }
                     (true, true) => {
-                        let (o, n) = (int(c.old.as_ref())?, int(c.new.as_ref())?);
+                        let (o, n) = (val(c.old.as_ref())?, val(c.new.as_ref())?);
                         best = Some(best.map_or(n, |b| toward(b, n))); // n is still in-set
                         if holds(o) && !holds(n) {
                             lost = true;
@@ -1254,7 +1257,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let mut rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10.0)).await;
 
         // A new high-water mark enters → maintained with no re-exec.
         reactor
@@ -1262,7 +1265,7 @@ mod tests {
             .await;
 
         assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15));
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15.0));
     }
 
     #[tokio::test]
@@ -1272,7 +1275,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let mut rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10.0)).await;
 
         // A row below the max enters → max stays 10, no re-exec, push suppressed.
         reactor
@@ -1290,7 +1293,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let mut rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10.0)).await;
 
         // A row well below the max leaves → the max still has a holder, no re-exec.
         reactor
@@ -1308,7 +1311,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let _rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10.0)).await;
 
         // The row holding the max leaves and nothing reaches it → next-best unknown
         // → fall back to a re-exec (the only source of truth for the new max).
@@ -1326,7 +1329,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let _rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10.0)).await;
 
         // The max holder stays in the filter but its value drops below the max → the
         // new max is some other row's value we don't have → fall back.
@@ -1344,7 +1347,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let mut rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10.0)).await;
 
         // A non-extreme row grows past the current max → maintained, no re-exec.
         reactor
@@ -1352,7 +1355,7 @@ mod tests {
             .await;
 
         assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(20));
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(20.0));
     }
 
     #[tokio::test]
@@ -1362,7 +1365,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let mut rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Min, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Min, json!(10.0)).await;
 
         // A new low enters → min maintained with no re-exec.
         reactor
@@ -1370,7 +1373,7 @@ mod tests {
             .await;
 
         assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(5));
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(5.0));
     }
 
     #[tokio::test]
@@ -1380,7 +1383,7 @@ mod tests {
         });
         let reactor = InMemoryReactor::new(reexec.clone());
         let _rx = reactor.register_client("a".into()).await;
-        extreme_sub(&reactor, "a", "A", AggFunc::Min, json!(10)).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Min, json!(10.0)).await;
 
         // The row holding the min leaves and nothing reaches it → fall back.
         reactor
