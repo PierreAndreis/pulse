@@ -2,6 +2,7 @@
 // (schema + handlers), reports a manifest, then for each `execute` runs the
 // handler with an instrumented `ctx.db` whose operations are proxied back to the
 // engine (which owns Postgres). See `pulse-jsruntime` for the engine side.
+import { createGetLoader } from "./loader";
 import { executeProcedure, PulseError } from "@onveloz/pulse-server";
 import type { RegisteredProcedure } from "@onveloz/pulse-server";
 import { ValidationError } from "@onveloz/pulse-schema";
@@ -67,6 +68,12 @@ function tableOf(id: unknown): string {
 
 function makeDb(requestId: string) {
   const call = (op: Record<string, unknown>) => dbop(requestId, op);
+
+  // DataLoader: collapse N concurrent get()s of one table into a single GetMany.
+  // `makeDb` is per-request, so this loader (and its batches) is request-scoped.
+  const getLoader = createGetLoader(
+    (table, ids) => call({ kind: "getmany", table, ids }) as Promise<unknown[]>,
+  );
 
   function rangeBuilder(predicates: Array<Record<string, unknown>>) {
     const push = (op: string) => (field: string, value: unknown) => {
@@ -182,7 +189,12 @@ function makeDb(requestId: string) {
   }
 
   return {
-    get: (id: unknown) => call({ kind: "get", table: tableOf(id), id }),
+    get: (id: unknown) => {
+      const table = tableOf(id);
+      // A malformed id (no `table:` prefix) can't be grouped by table → fall back
+      // to a single get so the engine surfaces its usual bad-id behavior.
+      return table === "" ? call({ kind: "get", table, id }) : getLoader(table, id);
+    },
     query,
     insert: (table: string, value: unknown) => call({ kind: "insert", table, value }),
     patch: (id: unknown, fields: unknown) => call({ kind: "patch", table: tableOf(id), id, fields }),
