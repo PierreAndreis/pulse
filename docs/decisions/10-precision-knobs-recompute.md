@@ -1,6 +1,7 @@
 # 10. Reactor Precision, Tuning Knobs, and the Recompute Frontier
 
 - **Status:** Accepted — closes several cons ADR 05 booked ("over-invalidation", "re-execution cost is the hot path") and records the tuning philosophy and a benchmark-grounded map of where Pulse actually hurts. Tracked in `docs/ARCHITECTURE.md` §10 and `docs/TUNING.md`.
+- **Update (since landed):** the tractable subset of the recompute frontier this ADR identified is now implemented — **incremental view maintenance for `count(*)` and `sum(integer field)`** (the reactor maintains the scalar from the change delta with zero worker re-execs; see the IVM section under "Out of Scope / Deferred"). `avg`, `min`/`max`, `count(distinct)`, and batched `get`s remain deferred.
 
 ## Context & Problem
 
@@ -29,7 +30,7 @@ ADR 05's M2 matcher was deliberately coarse: a write to a table re-ran **every**
 
 - **Per-sub coalescing/debounce window** to cut the *number* of recomputes under write storms. Deferred — it touches the core invalidation path under concurrency (risk of a missed final re-exec = a stale subscriber); left as a future knob (default off).
 - **Hashing the retained last-value** to cut per-sub memory. Rejected — a hash collision suppresses a genuine push (silent staleness); correctness over memory.
-- **General incremental view maintenance now.** The real fix for recompute, but a large engine that constrains supported SQL (ADR 05 / §4.1 deferred it). The tractable subset — incremental `sum/count/avg` from the change delta, and batched `get`s for N+1 — is the identified next seam, not this ADR.
+- **General incremental view maintenance now.** The real fix for recompute, but a large engine that constrains supported SQL (ADR 05 / §4.1 deferred it). The tractable subset — incremental `count`/`sum` from the change delta, and batched `get`s for N+1 — is the identified next seam. The aggregate part of that subset has since shipped (`count(*)` and integer `sum`); see the Update note above.
 - **A SQL `JOIN` instead of composition** to kill N+1. Trades the precise per-row read-set for a coarse two-table dependency; offered as a future option, not the default.
 
 ## Consequences
@@ -47,7 +48,7 @@ Cons: the table index and per-sub `last_lsn`/read-cols add bookkeeping and a lit
 
 ## Out of Scope / Deferred
 
-- **Incremental view maintenance** for aggregates and filtered lists (the recompute fix).
+- **Incremental view maintenance** — **`count(*)` and `sum(integer field)` SHIPPED**: the reactor maintains the scalar from the change delta (+/− per row entering/leaving the filter, value-delta on a stay), with zero worker re-execs, falling back to re-execution for any shape it can't maintain exactly (float/jsonb sum fields aren't captured in the change image; an empty set's sum is `NULL`). **Deferred:** `avg` (needs auxiliary running sum+count state the initial query doesn't return), `min`/`max` and `count(distinct)` (need the dataset, not just a delta), and incremental **filtered-list** deltas.
 - **Batched `get`s / DataLoader** in the worker to collapse N+1 joins to one `IN` query.
 - **Per-subscription coalescing/debounce** for rapid same-sub invalidations.
 - **Delta push** (changed rows only) for large results, and the retained-last-value memory it would shrink.
