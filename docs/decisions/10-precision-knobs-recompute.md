@@ -1,7 +1,7 @@
 # 10. Reactor Precision, Tuning Knobs, and the Recompute Frontier
 
 - **Status:** Accepted — closes several cons ADR 05 booked ("over-invalidation", "re-execution cost is the hot path") and records the tuning philosophy and a benchmark-grounded map of where Pulse actually hurts. Tracked in `docs/ARCHITECTURE.md` §10 and `docs/TUNING.md`.
-- **Update (since landed):** the tractable subset of the recompute frontier this ADR identified is now implemented — **incremental view maintenance for `count(*)` and `sum(integer field)`** (the reactor maintains the scalar from the change delta with zero worker re-execs; see the IVM section under "Out of Scope / Deferred"). `avg`, `min`/`max`, `count(distinct)`, and batched `get`s remain deferred.
+- **Update (since landed):** the tractable subset of the recompute frontier this ADR identified is now implemented — **incremental view maintenance for `count(*)` and `sum(integer field)`** (the reactor maintains the scalar from the change delta with zero worker re-execs; see the IVM section under "Out of Scope / Deferred") and **batched `get`s / DataLoader** (the worker collapses concurrent per-row `get`s into one `ANY($1::uuid[])` round-trip). `avg`, `min`/`max`, and `count(distinct)` remain deferred.
 
 ## Context & Problem
 
@@ -49,7 +49,7 @@ Cons: the table index and per-sub `last_lsn`/read-cols add bookkeeping and a lit
 ## Out of Scope / Deferred
 
 - **Incremental view maintenance** — **`count(*)` and `sum(integer field)` SHIPPED**: the reactor maintains the scalar from the change delta (+/− per row entering/leaving the filter, value-delta on a stay), with zero worker re-execs, falling back to re-execution for any shape it can't maintain exactly (float/jsonb sum fields aren't captured in the change image; an empty set's sum is `NULL`). **Deferred:** `avg` (needs auxiliary running sum+count state the initial query doesn't return), `min`/`max` and `count(distinct)` (need the dataset, not just a delta), and incremental **filtered-list** deltas.
-- **Batched `get`s / DataLoader** in the worker to collapse N+1 joins to one `IN` query.
+- **Batched `get`s / DataLoader** — **SHIPPED**: the worker collapses every `ctx.db.get(id)` of one table issued within the same microtask tick into a single `DbOp::GetMany` (`SELECT … WHERE _id = ANY(ARRAY[$1::uuid, …])`), one round-trip instead of N. The engine returns a result array index-aligned to the requested ids (missing → `null`); `capture_reads` records one point key per id, so the read-set is value-identical to N separate `get`s and M3 key-level invalidation precision is preserved. **Limitation:** only `get`s in flight together batch — `Promise.all(rows.map(r => ctx.db.get(r.id)))` becomes one query, but a sequential `for…await` loop flushes one id per tick (batch size 1, no speedup). This is transparent and correct either way; realizing the win requires the handler to issue the gets concurrently.
 - **Per-subscription coalescing/debounce** for rapid same-sub invalidations.
 - **Delta push** (changed rows only) for large results, and the retained-last-value memory it would shrink.
 - **Analyzer precision** — JSONB ops, true index-range tuples, and a declarable read-set for `ctx.sql` so the escape hatch isn't a recompute magnet.
