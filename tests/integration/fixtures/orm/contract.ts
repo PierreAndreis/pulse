@@ -32,6 +32,7 @@ export const contract = {
     avgQty: numN(),
     minQty: numN(),
     maxQty: numN(),
+    maxScoreActive: numN(), // max() over an int field + filter — maintained by IVM
     // grouping
     byActive: rows(),
     sumByTag: rows(),
@@ -40,7 +41,7 @@ export const contract = {
     withAuthor: rows(),
     // mutations
     addAuthor: oc.mutation().input(v.object({ name: v.string() })).output(v.any()),
-    addWidget: oc.mutation().input(v.object({ name: v.string(), qty: v.number(), price: v.optional(v.number()), active: v.boolean(), tag: v.optional(v.string()), authorId: v.optional(v.id("authors")) })).output(v.any()),
+    addWidget: oc.mutation().input(v.object({ name: v.string(), qty: v.number(), price: v.optional(v.number()), score: v.optional(v.int()), active: v.boolean(), tag: v.optional(v.string()), authorId: v.optional(v.id("authors")) })).output(v.any()),
     renameAuthor: oc.mutation().input(v.object({ id: v.id("authors"), name: v.string() })).output(v.null()),
     setActive: oc.mutation().input(v.object({ id: v.id("widgets"), active: v.boolean() })).output(v.null()),
     renameWidget: oc.mutation().input(v.object({ id: v.id("widgets"), name: v.string() })).output(v.null()),

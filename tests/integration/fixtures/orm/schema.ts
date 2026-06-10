@@ -9,6 +9,10 @@ export default defineSchema({
     name: v.string(),
     qty: v.number(),
     price: v.optional(v.number()),
+    // Integer column (bigint): its values are carried in the change image, so a
+    // reactive max(score) is maintained by IVM (not re-executed) — unlike qty/price
+    // (double precision), which aren't captured and always re-exec.
+    score: v.optional(v.int()),
     active: v.boolean(),
     tag: v.optional(v.string()),
     authorId: v.optional(v.id("authors")),

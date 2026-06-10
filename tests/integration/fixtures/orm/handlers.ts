@@ -45,6 +45,10 @@ export const sumPrice = os.w.sumPrice.handler(async ({ ctx }) => q(ctx).sum("pri
 export const avgQty = os.w.avgQty.handler(async ({ ctx }) => q(ctx).avg("qty"));
 export const minQty = os.w.minQty.handler(async ({ ctx }) => q(ctx).min("qty"));
 export const maxQty = os.w.maxQty.handler(async ({ ctx }) => q(ctx).max("qty"));
+// max() over an INTEGER field with a filter — int values are in the change image,
+// so the reactor maintains this by IVM (no worker re-exec) on a new high score.
+export const maxScoreActive = os.w.maxScoreActive.handler(async ({ ctx }) =>
+  q(ctx).filter((x: any) => x.eq("active", true)).max("score"));
 
 export const byActive = os.w.byActive.handler(async ({ ctx }) => q(ctx).groupBy("active").count());
 export const sumByTag = os.w.sumByTag.handler(async ({ ctx }) => q(ctx).groupBy("tag").sum("price"));
@@ -67,6 +71,7 @@ export const addAuthor = os.w.addAuthor.handler(async ({ ctx, input }: any) => {
 export const addWidget = os.w.addWidget.handler(async ({ ctx, input }: any) => {
   const doc: any = { name: input.name, qty: input.qty, active: input.active };
   if (input.price !== undefined) doc.price = input.price;
+  if (input.score !== undefined) doc.score = input.score;
   if (input.tag !== undefined) doc.tag = input.tag;
   if (input.authorId !== undefined) doc.authorId = input.authorId;
   const id = await ctx.db.insert("widgets", doc);
