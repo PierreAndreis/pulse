@@ -131,6 +131,40 @@ describe("ORM group by", () => {
   });
 });
 
+describe("ORM replace vs patch", () => {
+  test("replace nulls columns omitted from the value (true replace, not patch)", async () => {
+    const w = (await c.w.addWidget.call({
+      name: "r1",
+      qty: 1,
+      price: 10,
+      score: 7,
+      active: true,
+      tag: "x",
+    })) as { _id: string };
+
+    // Replace supplying only the required fields (+ a changed qty) — every omitted
+    // optional column must be nulled. A patch would have left price/score/tag intact.
+    await c.w.replaceWidget.call({ id: w._id as never, name: "r1", qty: 9, active: false });
+
+    const got = (await c.w.list.call({})).find((r: any) => r.name === "r1") as any;
+    expect(got.qty).toBe(9);
+    expect(got.active).toBe(false);
+    expect(got.price ?? null).toBeNull(); // omitted → nulled
+    expect(got.score ?? null).toBeNull();
+    expect(got.tag ?? null).toBeNull();
+  });
+
+  test("patch leaves omitted columns intact (contrast with replace)", async () => {
+    const w = (await c.w.addWidget.call({ name: "p1", qty: 1, price: 10, active: true })) as {
+      _id: string;
+    };
+    await c.w.renameWidget.call({ id: w._id as never, name: "p1-renamed" }); // patch: name only
+    const got = (await c.w.list.call({})).find((r: any) => r.name === "p1-renamed") as any;
+    expect(got.price).toBe(10); // untouched by the patch
+    expect(got.qty).toBe(1);
+  });
+});
+
 describe("ORM joins (handler composition)", () => {
   test("join widgets→authors and react to a change in the joined row", async () => {
     const alice = (await c.w.addAuthor.call({ name: "alice" })) as { _id: string };

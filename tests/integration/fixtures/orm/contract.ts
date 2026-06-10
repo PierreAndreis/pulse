@@ -45,6 +45,7 @@ export const contract = {
     renameAuthor: oc.mutation().input(v.object({ id: v.id("authors"), name: v.string() })).output(v.null()),
     setActive: oc.mutation().input(v.object({ id: v.id("widgets"), active: v.boolean() })).output(v.null()),
     renameWidget: oc.mutation().input(v.object({ id: v.id("widgets"), name: v.string() })).output(v.null()),
+    replaceWidget: oc.mutation().input(v.object({ id: v.id("widgets"), name: v.string(), qty: v.number(), active: v.boolean(), price: v.optional(v.number()), score: v.optional(v.int()), tag: v.optional(v.string()) })).output(v.null()),
     remove: oc.mutation().input(v.object({ id: v.id("widgets") })).output(v.null()),
   },
 };

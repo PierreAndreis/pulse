@@ -89,6 +89,13 @@ export const renameWidget = os.w.renameWidget.handler(async ({ ctx, input }: any
   await ctx.db.patch(input.id, { name: input.name });
   return null;
 });
+// Full replace: the row becomes exactly the provided value — optional fields the
+// caller omits are nulled (distinct from patch, which would leave them intact).
+export const replaceWidget = os.w.replaceWidget.handler(async ({ ctx, input }: any) => {
+  const { id, ...value } = input;
+  await ctx.db.replace(id, value);
+  return null;
+});
 export const remove = os.w.remove.handler(async ({ ctx, input }: any) => {
   await ctx.db.delete(input.id);
   return null;

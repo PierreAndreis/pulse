@@ -39,7 +39,7 @@ Because the engine sees every op, it captures the read/write-set *before* execut
 - **Get:** `SELECT <select_list> FROM <table> WHERE _id = $1::uuid`, returning the first row or `null`.
 - **Query:** `SELECT <select_list> FROM <table>` + optional `WHERE` (predicates AND-joined as `<col> <op> $n::<cast>`) + optional `ORDER BY _creation_time ASC|DESC` + a `LIMIT` chosen by mode (`take` → user limit, `first` → `LIMIT 1`, `unique` → `LIMIT 2`, `collect` → none). `unique` errors (`NotUnique`) if more than one row comes back. Order is always by `_creation_time`; index names from `withIndex` are accepted by the builder but **ignored** by lowering.
 - **Insert:** `INSERT INTO <table> (...) VALUES (...) RETURNING <select_list>` (or `DEFAULT VALUES` when no fields are given). Returns only the new `_id` string.
-- **Patch/Replace:** both lower to `UPDATE <table> SET <col> = $n::<cast>, ... WHERE _id = $k::uuid`. They share one `update()` path; Patch and Replace are **not distinguished at the SQL level** — an empty field map is a no-op returning `null`, and neither clears columns omitted from the map. (See Consequences: Replace does not yet null out unspecified columns.)
+- **Patch:** lowers to `UPDATE <table> SET <col> = $n::<cast>, ... WHERE _id = $k::uuid` over only the provided fields; an empty field map is a no-op returning `null`. **Replace:** lowers to an `UPDATE` over **every** user column — provided fields to their value, omitted ones to `NULL` — preserving the system columns (`_id`, `_creationTime`). An omitted `NOT NULL` column surfaces a constraint error, since a full replace must supply every required field. Unknown fields are rejected in both.
 - **Delete:** `DELETE FROM <table> WHERE _id = $1::uuid`, returns `null`.
 - **Raw:** the user-authored SQL is wrapped as `SELECT to_jsonb(__pulse_sub) AS j FROM ( <user sql> ) AS __pulse_sub`, so arbitrary result columns decode dynamically as one `jsonb` value per row; returns an array.
 
@@ -83,7 +83,7 @@ Rules: a `_id` column always references its own table; a user-declared `id` fiel
 **Cons / costs later**
 - **Text round-tripping leans on Postgres text representations.** Float precision, timestamp formatting, and `Bool` parsing (`"true"|"t"`) are tied to PG's text I/O; edge cases (e.g. numeric precision, non-UTC timestamps) may need revisiting. `Other` types silently degrade to `text`.
 - **Read-set is table-level only.** Every reactive query invalidates on any write to a touched table; the key/range tiering in ARCHITECTURE.md §3.5 is not implemented here. `Raw` captures nothing, so analytical queries are not reactive.
-- **Patch vs Replace are not distinguished in SQL.** Both only `SET` the provided fields; Replace does **not** null out columns absent from the map, and an empty map is a no-op. This differs from the intended `replace` semantics (full-document overwrite) and is a latent correctness gap.
+- **Patch vs Replace are now distinguished in SQL.** Patch `SET`s only the provided fields (empty map → no-op). Replace writes every user column — omitted ones to `NULL` — for true full-document overwrite, preserving `_id`/`_creationTime`; an omitted `NOT NULL` column errors. (Was a latent correctness gap; fixed.)
 - **`withIndex` is cosmetic.** Index names are ignored and ordering is hard-coded to `_creation_time`; predicates always become a flat `WHERE ... AND ...`. There is no index selection or true range scan yet.
 - **Raw id decoding is heuristic.** `decode_id_param` guesses based on a valid-uuid suffix; a non-id string shaped like `prefix:<valid-uuid>` would be silently rewritten.
 - **Catalog is built once from a manifest snapshot.** Schema changes after startup are not reflected without re-introspection.
@@ -97,13 +97,13 @@ Prior art already covering this decision:
 - `tests/integration/analytical.test.ts` — `ctx.sql` raw queries over real data, including CTEs + `GROUP BY` + aggregates (the `to_jsonb` wrapping + raw param binding decision).
 - `crates/pulse-sql/src/naming.rs` has unit tests for the camelCase↔snake_case mapping and round-trips — the one piece tested in isolation because it is pure and deterministic.
 
-What a good *new* test looks like for the gaps above: a client-level test that sends a value of each scalar kind (`int8`, `float8`, `bool`, `timestamptz`, `jsonb`, id ref) and asserts the value read back equals what was written (text round-trip fidelity); and, when Replace semantics are tightened, a test asserting that `replace` nulls out omitted optional fields while `patch` leaves them intact.
+What a good *new* test looks like for the gaps above: a client-level test that sends a value of each scalar kind (`int8`, `float8`, `bool`, `timestamptz`, `jsonb`, id ref) and asserts the value read back equals what was written (text round-trip fidelity). (Replace semantics are now covered: `tests/integration/orm.test.ts` asserts `replace` nulls omitted optional fields while `patch` leaves them intact.)
 
 ## Out of Scope / Deferred
 
 - **Tiered (key/range-level) read-set capture** and fine-grained invalidation — deferred (ARCHITECTURE.md M2/M3); current capture is table-level.
 - **Reactivity for `ctx.sql`** / static analysis of raw SQL read-sets — deferred; `Raw` is opaque.
-- **Correct `replace` semantics** (nulling unspecified columns) — not yet implemented.
+- **Correct `replace` semantics** (nulling unspecified columns) — **shipped**.
 - **Real index selection / range scans** behind `withIndex` — ignored today; ordering fixed to `_creation_time`.
 - **Embedded V8 deterministic sandbox** for handlers — deferred to M4; current runtime is a Node/Bun worker.
 - **Richer / exact Postgres type handling** beyond the coarse `PgTypeClass` (precise numerics, timestamp normalization, arrays, enums, extension types) — deferred.

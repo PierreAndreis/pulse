@@ -1138,7 +1138,7 @@ pub async fn execute_op(
             table: name,
             id,
             value,
-        } => update(&mut *conn, catalog, name, id, value).await,
+        } => replace(&mut *conn, catalog, name, id, value).await,
 
         DbOp::Delete { table: name, id } => {
             let t = table(catalog, name)?;
@@ -1287,6 +1287,85 @@ async fn update(
             binds.len(),
             col.type_class.cast()
         ));
+    }
+    binds.push(Some(raw_id));
+    let sql = format!(
+        "UPDATE {name} SET {} WHERE _id = ${}::uuid RETURNING {}",
+        sets.join(", "),
+        binds.len(),
+        t.select_list()
+    );
+    let mut q = sqlx::query(&sql);
+    for b in &binds {
+        q = q.bind(b.clone());
+    }
+    let new_row = q.fetch_optional(&mut *conn).await?;
+
+    let change = new_row.as_ref().or(old_row.as_ref()).map(|r| Change {
+        table: TableId::new(name.to_string()),
+        key: pk_of(r),
+        op: ChangeOp::Update,
+        new: new_row.as_ref().map(|r| row_to_values(r, t)),
+        old: old_row.as_ref().map(|r| row_to_values(r, t)),
+    });
+    Ok((Value::Null, change))
+}
+
+/// True replace: the row becomes exactly `value`. Every user column is written —
+/// provided fields to their value, omitted ones to `NULL` — while the system
+/// columns (`_id`, `_creationTime`) are preserved. This is the semantic distinct
+/// from `patch` (which only touches provided fields). A `NOT NULL` column omitted
+/// from `value` surfaces a constraint error, since a full replace must supply
+/// every required field. Unknown fields are rejected like `patch`.
+async fn replace(
+    conn: &mut PgConnection,
+    catalog: &Catalog,
+    name: &str,
+    id: &str,
+    value: &Map<String, Value>,
+) -> Result<(Value, Option<Change>), SqlError> {
+    let t = table(catalog, name)?;
+    // Reject unknown fields up front (a typo fails loudly, as in patch).
+    for field in value.keys() {
+        column(t, field)?;
+    }
+    let raw_id = decode_id(id).to_string();
+
+    // Pre-image (for invalidation of filters the old row matched) doubles as the
+    // existence check: no row → nothing to replace.
+    let pre_sql = format!(
+        "SELECT {} FROM {name} WHERE _id = $1::uuid",
+        t.select_list()
+    );
+    let old_row = sqlx::query(&pre_sql)
+        .bind(raw_id.clone())
+        .fetch_optional(&mut *conn)
+        .await?;
+    if old_row.is_none() {
+        return Ok((Value::Null, None));
+    }
+
+    let mut sets = Vec::new();
+    let mut binds: Vec<Option<String>> = Vec::new();
+    for col in &t.columns {
+        if col.field.starts_with('_') {
+            continue; // system column — never overwritten by a replace
+        }
+        match value.get(&col.field) {
+            Some(val) => {
+                binds.push(json_to_bind(val, col));
+                sets.push(format!(
+                    "{} = ${}::{}",
+                    col.column,
+                    binds.len(),
+                    col.type_class.cast()
+                ));
+            }
+            None => sets.push(format!("{} = NULL", col.column)), // omitted → nulled
+        }
+    }
+    if sets.is_empty() {
+        return Ok((Value::Null, None));
     }
     binds.push(Some(raw_id));
     let sql = format!(
