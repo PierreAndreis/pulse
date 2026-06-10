@@ -165,6 +165,43 @@ describe("ORM replace vs patch", () => {
   });
 });
 
+describe("ORM scalar round-trip fidelity (the text boundary)", () => {
+  // Every value crosses the SQL boundary as text — written via json_to_bind
+  // ($n::<cast>) and read via col::text → JSON. Assert each PgTypeClass survives a
+  // write→read trip unchanged, including edge values (empty/quoted strings,
+  // negative/zero numbers, an id-ref re-encoding to `table:uuid`).
+  test("each column type round-trips write→read unchanged", async () => {
+    const author = (await c.w.addAuthor.call({ name: "auth" })) as { _id: string };
+    const w = (await c.w.addWidget.call({
+      name: "", // empty text
+      qty: -3.5, // negative float8
+      price: 0, // zero float8 (distinct from null)
+      score: -42, // negative bigint
+      active: false, // bool
+      tag: "a'b\"c", // quotes — proves parameterization, not interpolation
+      authorId: author._id as never, // id-ref (uuid)
+    })) as any;
+
+    expect(w.name).toBe("");
+    expect(w.qty).toBe(-3.5);
+    expect(w.price).toBe(0);
+    expect(w.score).toBe(-42);
+    expect(w.active).toBe(false);
+    expect(w.tag).toBe("a'b\"c");
+    expect(w.authorId).toBe(author._id); // uuid re-encodes to `authors:<uuid>`
+    expect(typeof w._id).toBe("string");
+    expect(typeof w._creationTime).toBe("number"); // system bigint → JS number
+  });
+
+  test("omitted optional columns read back as null", async () => {
+    const w = (await c.w.addWidget.call({ name: "n", qty: 1, active: true })) as any;
+    expect(w.price ?? null).toBeNull();
+    expect(w.score ?? null).toBeNull();
+    expect(w.tag ?? null).toBeNull();
+    expect(w.authorId ?? null).toBeNull();
+  });
+});
+
 describe("ORM joins (handler composition)", () => {
   test("join widgets→authors and react to a change in the joined row", async () => {
     const alice = (await c.w.addAuthor.call({ name: "alice" })) as { _id: string };
