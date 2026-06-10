@@ -563,7 +563,69 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
             // Match the re-exec output shape (sum is a bare json number).
             Some(json!(base + delta as f64))
         }
-        // avg / min / max / count(field) / count(distinct) → re-exec (later slices).
+        // max(field) / min(field): a *rising* extreme (a row entering or growing
+        // to/above the current extreme) is cheap to maintain from the delta — the
+        // monotonic high-water-mark case stays fully incremental. But *removing* or
+        // *lowering* the row that holds the extreme needs the next-best value, which
+        // isn't in the change image, so we fall back. Integer fields only (same
+        // reasons as sum: only ints are carried in the change image, and it keeps the
+        // comparisons exact). An empty set's extreme is SQL NULL → non-int `last`
+        // falls back.
+        AggFunc::Max | AggFunc::Min if agg.field.is_some() && !agg.distinct => {
+            let is_max = matches!(agg.func, AggFunc::Max);
+            let field = agg.field.as_ref().unwrap();
+            let cur = last.as_i64()?; // Null (empty set) / non-int → fall back
+            let int = |row: Option<&RowValues>| -> Option<i64> {
+                match row?.get(field)? {
+                    KeyValue::Int(n) => Some(*n),
+                    _ => None,
+                }
+            };
+            // `toward(cur, v)` keeps the value closer to the extreme (the larger for
+            // max, the smaller for min); `holds(v)` is true when v reaches the extreme.
+            let toward = |a: i64, b: i64| if is_max { a.max(b) } else { a.min(b) };
+            let holds = |v: i64| if is_max { v >= cur } else { v <= cur };
+
+            let mut best: Option<i64> = None; // extreme among rows in-set after the change
+            let mut lost = false; // the row holding `cur` left or moved off the extreme
+            for c in &cs.changes {
+                if &c.table != table {
+                    continue;
+                }
+                match filter.membership(c) {
+                    (false, true) => {
+                        let v = int(c.new.as_ref())?;
+                        best = Some(best.map_or(v, |b| toward(b, v)));
+                    }
+                    (true, false) => {
+                        if holds(int(c.old.as_ref())?) {
+                            lost = true;
+                        }
+                    }
+                    (true, true) => {
+                        let (o, n) = (int(c.old.as_ref())?, int(c.new.as_ref())?);
+                        best = Some(best.map_or(n, |b| toward(b, n))); // n is still in-set
+                        if holds(o) && !holds(n) {
+                            lost = true;
+                        }
+                    }
+                    (false, false) => {}
+                }
+            }
+            let new_extreme = if !lost {
+                // `cur` still has a holder → extreme is `cur` pulled toward by entrants.
+                toward(cur, best.unwrap_or(cur))
+            } else {
+                // The holder of `cur` is gone; only a row that reaches `cur` can prove
+                // the new extreme — otherwise the next-best is unknown → fall back.
+                match best {
+                    Some(b) if holds(b) => b,
+                    _ => return None,
+                }
+            };
+            Some(json!(new_extreme))
+        }
+        // avg / count(field) / count(distinct) → re-exec (later slices).
         _ => None,
     }
 }
@@ -1140,23 +1202,221 @@ mod tests {
         rs
     }
 
+    // ── IVM: max(integer field) / min(integer field) ─────────────────────────
+
+    async fn extreme_sub(
+        reactor: &InMemoryReactor,
+        client: &str,
+        channel: &str,
+        func: AggFunc,
+        initial: Value,
+    ) {
+        reactor
+            .add_subscription(Subscription {
+                client_id: client.into(),
+                sub: format!("messages.ext::{channel}"),
+                path: vec!["messages".into(), "ext".into()],
+                input: json!({ "channelId": channel }),
+                headers: HashMap::new(),
+                // read_cols must include the aggregate field, or a value-only update
+                // lowering the extreme would be column-pruned and never re-checked
+                // (capture_reads adds the aggregate field for exactly this reason).
+                read_set: {
+                    let mut rs = ReadSet::new();
+                    rs.add_filter(
+                        TableId::new("messages"),
+                        Filter {
+                            conds: vec![Cond {
+                                field: "channelId".into(),
+                                op: FilterOp::Eq,
+                                value: KeyValue::Text(channel.into()),
+                            }],
+                            read_cols: Some(vec!["amount".into()]),
+                            aggregate: Some(pulse_core::Aggregate {
+                                func,
+                                field: Some("amount".into()),
+                                distinct: false,
+                            }),
+                        },
+                    );
+                    rs
+                },
+                last: Some(initial),
+                last_lsn: Lsn::ZERO,
+            })
+            .await;
+    }
+
     #[tokio::test]
-    async fn ivm_falls_back_for_every_non_count_shape() {
+    async fn ivm_max_rises_on_insert() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+
+        // A new high-water mark enters → maintained with no re-exec.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 15)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15));
+    }
+
+    #[tokio::test]
+    async fn ivm_max_unchanged_on_smaller_insert() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+
+        // A row below the max enters → max stays 10, no re-exec, push suppressed.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 3)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err(), "unchanged max → no redundant push");
+    }
+
+    #[tokio::test]
+    async fn ivm_max_holds_when_non_extreme_row_leaves() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+
+        // A row well below the max leaves → the max still has a holder, no re-exec.
+        reactor
+            .apply_change_set(cs_of(vec![delete_amount("A", 4)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err(), "max unchanged → no push");
+    }
+
+    #[tokio::test]
+    async fn ivm_max_falls_back_when_holder_leaves() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+
+        // The row holding the max leaves and nothing reaches it → next-best unknown
+        // → fall back to a re-exec (the only source of truth for the new max).
+        reactor
+            .apply_change_set(cs_of(vec![delete_amount("A", 10)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ivm_max_falls_back_when_holder_drops_below() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+
+        // The max holder stays in the filter but its value drops below the max → the
+        // new max is some other row's value we don't have → fall back.
+        reactor
+            .apply_change_set(cs_of(vec![update_amount("A", 10, 4)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ivm_max_rises_on_value_change_without_reexec() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, json!(10)).await;
+
+        // A non-extreme row grows past the current max → maintained, no re-exec.
+        reactor
+            .apply_change_set(cs_of(vec![update_amount("A", 3, 20)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(20));
+    }
+
+    #[tokio::test]
+    async fn ivm_min_falls_on_insert() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Min, json!(10)).await;
+
+        // A new low enters → min maintained with no re-exec.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 5)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(5));
+    }
+
+    #[tokio::test]
+    async fn ivm_min_falls_back_when_holder_leaves() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        extreme_sub(&reactor, "a", "A", AggFunc::Min, json!(10)).await;
+
+        // The row holding the min leaves and nothing reaches it → fall back.
+        reactor
+            .apply_change_set(cs_of(vec![delete_amount("A", 10)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ivm_extreme_falls_back_on_empty_set_null_last() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        // An empty set's max is SQL NULL; a non-int `last` can't seed the comparison.
+        extreme_sub(&reactor, "a", "A", AggFunc::Max, Value::Null).await;
+
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 5)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ivm_falls_back_for_unmaintainable_shapes() {
         use pulse_core::Aggregate;
-        // Each shape slice-1 IVM cannot maintain precisely must re-execute.
+        // Shapes IVM cannot maintain from a delta alone must re-execute: avg (needs
+        // auxiliary sum+count the initial query doesn't return), count(field) and
+        // count(distinct) (need the dataset). count(*), sum, and min/max have their
+        // own dedicated tests.
         let shapes = [
             Aggregate {
                 func: AggFunc::Avg,
-                field: Some("p".into()),
-                distinct: false,
-            },
-            Aggregate {
-                func: AggFunc::Min,
-                field: Some("p".into()),
-                distinct: false,
-            },
-            Aggregate {
-                func: AggFunc::Max,
                 field: Some("p".into()),
                 distinct: false,
             },
