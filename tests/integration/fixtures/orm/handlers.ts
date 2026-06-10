@@ -53,12 +53,11 @@ export const bigTags = os.w.bigTags.handler(async ({ ctx }: any) => q(ctx).group
 // Reactive join via handler composition.
 export const withAuthor = os.w.withAuthor.handler(async ({ ctx }) => {
   const ws = await q(ctx).order("asc", "name").collect();
-  const out: any[] = [];
-  for (const w of ws) {
-    const a = w.authorId ? await ctx.db.get(w.authorId) : null;
-    out.push({ name: w.name, author: a ? a.name : null });
-  }
-  return out;
+  // Batched join: issue every author get() concurrently so the worker's DataLoader
+  // collapses them into one GetMany (ANY($1::uuid[])) round-trip. Each id keeps its
+  // own point key in the read-set, so a change to any joined author re-fires this sub.
+  const authors = await Promise.all(ws.map((w) => (w.authorId ? ctx.db.get(w.authorId) : null)));
+  return ws.map((w, i) => ({ name: w.name, author: (authors[i] as { name?: string } | null)?.name ?? null }));
 });
 
 export const addAuthor = os.w.addAuthor.handler(async ({ ctx, input }: any) => {

@@ -149,6 +149,34 @@ describe("ORM joins (handler composition)", () => {
       unsub();
     }
   });
+
+  test("batched join keeps per-id key precision: an unrelated author does not re-fire", async () => {
+    // The handler reads authors via a batched get() (DataLoader → GetMany). Each id
+    // must land as its own point key in the read-set — so renaming an author NOT in
+    // the join is invisible, while renaming the joined one re-runs. This is the M3
+    // precision invariant proven end-to-end through the batched path.
+    const alice = (await c.w.addAuthor.call({ name: "alice" })) as { _id: string };
+    const bob = (await c.w.addAuthor.call({ name: "bob" })) as { _id: string };
+    await c.w.addWidget.call({ name: "w1", qty: 1, active: true, authorId: alice._id as never });
+
+    const seen: string[] = [];
+    const unsub = c.w.withAuthor.subscribe({}, (d) =>
+      seen.push((d as { name: string; author: string | null }[]).map((r) => `${r.name}:${r.author}`).join(",")),
+    );
+    try {
+      await waitFor(() => seen.at(-1) === "w1:alice");
+
+      const pushesBefore = seen.length;
+      await c.w.renameAuthor.call({ id: bob._id as never, name: "bob2" }); // bob is NOT joined
+      await new Promise((r) => setTimeout(r, 600));
+      expect(seen.length).toBe(pushesBefore); // unrelated author pruned — no re-fire
+
+      await c.w.renameAuthor.call({ id: alice._id as never, name: "alice2" }); // joined → re-runs
+      await waitFor(() => seen.at(-1) === "w1:alice2");
+    } finally {
+      unsub();
+    }
+  });
 });
 
 describe("ORM reactivity is precise", () => {
