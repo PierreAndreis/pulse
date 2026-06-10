@@ -18,6 +18,11 @@ export class SyncClient {
   private readonly clientId = makeClientId();
   /** Active subscriptions, kept so they can be re-registered after a reconnect. */
   private readonly registered = new Map<string, { path: string[]; input: unknown }>();
+  /** Highest SSE event id we've processed — resent as `Last-Event-ID` to resume. */
+  private lastEventId?: number;
+  /** Subscriptions the server currently holds — kept across a *resumed* reconnect
+   *  so we don't re-subscribe (and re-execute) everything for a brief blip. */
+  private readonly serverHasSub = new Set<string>();
   private streamAbort?: AbortController;
   private wake?: () => void;
   private started = false;
@@ -61,13 +66,20 @@ export class SyncClient {
     this.startLoop();
     // If already connected, register immediately; otherwise the reconnect loop
     // re-registers everything once the stream (re)opens.
-    if (this.connected) void this.control("subscribe", { sub: key, path, input });
+    if (this.connected) this.registerSub(key, path, input);
   }
 
   release(path: string[], input: unknown): void {
     const key = queryKeyOf(path, input);
     if (!this.registered.delete(key)) return;
+    this.serverHasSub.delete(key);
     void this.control("unsubscribe", { sub: key });
+  }
+
+  /** Register one subscription with the server and remember the server now has it. */
+  private registerSub(key: string, path: string[], input: unknown): void {
+    this.serverHasSub.add(key);
+    void this.control("subscribe", { sub: key, path, input });
   }
 
   private joinUrl(p: string): string {
@@ -123,19 +135,34 @@ export class SyncClient {
   private async runStream(): Promise<void> {
     this.streamAbort = new AbortController();
     const doFetch = this.options.fetch ?? globalThis.fetch;
+    const resuming = this.lastEventId !== undefined;
+    const headers: Record<string, string> = {
+      accept: "text/event-stream",
+      ...((await this.options.headers?.()) ?? {}),
+    };
+    // Resume from the last event we saw; the server replays anything we missed
+    // (or sends a `resync` frame if the gap rolled past its buffer).
+    if (this.lastEventId !== undefined) headers["last-event-id"] = String(this.lastEventId);
     const res = await doFetch(this.joinUrl(`sync?clientId=${this.clientId}`), {
       method: "GET",
-      headers: { accept: "text/event-stream", ...((await this.options.headers?.()) ?? {}) },
+      headers,
       signal: this.streamAbort.signal,
     });
     if (!res.ok || !res.body) throw new Error(`SSE open failed (${res.status})`);
 
     this.connected = true;
     this.setStatus("connected");
-    // (Re-)register every active subscription on this fresh connection — the
-    // server has no memory of subscriptions from a previous stream.
-    for (const [key, { path, input }] of this.registered) {
-      void this.control("subscribe", { sub: key, path, input });
+    if (!resuming) {
+      // Fresh stream: the server has no memory of our subs — (re)register all.
+      this.serverHasSub.clear();
+      for (const [key, { path, input }] of this.registered) this.registerSub(key, path, input);
+    } else {
+      // Resumed stream: subs registered before the drop are kept server-side.
+      // Register only subs added while disconnected; a `resync` frame (server
+      // lost state) triggers a full re-register in handleEvent.
+      for (const [key, { path, input }] of this.registered) {
+        if (!this.serverHasSub.has(key)) this.registerSub(key, path, input);
+      }
     }
 
     const reader = res.body.getReader();
@@ -155,18 +182,34 @@ export class SyncClient {
   }
 
   private handleEvent(raw: string): void {
-    const dataLines = raw
-      .split("\n")
-      .filter((l) => l.startsWith("data:"))
-      .map((l) => l.slice(5).trim());
-    if (dataLines.length === 0) return;
-    try {
-      const payload = JSON.parse(dataLines.join("\n")) as { sub: string; data: unknown };
-      if (payload.sub) {
-        this.store.setConfirmed(payload.sub, (payload.data ?? []) as unknown[]);
-      }
-    } catch {
-      // ignore keep-alive / unparseable frames
+    const lines = raw.split("\n");
+    const idLine = lines.find((l) => l.startsWith("id:"));
+    const eventId = idLine ? Number(idLine.slice(3).trim()) : undefined;
+    const dataLines = lines.filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim());
+    if (dataLines.length === 0) {
+      if (eventId !== undefined) this.lastEventId = eventId; // keep-alive with an id
+      return;
     }
+    let payload: { sub?: string; data?: unknown; type?: string } | undefined;
+    try {
+      payload = JSON.parse(dataLines.join("\n"));
+    } catch {
+      return; // unparseable
+    }
+    // A `resync` means the server lost our subscriptions (restart, or the buffer
+    // rolled past) — re-register everything and adopt the server's stream position.
+    // Handled before the dedup guard, since after a restart its id can be < ours.
+    if (payload?.type === "resync") {
+      this.serverHasSub.clear();
+      for (const [key, { path, input }] of this.registered) this.registerSub(key, path, input);
+      this.lastEventId = eventId;
+      return;
+    }
+    // Drop an event we've already processed (replayed-and-also-delivered guard).
+    if (eventId !== undefined && this.lastEventId !== undefined && eventId <= this.lastEventId) return;
+    if (payload?.sub) {
+      this.store.setConfirmed(payload.sub, (payload.data ?? []) as unknown[]);
+    }
+    if (eventId !== undefined) this.lastEventId = eventId;
   }
 }

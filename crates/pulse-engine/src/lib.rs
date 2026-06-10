@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use pulse_core::{Change, ChangeSet, Lsn, TableId};
-pub use pulse_reactor::{Reactor, SsePush, Subscription};
+pub use pulse_reactor::{Reactor, Resume, SsePush, Subscription};
 use tokio::sync::mpsc;
 
 /// What a procedure run yields. Richer than the reactor's `ReExecutor` (which
@@ -321,6 +321,19 @@ impl Coordinator {
 
     pub async fn register_client(&self, client_id: String) -> mpsc::Receiver<SsePush> {
         self.reactor.register_client(client_id).await
+    }
+
+    /// Reconnect a client, optionally resuming from a `Last-Event-ID`. The
+    /// returned receiver already has any replayed events (or a `resync` control
+    /// frame) enqueued ahead of live delivery.
+    pub async fn register_client_resume(
+        &self,
+        client_id: String,
+        last_event_id: Option<u64>,
+    ) -> (mpsc::Receiver<SsePush>, Resume) {
+        self.reactor
+            .register_client_resume(client_id, last_event_id)
+            .await
     }
 
     pub async fn handle_unsubscribe(&self, client_id: &str, sub: &str) {

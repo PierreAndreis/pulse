@@ -578,13 +578,28 @@ async fn rpc(
 struct SyncQuery {
     #[serde(rename = "clientId")]
     client_id: String,
+    /// Resume point fallback for clients that can't set the `Last-Event-ID`
+    /// header (the standard SSE resume header takes precedence).
+    #[serde(rename = "lastEventId", default)]
+    last_event_id: Option<u64>,
 }
 
 async fn sync(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<SyncQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.coord.register_client(q.client_id).await;
+    // Standard SSE resume: the browser/client re-presents the last event id it
+    // saw. Header wins; the `?lastEventId=` query is a fallback for manual readers.
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or(q.last_event_id);
+    let (rx, _resume) = state
+        .coord
+        .register_client_resume(q.client_id, last_event_id)
+        .await;
     let stream = ReceiverStream::new(rx)
         .map(|push| Ok(Event::default().id(push.id.to_string()).data(push.body)));
     Sse::new(stream).keep_alive(KeepAlive::default())
