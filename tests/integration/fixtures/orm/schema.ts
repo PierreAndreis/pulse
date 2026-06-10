@@ -16,5 +16,8 @@ export default defineSchema({
     active: v.boolean(),
     tag: v.optional(v.string()),
     authorId: v.optional(v.id("authors")),
+    // Freeform JSON (jsonb) — exercises object/array/nested round-trip through the
+    // text → ::jsonb → text boundary.
+    meta: v.optional(v.any()),
   }),
 });

@@ -200,6 +200,18 @@ describe("ORM scalar round-trip fidelity (the text boundary)", () => {
     expect(w.tag ?? null).toBeNull();
     expect(w.authorId ?? null).toBeNull();
   });
+
+  test("a jsonb column round-trips a nested object/array unchanged", async () => {
+    const meta = {
+      note: "hi",
+      n: 3.5,
+      flag: true,
+      nested: { tags: ["a", "b"], empty: null },
+      list: [1, 2, { k: "v" }],
+    };
+    const w = (await c.w.addWidget.call({ name: "j", qty: 1, active: true, meta })) as any;
+    expect(w.meta).toEqual(meta); // object → ::jsonb → text → parse, deep-equal
+  });
 });
 
 describe("ORM joins (handler composition)", () => {

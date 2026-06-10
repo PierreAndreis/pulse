@@ -73,6 +73,7 @@ export const addWidget = os.w.addWidget.handler(async ({ ctx, input }: any) => {
   if (input.price !== undefined) doc.price = input.price;
   if (input.score !== undefined) doc.score = input.score;
   if (input.tag !== undefined) doc.tag = input.tag;
+  if (input.meta !== undefined) doc.meta = input.meta;
   if (input.authorId !== undefined) doc.authorId = input.authorId;
   const id = await ctx.db.insert("widgets", doc);
   return await ctx.db.get(id);
