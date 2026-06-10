@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use pulse_core::{AggFunc, ChangeSet, Lsn, ReadSet, TableId};
+use pulse_core::{AggFunc, ChangeSet, KeyValue, Lsn, ReadSet, RowValues, TableId};
 
 /// One server→client SSE event: a monotonic per-client `id` (for `Last-Event-ID`
 /// resume) and the JSON body.
@@ -525,7 +525,36 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
             }
             Some(json!(last.as_i64()? + delta))
         }
-        // sum / avg / min / max / count(field) / count(distinct) → re-exec (later slices).
+        // sum(field): +new on enter, −old on leave, (new−old) on a stay where the
+        // value changed. Maintained only for INTEGER fields — float/jsonb columns
+        // aren't carried in the change image (so `int()` returns None → fall back),
+        // which also keeps the arithmetic exact (no f64 drift). An empty set's sum
+        // is SQL NULL, so a non-numeric `last` falls back too.
+        AggFunc::Sum if agg.field.is_some() && !agg.distinct => {
+            let field = agg.field.as_ref().unwrap();
+            let base = last.as_f64()?; // Null (empty set) / non-numeric → fall back
+            let int = |row: Option<&RowValues>| -> Option<i64> {
+                match row?.get(field)? {
+                    KeyValue::Int(n) => Some(*n),
+                    _ => None,
+                }
+            };
+            let mut delta: i64 = 0;
+            for c in &cs.changes {
+                if &c.table != table {
+                    continue;
+                }
+                match filter.membership(c) {
+                    (false, true) => delta += int(c.new.as_ref())?, // entered
+                    (true, false) => delta -= int(c.old.as_ref())?, // left
+                    (true, true) => delta += int(c.new.as_ref())? - int(c.old.as_ref())?, // stayed
+                    (false, false) => {}                            // outside
+                }
+            }
+            // Match the re-exec output shape (sum is a bare json number).
+            Some(json!(base + delta as f64))
+        }
+        // avg / min / max / count(field) / count(distinct) → re-exec (later slices).
         _ => None,
     }
 }
@@ -939,14 +968,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ivm_falls_back_to_reexec_for_sum() {
-        let reexec = Arc::new(CountingReExec {
-            calls: AtomicUsize::new(0),
-        });
-        let reactor = InMemoryReactor::new(reexec.clone());
-        let _rx = reactor.register_client("a".into()).await;
-        // A sum aggregate is not maintained in slice 1 → must re-execute.
+    // ── IVM: sum(integer field) ──────────────────────────────────────────────
+
+    fn sum_filter(channel: &str) -> ReadSet {
         let mut rs = ReadSet::new();
         rs.add_filter(
             TableId::new("messages"),
@@ -954,7 +978,7 @@ mod tests {
                 conds: vec![Cond {
                     field: "channelId".into(),
                     op: FilterOp::Eq,
-                    value: KeyValue::Text("A".into()),
+                    value: KeyValue::Text(channel.into()),
                 }],
                 read_cols: Some(vec!["amount".into()]),
                 aggregate: Some(pulse_core::Aggregate {
@@ -964,27 +988,125 @@ mod tests {
                 }),
             },
         );
+        rs
+    }
+
+    async fn sum_sub(reactor: &InMemoryReactor, client: &str, channel: &str, initial: f64) {
         reactor
             .add_subscription(Subscription {
-                client_id: "a".into(),
-                sub: "messages.sum::A".into(),
+                client_id: client.into(),
+                sub: format!("messages.sum::{channel}"),
                 path: vec!["messages".into(), "sum".into()],
-                input: json!({ "channelId": "A" }),
+                input: json!({ "channelId": channel }),
                 headers: HashMap::new(),
-                read_set: rs,
-                last: Some(json!(10)),
+                read_set: sum_filter(channel),
+                last: Some(json!(initial)),
                 last_lsn: Lsn::ZERO,
             })
             .await;
+    }
 
+    fn amount_row(channel: &str, amount: i64) -> RowValues {
+        let mut m = RowValues::new();
+        m.insert("channelId".to_string(), KeyValue::Text(channel.into()));
+        m.insert("amount".to_string(), KeyValue::Int(amount));
+        m
+    }
+    fn insert_amount(channel: &str, key: i64, amount: i64) -> Change {
+        Change {
+            table: TableId::new("messages"),
+            key: PrimaryKey::single(KeyValue::Int(key)),
+            op: ChangeOp::Insert,
+            new: Some(amount_row(channel, amount)),
+            old: None,
+        }
+    }
+    fn delete_amount(channel: &str, amount: i64) -> Change {
+        Change {
+            table: TableId::new("messages"),
+            key: PrimaryKey::single(KeyValue::Int(1)),
+            op: ChangeOp::Delete,
+            new: None,
+            old: Some(amount_row(channel, amount)),
+        }
+    }
+    fn update_amount(channel: &str, old_a: i64, new_a: i64) -> Change {
+        Change {
+            table: TableId::new("messages"),
+            key: PrimaryKey::single(KeyValue::Int(1)),
+            op: ChangeOp::Update,
+            old: Some(amount_row(channel, old_a)),
+            new: Some(amount_row(channel, new_a)),
+        }
+    }
+
+    #[tokio::test]
+    async fn ivm_sum_increments_on_insert() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        sum_sub(&reactor, "a", "A", 10.0).await;
+
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 5)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15.0));
+    }
+
+    #[tokio::test]
+    async fn ivm_sum_decrements_on_delete() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        sum_sub(&reactor, "a", "A", 20.0).await;
+
+        reactor
+            .apply_change_set(cs_of(vec![delete_amount("A", 8)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(12.0));
+    }
+
+    #[tokio::test]
+    async fn ivm_sum_applies_delta_on_value_change() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        sum_sub(&reactor, "a", "A", 10.0).await;
+
+        // Row stays in the filter, amount 3→8 → sum += 5.
+        reactor
+            .apply_change_set(cs_of(vec![update_amount("A", 3, 8)]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15.0));
+    }
+
+    #[tokio::test]
+    async fn ivm_sum_falls_back_when_field_absent_from_image() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        sum_sub(&reactor, "a", "A", 10.0).await;
+
+        // The change image carries no `amount` (e.g. a float column, never
+        // captured) → the delta can't be computed → fall back to re-exec.
         reactor
             .apply_change_set(cs_of(vec![insert_into("A")]))
             .await;
-        assert_eq!(
-            reexec.calls.load(Ordering::SeqCst),
-            1,
-            "sum is not IVM-able in slice 1 → falls back to re-exec"
-        );
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
     }
 
     fn agg_filter(channel: &str, agg: pulse_core::Aggregate) -> ReadSet {
