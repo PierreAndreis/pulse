@@ -12,4 +12,4 @@ mod readset;
 pub use change::{Change, ChangeOp, ChangeSet, KeyValue, PrimaryKey, RowValues, TableId};
 pub use lsn::{Lsn, ParseLsnError};
 pub use procedure::{ProcedureKind, ProcedurePath, SubscriptionId};
-pub use readset::{Cond, Filter, FilterOp, IndexBound, IndexRange, ReadSet};
+pub use readset::{AggFunc, Aggregate, Cond, Filter, FilterOp, IndexBound, IndexRange, ReadSet};

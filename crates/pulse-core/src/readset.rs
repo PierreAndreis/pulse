@@ -46,6 +46,30 @@ pub struct Cond {
     pub value: KeyValue,
 }
 
+/// A reactive aggregate function (mirror of `pulse_sql::AggFn`, kept here so the
+/// reactor can maintain the scalar incrementally without a `pulse-sql` dep).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// The aggregate a reactive query computes over its filtered rows. Lets the
+/// reactor update the cached scalar from a change's membership/value delta
+/// (incremental view maintenance) instead of re-running the query — when the
+/// shape is one it can maintain precisely (else it falls back to re-execution).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Aggregate {
+    pub func: AggFunc,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub distinct: bool,
+}
+
 /// One analyzed read of a table. `conds` are AND-ed; an empty `conds` would be a
 /// whole-table read (but we record those as `tables` wildcards instead).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +82,10 @@ pub struct Filter {
     /// ignores updates that don't move a row in/out of the filter.
     #[serde(default)]
     pub read_cols: Option<Vec<String>>,
+    /// When this read is a single scalar aggregate, the function + field so the
+    /// reactor can maintain it incrementally. `None` for plain row reads.
+    #[serde(default)]
+    pub aggregate: Option<Aggregate>,
 }
 
 impl Filter {
@@ -66,6 +94,7 @@ impl Filter {
         Self {
             conds,
             read_cols: None,
+            aggregate: None,
         }
     }
 
@@ -75,7 +104,18 @@ impl Filter {
         Self {
             conds,
             read_cols: Some(read_cols),
+            aggregate: None,
         }
+    }
+
+    /// Whether the change's `old`/`new` images satisfy this filter's conditions —
+    /// the `(old_m, new_m)` enter/leave/stay signal incremental aggregates use.
+    pub fn membership(&self, change: &Change) -> (bool, bool) {
+        let hit = |row: &RowValues| self.conds.iter().all(|c| eval(c, row));
+        (
+            change.old.as_ref().is_some_and(hit),
+            change.new.as_ref().is_some_and(hit),
+        )
     }
 }
 
@@ -190,9 +230,7 @@ fn like_greedy(s: &str, p: &str) -> bool {
 }
 
 fn filter_matches(filter: &Filter, change: &Change) -> bool {
-    let hit = |row: &RowValues| filter.conds.iter().all(|c| eval(c, row));
-    let new_m = change.new.as_ref().is_some_and(hit);
-    let old_m = change.old.as_ref().is_some_and(hit);
+    let (old_m, new_m) = filter.membership(change);
     if !new_m && !old_m {
         return false; // the row is outside the filter in both images → irrelevant
     }
@@ -313,6 +351,7 @@ mod tests {
                 value,
             }],
             read_cols: None,
+            aggregate: None,
         }
     }
 
@@ -381,6 +420,7 @@ mod tests {
                     value: KeyValue::Bool(false),
                 }],
                 read_cols: None,
+                aggregate: None,
             },
         );
         let done = Change {
@@ -408,6 +448,7 @@ mod tests {
                         value: KeyValue::Text("%ppl%".into()),
                     }],
                     read_cols: None,
+                    aggregate: None,
                 },
             );
             rs
@@ -559,6 +600,7 @@ mod tests {
                     },
                 ],
                 read_cols: None,
+                aggregate: None,
             },
         );
         let both = Change {
@@ -593,6 +635,7 @@ mod tests {
                     value: KeyValue::Bool(false),
                 }],
                 read_cols: None,
+                aggregate: None,
             },
         );
         let absent = Change {
@@ -631,6 +674,7 @@ mod tests {
                     value: KeyValue::Int(100),
                 }],
                 read_cols: None,
+                aggregate: None,
             },
         );
         let after = Change {
@@ -653,6 +697,7 @@ mod tests {
                 value,
             }],
             read_cols: None,
+            aggregate: None,
         }
     }
 
@@ -776,6 +821,7 @@ mod tests {
                     },
                 ],
                 read_cols: None,
+                aggregate: None,
             },
         );
         let only_channel = Change {

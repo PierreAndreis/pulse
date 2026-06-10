@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use pulse_core::{ChangeSet, Lsn, ReadSet, TableId};
+use pulse_core::{AggFunc, ChangeSet, Lsn, ReadSet, TableId};
 
 /// One server→client SSE event: a monotonic per-client `id` (for `Last-Event-ID`
 /// resume) and the JSON body.
@@ -260,19 +260,6 @@ impl Registry {
         }
     }
 
-    /// Re-exec jobs for subscriptions on `changed` whose read-set precisely
-    /// matches `cs` (the `apply_change_set` path). Only matches are cloned, and
-    /// only their light job fields — not the read-set or retained last-value.
-    fn matching_jobs(&self, changed: &HashSet<TableId>, cs: &ChangeSet) -> Vec<ReExecJob> {
-        let mut out = Vec::new();
-        self.for_each_candidate(changed, |s| {
-            if s.read_set.matches(cs) {
-                out.push(ReExecJob::of(s));
-            }
-        });
-        out
-    }
-
     /// Re-exec jobs for every subscription on `tables`, no row-level matching (the
     /// coarse table-scoped invalidation path).
     fn table_jobs(&self, tables: &HashSet<TableId>) -> Vec<ReExecJob> {
@@ -458,7 +445,13 @@ impl InMemoryReactor {
         let changed: HashSet<TableId> =
             change_set.changes.iter().map(|c| c.table.clone()).collect();
         let reg = self.reg.lock().await;
-        reg.matching_jobs(&changed, change_set).len()
+        let mut n = 0;
+        reg.for_each_candidate(&changed, |s| {
+            if s.read_set.matches(change_set) {
+                n += 1;
+            }
+        });
+        n
     }
 
     /// Refresh the subscription's read-set from the latest run (so dependencies
@@ -498,6 +491,42 @@ impl InMemoryReactor {
         // (dynamic dependencies, e.g. a join reaching a new row's table).
         self.announce_interest(newly_watched).await;
         result.flatten()
+    }
+}
+
+/// Maintain an aggregate subscription's scalar incrementally from a `ChangeSet`,
+/// returning the new value — or `None` to fall back to a full re-execution. IVM
+/// is opportunistic; `None` is always safe (the re-exec path is exact). Slice 1
+/// supports bare `count(*)`; every other shape falls back.
+fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
+    // Only a clean single scalar aggregate over one table is IVM-able: no coarse
+    // table-wildcard, no point-key, exactly one filter on one table.
+    let rs = &sub.read_set;
+    if !rs.tables.is_empty() || !rs.keys.is_empty() || rs.filters.len() != 1 {
+        return None;
+    }
+    let (table, filters) = rs.filters.iter().next()?;
+    if filters.len() != 1 {
+        return None;
+    }
+    let filter = &filters[0];
+    let agg = filter.aggregate.as_ref()?;
+    let last = sub.last.as_ref()?;
+    match agg.func {
+        // bare count(*): +1 per row entering the filter, −1 per row leaving it.
+        AggFunc::Count if agg.field.is_none() && !agg.distinct => {
+            let mut delta: i64 = 0;
+            for c in &cs.changes {
+                if &c.table != table {
+                    continue;
+                }
+                let (old_m, new_m) = filter.membership(c);
+                delta += new_m as i64 - old_m as i64;
+            }
+            Some(json!(last.as_i64()? + delta))
+        }
+        // sum / avg / min / max / count(field) / count(distinct) → re-exec (later slices).
+        _ => None,
     }
 }
 
@@ -615,10 +644,43 @@ impl Reactor for InMemoryReactor {
         // runs on those (dedup: a multi-row tx re-runs each sub at most once).
         let changed: HashSet<TableId> =
             change_set.changes.iter().map(|c| c.table.clone()).collect();
-        let dirty = {
+        // Partition matched subs: those whose result can be maintained from the
+        // change delta (incremental view maintenance — no worker round-trip) vs.
+        // the rest, which re-execute. IVM is opportunistic; `try_ivm` returns
+        // `None` for anything it can't maintain precisely, so correctness is the
+        // re-exec path's.
+        let (ivm, dirty) = {
             let reg = self.reg.lock().await;
-            reg.matching_jobs(&changed, &change_set)
+            let mut ivm: Vec<(String, String, ReadSet, Value)> = Vec::new();
+            let mut dirty = Vec::new();
+            reg.for_each_candidate(&changed, |s| {
+                if !s.read_set.matches(&change_set) {
+                    return;
+                }
+                match try_ivm(s, &change_set) {
+                    Some(value) => ivm.push((
+                        s.client_id.clone(),
+                        s.sub.clone(),
+                        s.read_set.clone(),
+                        value,
+                    )),
+                    None => dirty.push(ReExecJob::of(s)),
+                }
+            });
+            (ivm, dirty)
         };
+        // IVM pushes reuse record_value (diff-suppression + watermark clamp) and
+        // send, exactly like a re-exec push — minus the worker call.
+        for (client_id, sub, read_set, value) in ivm {
+            if let Some(lsn) = self
+                .record_value(&client_id, &sub, &value, read_set, change_set.commit_lsn)
+                .await
+            {
+                if !self.send(&client_id, &sub, &value, lsn).await {
+                    self.remove_client(&client_id).await;
+                }
+            }
+        }
         self.reexec_and_push(dirty, change_set.commit_lsn).await;
     }
 
@@ -690,6 +752,7 @@ mod tests {
                     value: KeyValue::Text(value.into()),
                 }],
                 read_cols: None,
+                aggregate: None,
             },
         );
         rs
@@ -720,6 +783,208 @@ mod tests {
                 last_lsn: Lsn::ZERO,
             })
             .await;
+    }
+
+    // ── Incremental view maintenance (IVM) ───────────────────────────────────
+
+    /// A reactive bare `count()` over `channelId = channel`.
+    fn count_filter(channel: &str) -> ReadSet {
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            Filter {
+                conds: vec![Cond {
+                    field: "channelId".into(),
+                    op: FilterOp::Eq,
+                    value: KeyValue::Text(channel.into()),
+                }],
+                read_cols: Some(vec![]), // bare count → value-only updates pruned
+                aggregate: Some(pulse_core::Aggregate {
+                    func: AggFunc::Count,
+                    field: None,
+                    distinct: false,
+                }),
+            },
+        );
+        rs
+    }
+
+    fn insert_keyed(channel: &str, key: i64) -> Change {
+        Change {
+            key: PrimaryKey::single(KeyValue::Int(key)),
+            ..insert_into(channel)
+        }
+    }
+
+    fn delete_from(channel: &str) -> Change {
+        let mut old = HashMap::new();
+        old.insert("channelId".to_string(), KeyValue::Text(channel.into()));
+        Change {
+            table: TableId::new("messages"),
+            key: PrimaryKey::single(KeyValue::Int(1)),
+            op: ChangeOp::Delete,
+            new: None,
+            old: Some(old),
+        }
+    }
+
+    async fn count_sub(reactor: &InMemoryReactor, client: &str, channel: &str, initial: i64) {
+        reactor
+            .add_subscription(Subscription {
+                client_id: client.into(),
+                sub: format!("messages.count::{channel}"),
+                path: vec!["messages".into(), "count".into()],
+                input: json!({ "channelId": channel }),
+                headers: HashMap::new(),
+                read_set: count_filter(channel),
+                last: Some(json!(initial)),
+                last_lsn: Lsn::ZERO,
+            })
+            .await;
+    }
+
+    fn pushed_data(push: &SsePush) -> Value {
+        serde_json::from_str::<Value>(&push.body).unwrap()["data"].clone()
+    }
+
+    fn cs_of(changes: Vec<Change>) -> ChangeSet {
+        ChangeSet {
+            commit_lsn: Lsn(1),
+            changes,
+        }
+    }
+
+    #[tokio::test]
+    async fn ivm_count_increments_on_insert_without_reexec() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        count_sub(&reactor, "a", "A", 2).await;
+
+        reactor
+            .apply_change_set(cs_of(vec![insert_into("A")]))
+            .await;
+
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            0,
+            "count is maintained from the delta — no worker re-exec"
+        );
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(3));
+    }
+
+    #[tokio::test]
+    async fn ivm_count_decrements_on_delete() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        count_sub(&reactor, "a", "A", 3).await;
+
+        reactor
+            .apply_change_set(cs_of(vec![delete_from("A")]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(2));
+    }
+
+    #[tokio::test]
+    async fn ivm_count_multi_row_tx_is_one_push() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        count_sub(&reactor, "a", "A", 0).await;
+
+        reactor
+            .apply_change_set(cs_of(vec![
+                insert_keyed("A", 1),
+                insert_keyed("A", 2),
+                insert_keyed("A", 3),
+            ]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pushed_data(&rx.try_recv().unwrap()),
+            json!(3),
+            "delta accumulated"
+        );
+        assert!(rx.try_recv().is_err(), "one push per ChangeSet");
+    }
+
+    #[tokio::test]
+    async fn ivm_count_net_zero_change_suppresses_push() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        count_sub(&reactor, "a", "A", 5).await;
+
+        // One row enters, one leaves → net 0 → identical value → no push.
+        reactor
+            .apply_change_set(cs_of(vec![insert_keyed("A", 9), delete_from("A")]))
+            .await;
+
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged count → no redundant push"
+        );
+    }
+
+    #[tokio::test]
+    async fn ivm_falls_back_to_reexec_for_sum() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        // A sum aggregate is not maintained in slice 1 → must re-execute.
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            Filter {
+                conds: vec![Cond {
+                    field: "channelId".into(),
+                    op: FilterOp::Eq,
+                    value: KeyValue::Text("A".into()),
+                }],
+                read_cols: Some(vec!["amount".into()]),
+                aggregate: Some(pulse_core::Aggregate {
+                    func: AggFunc::Sum,
+                    field: Some("amount".into()),
+                    distinct: false,
+                }),
+            },
+        );
+        reactor
+            .add_subscription(Subscription {
+                client_id: "a".into(),
+                sub: "messages.sum::A".into(),
+                path: vec!["messages".into(), "sum".into()],
+                input: json!({ "channelId": "A" }),
+                headers: HashMap::new(),
+                read_set: rs,
+                last: Some(json!(10)),
+                last_lsn: Lsn::ZERO,
+            })
+            .await;
+
+        reactor
+            .apply_change_set(cs_of(vec![insert_into("A")]))
+            .await;
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            1,
+            "sum is not IVM-able in slice 1 → falls back to re-exec"
+        );
     }
 
     /// An injected ChangeSet drives matching + re-execution via the trait alone,

@@ -117,6 +117,18 @@ pub enum AggFn {
     Avg,
 }
 
+impl From<AggFn> for pulse_core::AggFunc {
+    fn from(f: AggFn) -> Self {
+        match f {
+            AggFn::Count => pulse_core::AggFunc::Count,
+            AggFn::Sum => pulse_core::AggFunc::Sum,
+            AggFn::Min => pulse_core::AggFunc::Min,
+            AggFn::Max => pulse_core::AggFunc::Max,
+            AggFn::Avg => pulse_core::AggFunc::Avg,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agg {
     pub func: AggFn,
@@ -632,6 +644,7 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
             filters,
             aggregate,
             group_by,
+            having,
             ..
         } => {
             let tid = TableId::new(name.clone());
@@ -666,6 +679,19 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
                     Some(cols)
                 }
             };
+            // A single *scalar* aggregate (no group_by/having) can be maintained
+            // incrementally by the reactor. Grouped/having results are arrays —
+            // never IVM-able, so record no aggregate descriptor for them.
+            let agg_meta: Option<pulse_core::Aggregate> = match aggregate {
+                Some(agg) if group_by.is_none() && having.is_none() => {
+                    Some(pulse_core::Aggregate {
+                        func: agg.func.into(),
+                        field: agg.field.clone(),
+                        distinct: agg.distinct,
+                    })
+                }
+                _ => None,
+            };
             // Convert predicates + filter trees to DNF. Each conjunction becomes a
             // precise `Filter` (an OR across them). An empty conjunction means
             // "match anything" (uncoercible value), and `None` means it grew past
@@ -678,6 +704,7 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
                             Filter {
                                 conds,
                                 read_cols: read_cols.clone(),
+                                aggregate: agg_meta.clone(),
                             },
                         );
                     }

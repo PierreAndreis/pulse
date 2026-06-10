@@ -135,6 +135,7 @@ fn channel_filter(channel: &str) -> ReadSet {
                 value: KeyValue::Text(channel.into()),
             }],
             read_cols: None,
+            aggregate: None,
         },
     );
     rs
