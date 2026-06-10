@@ -183,6 +183,12 @@ impl Coordinator {
         &self.metrics
     }
 
+    /// Count of subscription updates served by incremental view maintenance (no
+    /// worker re-exec) — surfaced on `/metrics` for IVM hit-rate observability.
+    pub fn ivm_applied(&self) -> u64 {
+        self.reactor.ivm_applied()
+    }
+
     /// Run a procedure. On a mutation that produced writes, the result carries a
     /// `propagate` change-set already stamped with the sampled commit watermark;
     /// the caller spawns [`Coordinator::propagate`] for it off the response path.

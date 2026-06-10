@@ -8,6 +8,7 @@
 //! (or a cross-node bus) plugs into without a second matching path.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -147,6 +148,9 @@ pub trait Reactor: Send + Sync {
     /// fallback used when a precise change-set can't be delivered (e.g. an
     /// oversized cross-node bus payload).
     async fn invalidate_all(&self);
+    /// Count of subscription updates served incrementally (IVM) rather than by a
+    /// worker re-exec — an observability signal exposed on `/metrics`.
+    fn ivm_applied(&self) -> u64;
     /// The tables this node currently has at least one subscription on — the set to
     /// (re)register as cross-node interest on the bus heartbeat.
     async fn interest_tables(&self) -> Vec<TableId>;
@@ -288,6 +292,10 @@ pub struct InMemoryReactor {
     /// Per-client SSE channel capacity — a bigger buffer tolerates burstier/slower
     /// clients at the cost of memory; a full buffer drops the client.
     sse_buffer: usize,
+    /// Count of subscription updates served by incremental view maintenance (an
+    /// aggregate maintained from the change delta) instead of a worker re-exec —
+    /// an observability signal for the IVM hit-rate.
+    ivm_applied: AtomicU64,
 }
 
 impl InMemoryReactor {
@@ -298,6 +306,7 @@ impl InMemoryReactor {
             reexec,
             interest: None,
             sse_buffer: DEFAULT_SSE_BUFFER,
+            ivm_applied: AtomicU64::new(0),
         }
     }
 
@@ -698,6 +707,7 @@ impl Reactor for InMemoryReactor {
             });
             (ivm, dirty)
         };
+        self.ivm_applied.fetch_add(ivm.len() as u64, Relaxed);
         // IVM pushes reuse record_value (diff-suppression + watermark clamp) and
         // send, exactly like a re-exec push — minus the worker call.
         for (client_id, sub, read_set, value) in ivm {
@@ -733,6 +743,10 @@ impl Reactor for InMemoryReactor {
     async fn invalidate_all(&self) {
         let all = self.reg.lock().await.all_jobs();
         self.reexec_and_push(all, Lsn::ZERO).await;
+    }
+
+    fn ivm_applied(&self) -> u64 {
+        self.ivm_applied.load(Relaxed)
     }
 
     async fn interest_tables(&self) -> Vec<TableId> {

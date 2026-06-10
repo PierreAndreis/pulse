@@ -501,6 +501,9 @@ async fn node_metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
         // WAL/CDC: changes dropped because they echo an in-engine write already
         // applied locally (Mode B). Non-zero ⇒ the WAL consumer is live.
         "walDeduped": m.deduped.load(Relaxed),
+        // Subscription updates served incrementally (IVM) instead of by a worker
+        // re-exec — the IVM hit signal.
+        "ivmApplied": state.coord.ivm_applied(),
         "busLagMs": avg_ms(m.lag_us_sum.load(Relaxed), changes),
         "applyMs": avg_ms(m.apply_us_sum.load(Relaxed), events),
         // Raw sums (µs) so a benchmark can compute a windowed average via deltas.

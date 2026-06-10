@@ -204,6 +204,25 @@ describe("ORM reactivity is precise", () => {
       unsub();
     }
   });
+
+  test("a filtered count() update is served by IVM, not a re-exec (ivmApplied++)", async () => {
+    const ivm = async () =>
+      ((await (await fetch(`${h.baseUrl}/metrics`)).json()) as { ivmApplied: number }).ivmApplied;
+    const counts: number[] = [];
+    const unsub = c.w.activeCount.subscribe({}, (n) => counts.push(n as number));
+    try {
+      await waitFor(() => counts.length >= 1); // initial snapshot (a real re-exec)
+      const before = await ivm();
+      const initial = counts.at(-1);
+      // A matching write: the count is maintained from the change delta — the
+      // reactor never calls the worker, so the IVM counter advances.
+      await c.w.addWidget.call({ name: "ivm-z", qty: 1, active: true });
+      await waitFor(() => counts.at(-1) !== initial);
+      expect(await ivm()).toBeGreaterThan(before);
+    } finally {
+      unsub();
+    }
+  });
 });
 
 describe("commit LSN watermark (end-to-end via raw SSE)", () => {
