@@ -398,7 +398,8 @@ async fn main() -> anyhow::Result<()> {
             }
             (true, Some(catalog)) => {
                 let slot = env_or("PULSE_WAL_SLOT", pulse_cdc::wal::DEFAULT_SLOT);
-                let publication = env_or("PULSE_WAL_PUBLICATION", pulse_cdc::wal::DEFAULT_PUBLICATION);
+                let publication =
+                    env_or("PULSE_WAL_PUBLICATION", pulse_cdc::wal::DEFAULT_PUBLICATION);
                 let poll_ms = num_env("PULSE_WAL_POLL_MS", 50).max(1);
                 if let Err(e) = pulse_cdc::wal::ensure_publication(&pool, &publication).await {
                     tracing::error!("WAL: ensure_publication failed: {e}");
@@ -407,7 +408,8 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("WAL: ensure_slot failed: {e}");
                 }
                 // Single-consumer: only the node holding the advisory lock drains it.
-                match pulse_cdc::wal::try_acquire_leadership(&database_url, wal_lock_key(&slot)).await
+                match pulse_cdc::wal::try_acquire_leadership(&database_url, wal_lock_key(&slot))
+                    .await
                 {
                     Ok(Some(guard)) => {
                         let mut rx = pulse_cdc::wal::start_wal_consumer(

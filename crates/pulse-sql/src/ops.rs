@@ -1240,7 +1240,12 @@ mod tests {
     fn text_to_key_value_covers_each_class() {
         let u = Uuid::nil();
         // id_ref columns decode to the raw uuid (matches predicate-bound ids).
-        let id = col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels"));
+        let id = col(
+            "channel_id",
+            "channelId",
+            PgTypeClass::Uuid,
+            Some("channels"),
+        );
         assert_eq!(
             text_to_key_value(Some(&u.to_string()), &id),
             Some(KeyValue::Uuid(u))
@@ -1252,8 +1257,14 @@ mod tests {
         // bool: Postgres `::text` yields `t`/`f`; the engine also accepts `true`.
         let b = col("done", "done", PgTypeClass::Bool, None);
         assert_eq!(text_to_key_value(Some("t"), &b), Some(KeyValue::Bool(true)));
-        assert_eq!(text_to_key_value(Some("true"), &b), Some(KeyValue::Bool(true)));
-        assert_eq!(text_to_key_value(Some("f"), &b), Some(KeyValue::Bool(false)));
+        assert_eq!(
+            text_to_key_value(Some("true"), &b),
+            Some(KeyValue::Bool(true))
+        );
+        assert_eq!(
+            text_to_key_value(Some("f"), &b),
+            Some(KeyValue::Bool(false))
+        );
         // text passes through.
         let t = col("body", "body", PgTypeClass::Text, None);
         assert_eq!(

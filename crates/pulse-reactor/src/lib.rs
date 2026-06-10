@@ -958,7 +958,10 @@ mod tests {
         assert_eq!(outcome, Resume::Resumed);
         assert_eq!(rx.try_recv().unwrap().id, 2);
         assert_eq!(rx.try_recv().unwrap().id, 3);
-        assert!(rx.try_recv().is_err(), "only the missed events are replayed");
+        assert!(
+            rx.try_recv().is_err(),
+            "only the missed events are replayed"
+        );
     }
 
     /// Slice 2: the buffer is bounded by PULSE_SSE_BUFFER — a reconnect can
@@ -1009,7 +1012,11 @@ mod tests {
         // A live push after the resume continues the same monotonic stream.
         reactor.push("a", "s", &json!({ "n": 6 }), Lsn::ZERO).await;
         let ids: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok().map(|p| p.id)).collect();
-        assert_eq!(ids, vec![4, 5, 6], "replay 4,5 then live 6 — no dup, no gap");
+        assert_eq!(
+            ids,
+            vec![4, 5, 6],
+            "replay 4,5 then live 6 — no dup, no gap"
+        );
     }
 
     /// Slice 5: an unknown client presenting a resume point (server restart, or a

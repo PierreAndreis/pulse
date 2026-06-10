@@ -52,7 +52,10 @@ impl<'a> Reader<'a> {
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], WalError> {
         if self.pos + n > self.buf.len() {
-            return Err(WalError::Truncated { need: n, at: self.pos });
+            return Err(WalError::Truncated {
+                need: n,
+                at: self.pos,
+            });
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -342,7 +345,11 @@ pub async fn drop_slot(pool: &PgPool, slot: &str) -> Result<(), WalError> {
 
 /// Drain the slot once, returning the raw pgoutput message buffers in WAL order.
 /// `get_binary_changes` consumes (advances the slot), so each buffer is seen once.
-pub async fn poll_raw(pool: &PgPool, slot: &str, publication: &str) -> Result<Vec<Vec<u8>>, WalError> {
+pub async fn poll_raw(
+    pool: &PgPool,
+    slot: &str,
+    publication: &str,
+) -> Result<Vec<Vec<u8>>, WalError> {
     let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
         "SELECT data FROM pg_logical_slot_get_binary_changes($1, NULL, NULL, \
          'proto_version', '1', 'publication_names', $2)",
@@ -538,7 +545,10 @@ mod tests {
             ))
             .unwrap()
             .is_none());
-        let ev = d.feed(&commit_msg(99)).unwrap().expect("commit emits an event");
+        let ev = d
+            .feed(&commit_msg(99))
+            .unwrap()
+            .expect("commit emits an event");
         let WalEvent::Changes(cs) = ev else {
             panic!("expected a Changes event, got {ev:?}");
         };

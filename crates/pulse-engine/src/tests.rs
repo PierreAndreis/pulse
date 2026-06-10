@@ -277,10 +277,15 @@ async fn mode_b_dedups_wal_echo_but_applies_out_of_band_writes() {
     // recorded in the dedup window.
     let change = insert_into_key("c1", 1);
     r.coord.propagate(stamp(vec![change.clone()])).await;
-    assert!(recv(&mut rx).await.is_some(), "in-engine write pushes locally");
+    assert!(
+        recv(&mut rx).await.is_some(),
+        "in-engine write pushes locally"
+    );
 
     // The WAL echo of that same commit must be dropped — no second push.
-    r.coord.apply_wal(stamp(vec![change.clone()]), Some(0)).await;
+    r.coord
+        .apply_wal(stamp(vec![change.clone()]), Some(0))
+        .await;
     assert!(
         recv(&mut rx).await.is_none(),
         "WAL echo of an in-engine write is deduped (Mode B)"

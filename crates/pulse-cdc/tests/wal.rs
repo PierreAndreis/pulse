@@ -29,7 +29,9 @@ async fn url() -> Option<&'static str> {
         let host = node.get_host().await.ok()?;
         let port = node.get_host_port_ipv4(5432).await.ok()?;
         std::mem::forget(node);
-        Some(format!("postgres://postgres:postgres@{host}:{port}/postgres"))
+        Some(format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
     })
     .await
     .as_deref()
@@ -86,15 +88,27 @@ async fn fixture(tag: &str) -> Fixture {
     let catalog = {
         let cols = vec![
             col("_id", "_id", PgTypeClass::Uuid, Some(&table)),
-            col("channel_id", "channelId", PgTypeClass::Uuid, Some("channels")),
+            col(
+                "channel_id",
+                "channelId",
+                PgTypeClass::Uuid,
+                Some("channels"),
+            ),
             col("body", "body", PgTypeClass::Text, None),
         ];
         let mut c = Catalog::default();
-        c.tables.insert(table.clone(), Table::from_columns(&table, cols));
+        c.tables
+            .insert(table.clone(), Table::from_columns(&table, cols));
         c
     };
 
-    Fixture { pool, table, slot, publication, catalog }
+    Fixture {
+        pool,
+        table,
+        slot,
+        publication,
+        catalog,
+    }
 }
 
 impl Fixture {
@@ -167,12 +181,15 @@ async fn out_of_band_update_carries_both_images() {
     .unwrap();
     // Move the row across the channel filter (A → B): the old image is what lets
     // a channel-A subscription drop the row, so it MUST be captured.
-    sqlx::query(&format!("UPDATE {} SET channel_id = $1 WHERE _id = $2", fx.table))
-        .bind(chan_b)
-        .bind(id)
-        .execute(&fx.pool)
-        .await
-        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE {} SET channel_id = $1 WHERE _id = $2",
+        fx.table
+    ))
+    .bind(chan_b)
+    .bind(id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
 
     let changes = fx.drain().await;
     let upd = changes
@@ -318,9 +335,13 @@ async fn wal_leadership_is_single_holder_with_failover() {
         return;
     };
     let key = 0x7012_3457; // unique to this test
-    let a = pulse_cdc::wal::try_acquire_leadership(url, key).await.unwrap();
+    let a = pulse_cdc::wal::try_acquire_leadership(url, key)
+        .await
+        .unwrap();
     assert!(a.is_some(), "first acquirer becomes the WAL consumer");
-    let b = pulse_cdc::wal::try_acquire_leadership(url, key).await.unwrap();
+    let b = pulse_cdc::wal::try_acquire_leadership(url, key)
+        .await
+        .unwrap();
     assert!(b.is_none(), "a second node is locked out of the slot");
 
     drop(a); // closes the connection → Postgres releases the session lock
@@ -329,13 +350,19 @@ async fn wal_leadership_is_single_holder_with_failover() {
     // while Postgres notices the disconnect).
     let mut took_over = None;
     for _ in 0..100 {
-        if let Some(g) = pulse_cdc::wal::try_acquire_leadership(url, key).await.unwrap() {
+        if let Some(g) = pulse_cdc::wal::try_acquire_leadership(url, key)
+            .await
+            .unwrap()
+        {
             took_over = Some(g);
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(took_over.is_some(), "leadership fails over after the holder drops");
+    assert!(
+        took_over.is_some(),
+        "leadership fails over after the holder drops"
+    );
 }
 
 // ── Mode A vs Mode B benchmark ───────────────────────────────────────────────
