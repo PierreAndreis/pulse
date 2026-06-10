@@ -783,6 +783,9 @@ pub fn text_to_key_value(text: Option<&str>, col: &Column) -> Option<KeyValue> {
     }
     match col.type_class {
         PgTypeClass::Int8 => s.parse::<i64>().ok().map(KeyValue::Int),
+        // double precision is carried in the image (for float aggregates), even
+        // though it can't be a primary key or a filter-predicate value.
+        PgTypeClass::Float8 => s.parse::<f64>().ok().map(KeyValue::Float),
         PgTypeClass::Bool => Some(KeyValue::Bool(s == "true" || s == "t")),
         PgTypeClass::Uuid => Uuid::parse_str(s).ok().map(KeyValue::Uuid),
         PgTypeClass::Text => Some(KeyValue::Text(s.to_string())),
@@ -1443,9 +1446,15 @@ mod tests {
             text_to_key_value(Some("hi"), &t),
             Some(KeyValue::Text("hi".into()))
         );
-        // unindexed classes and absent values → None.
+        // float8 is now captured (for float aggregates), though it can't be a key
+        // or a filter-predicate value; a parse failure degrades to None.
         let f = col("amount", "amount", PgTypeClass::Float8, None);
-        assert_eq!(text_to_key_value(Some("1.5"), &f), None);
+        assert_eq!(
+            text_to_key_value(Some("1.5"), &f),
+            Some(KeyValue::Float(1.5))
+        );
+        assert_eq!(text_to_key_value(Some("xyz"), &f), None);
+        // absent value → None.
         assert_eq!(text_to_key_value(None, &t), None);
     }
 

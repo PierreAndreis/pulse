@@ -49,6 +49,10 @@ export const maxQty = os.w.maxQty.handler(async ({ ctx }) => q(ctx).max("qty"));
 // so the reactor maintains this by IVM (no worker re-exec) on a new high score.
 export const maxScoreActive = os.w.maxScoreActive.handler(async ({ ctx }) =>
   q(ctx).filter((x: any) => x.eq("active", true)).max("score"));
+// max() over a DOUBLE PRECISION field with a filter — qty's float values are now in
+// the change image too, so this is also maintained incrementally (IVM), not re-run.
+export const maxQtyActive = os.w.maxQtyActive.handler(async ({ ctx }) =>
+  q(ctx).filter((x: any) => x.eq("active", true)).max("qty"));
 
 export const byActive = os.w.byActive.handler(async ({ ctx }) => q(ctx).groupBy("active").count());
 export const sumByTag = os.w.sumByTag.handler(async ({ ctx }) => q(ctx).groupBy("tag").sum("price"));

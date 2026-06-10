@@ -21,17 +21,55 @@ impl From<&str> for TableId {
     }
 }
 
-/// A single column value within a primary key. Floats are intentionally absent
-/// — real primary keys are integers, text, uuids, or booleans, all of which are
-/// `Hash + Eq` so a `PrimaryKey` can live in a `HashSet`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A single column value. The `Int`/`Text`/`Uuid`/`Bool` variants are the ones a
+/// `PrimaryKey` is built from. `Float` is *not* a primary-key value (real keys are
+/// never floats) but is carried in row images so reactive `sum`/`min`/`max` over a
+/// `double precision` column can be maintained incrementally.
+///
+/// `Eq`/`Hash`/`PartialEq` are hand-written (f64 implements none of them): `Float`
+/// compares and hashes by its raw bits, which is reflexive (a bit pattern equals
+/// itself, including `NaN`) and consistent — so `KeyValue` is a sound `Eq + Hash`
+/// key, and a `PrimaryKey` can still live in a `HashSet`. Ordered comparison of two
+/// floats uses `partial_cmp` (so a `NaN` is unordered, like the cross-variant case).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
 pub enum KeyValue {
     Int(i64),
+    Float(f64),
     Text(String),
     Uuid(Uuid),
     Bool(bool),
     Null,
+}
+
+impl PartialEq for KeyValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (KeyValue::Int(a), KeyValue::Int(b)) => a == b,
+            (KeyValue::Float(a), KeyValue::Float(b)) => a.to_bits() == b.to_bits(),
+            (KeyValue::Text(a), KeyValue::Text(b)) => a == b,
+            (KeyValue::Uuid(a), KeyValue::Uuid(b)) => a == b,
+            (KeyValue::Bool(a), KeyValue::Bool(b)) => a == b,
+            (KeyValue::Null, KeyValue::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for KeyValue {}
+
+impl std::hash::Hash for KeyValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            KeyValue::Int(n) => n.hash(state),
+            KeyValue::Float(f) => f.to_bits().hash(state),
+            KeyValue::Text(s) => s.hash(state),
+            KeyValue::Uuid(u) => u.hash(state),
+            KeyValue::Bool(b) => b.hash(state),
+            KeyValue::Null => {}
+        }
+    }
 }
 
 impl KeyValue {
@@ -40,6 +78,7 @@ impl KeyValue {
     pub fn order(&self, other: &KeyValue) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (KeyValue::Int(a), KeyValue::Int(b)) => Some(a.cmp(b)),
+            (KeyValue::Float(a), KeyValue::Float(b)) => a.partial_cmp(b),
             (KeyValue::Text(a), KeyValue::Text(b)) => Some(a.cmp(b)),
             (KeyValue::Uuid(a), KeyValue::Uuid(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
             (KeyValue::Bool(a), KeyValue::Bool(b)) => Some(a.cmp(b)),
@@ -66,9 +105,11 @@ pub enum ChangeOp {
     Delete,
 }
 
-/// A column field (camelCase) → value image of the columns any predicate can
-/// filter on. Floats/jsonb/large text are omitted (no `KeyValue::Float`); a
-/// filter on such a column degrades to a table-wildcard at capture time.
+/// A column field (camelCase) → value image. Carries the filterable scalar columns
+/// (int/text/uuid/bool) plus `double precision` (`KeyValue::Float`) so float
+/// aggregates can be maintained from the delta. jsonb/large-text are still omitted;
+/// a *filter* on a float column degrades to a table-wildcard at capture time (float
+/// predicate values are dropped), but the float *value* is present for aggregates.
 pub type RowValues = std::collections::HashMap<String, KeyValue>;
 
 /// A single committed row change (from an in-engine mutation or, later, the WAL).

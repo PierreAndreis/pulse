@@ -354,6 +354,25 @@ describe("ORM reactivity is precise", () => {
       unsub();
     }
   });
+
+  test("a max() over a DOUBLE field rises by IVM on a new high (ivmApplied++)", async () => {
+    // qty is v.number() → double precision. Its values are now carried in the change
+    // image too, so max(qty) is maintained from the delta — no longer dormant.
+    const ivm = async () =>
+      ((await (await fetch(`${h.baseUrl}/metrics`)).json()) as { ivmApplied: number }).ivmApplied;
+    await c.w.addWidget.call({ name: "q1", qty: 2.5, active: true }); // seed max=2.5
+    const maxes: (number | null)[] = [];
+    const unsub = c.w.maxQtyActive.subscribe({}, (n) => maxes.push(n as number | null));
+    try {
+      await waitFor(() => maxes.at(-1) === 2.5); // initial snapshot (a real re-exec)
+      const before = await ivm();
+      await c.w.addWidget.call({ name: "q2", qty: 9.5, active: true }); // new high
+      await waitFor(() => maxes.at(-1) === 9.5);
+      expect(await ivm()).toBeGreaterThan(before); // float value maintained from the delta
+    } finally {
+      unsub();
+    }
+  });
 });
 
 describe("commit LSN watermark (end-to-end via raw SSE)", () => {

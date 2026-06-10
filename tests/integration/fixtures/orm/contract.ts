@@ -33,6 +33,7 @@ export const contract = {
     minQty: numN(),
     maxQty: numN(),
     maxScoreActive: numN(), // max() over an int field + filter — maintained by IVM
+    maxQtyActive: numN(), // max() over a DOUBLE field + filter — also maintained by IVM
     // grouping
     byActive: rows(),
     sumByTag: rows(),

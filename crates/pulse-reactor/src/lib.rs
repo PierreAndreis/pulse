@@ -550,25 +550,25 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
             Some(json!(last.as_i64()? + delta))
         }
         // sum(field): +new on enter, −old on leave, (new−old) on a stay where the
-        // value changed. Maintained only for INTEGER fields — float/jsonb columns
-        // aren't carried in the change image (so `int()` returns None → fall back),
-        // which also keeps the arithmetic exact (no f64 drift). An empty set's sum
-        // is SQL NULL, so a non-numeric `last` falls back too.
+        // value changed. Maintained for `int8` and `double precision` fields — both
+        // are carried in the change image; jsonb/absent → `num()` returns None → fall
+        // back. An empty set's sum is SQL NULL, so a non-numeric `last` falls back too.
         AggFunc::Sum if agg.field.is_some() && !agg.distinct => {
             let field = agg.field.as_ref().unwrap();
             let base = last.as_f64()?; // Null (empty set) / non-numeric → fall back
-            let int = |row: Option<&RowValues>| -> Option<i64> {
+            let num = |row: Option<&RowValues>| -> Option<f64> {
                 match row?.get(field)? {
-                    KeyValue::Int(n) => Some(*n),
+                    KeyValue::Int(n) => Some(*n as f64),
+                    KeyValue::Float(f) => Some(*f),
                     _ => None,
                 }
             };
-            let mut delta: i64 = 0;
+            let mut delta: f64 = 0.0;
             for (old, new) in &nets {
                 match filter.membership_images(*old, *new) {
-                    (false, true) => delta += int(*new)?,             // entered
-                    (true, false) => delta -= int(*old)?,             // left
-                    (true, true) => delta += int(*new)? - int(*old)?, // stayed
+                    (false, true) => delta += num(*new)?,             // entered
+                    (true, false) => delta -= num(*old)?,             // left
+                    (true, true) => delta += num(*new)? - num(*old)?, // stayed
                     (false, false) => {}                              // outside
                 }
             }
@@ -577,7 +577,7 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
             // can't tell — so fall back and let the re-exec decide. Any *non-zero*
             // result proves a non-empty set, so it's safe to push (matches the
             // re-exec's bare-number shape).
-            let result = base + delta as f64;
+            let result = base + delta;
             if result == 0.0 {
                 return None;
             }
@@ -589,11 +589,10 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
         // *lowering* the row that holds the extreme needs the next-best value, which
         // isn't in the change image, so we fall back.
         //
-        // Integer fields only: the change image carries no floats (KeyValue must stay
-        // Hash+Eq for primary keys), so a float/absent field → None → fall back. The
-        // engine reads scalar aggregates as f64 (fetch_scalar_opt_f64), so `last` and
-        // the output are f64 even for integer columns — matching sum and the re-exec
-        // shape; an empty set's extreme is SQL NULL → non-numeric `last` falls back.
+        // Maintained for `int8` and `double precision` fields (both in the change
+        // image); jsonb/absent → `val()` returns None → fall back. The engine reads
+        // scalar aggregates as f64 (fetch_scalar_opt_f64), so `last` and the output
+        // are f64; an empty set's extreme is SQL NULL → non-numeric `last` falls back.
         AggFunc::Max | AggFunc::Min if agg.field.is_some() && !agg.distinct => {
             let is_max = matches!(agg.func, AggFunc::Max);
             let field = agg.field.as_ref().unwrap();
@@ -601,6 +600,7 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
             let val = |row: Option<&RowValues>| -> Option<f64> {
                 match row?.get(field)? {
                     KeyValue::Int(n) => Some(*n as f64),
+                    KeyValue::Float(f) => Some(*f),
                     _ => None,
                 }
             };
@@ -2443,6 +2443,16 @@ mod tests {
             m
         }
 
+        // Same row, but the amount is a `double precision` field (KeyValue::Float).
+        // Amounts stay integer-valued so the aggregate arithmetic is exact and the
+        // brute-force oracle can assert equality — proving the Float reading path.
+        fn prow_float(ch: &str, amt: i64) -> RowValues {
+            let mut m = RowValues::new();
+            m.insert("channelId".to_string(), KeyValue::Text(ch.to_string()));
+            m.insert("amount".to_string(), KeyValue::Float(amt as f64));
+            m
+        }
+
         fn psub(func: AggFunc, field: Option<&str>, last: Value) -> Subscription {
             let mut rs = ReadSet::new();
             rs.add_filter(
@@ -2476,7 +2486,11 @@ mod tests {
         // Replay ops onto `initial`, returning (changes, post-world). An op is
         // (key, Some((channel, amount))) = upsert, or (key, None) = delete. Old/new
         // images are derived from the simulated world so the changeset is valid.
-        fn replay(initial: &World, ops: &[(u8, Option<(String, i64)>)]) -> (Vec<Change>, World) {
+        fn replay(
+            initial: &World,
+            ops: &[(u8, Option<(String, i64)>)],
+            row: impl Fn(&str, i64) -> RowValues,
+        ) -> (Vec<Change>, World) {
             let mut world = initial.clone();
             let mut changes = Vec::new();
             for (k, act) in ops {
@@ -2492,8 +2506,8 @@ mod tests {
                             } else {
                                 ChangeOp::Insert
                             },
-                            old: before.as_ref().map(|(c, a)| prow(c, *a)),
-                            new: Some(prow(ch, *amt)),
+                            old: before.as_ref().map(|(c, a)| row(c, *a)),
+                            new: Some(row(ch, *amt)),
                         });
                     }
                     None => {
@@ -2503,7 +2517,7 @@ mod tests {
                                 table: TableId::new("messages"),
                                 key: PrimaryKey::single(KeyValue::Int(*k as i64)),
                                 op: ChangeOp::Delete,
-                                old: Some(prow(&c, a)),
+                                old: Some(row(&c, a)),
                                 new: None,
                             });
                         }
@@ -2528,7 +2542,7 @@ mod tests {
                 initial in prop::collection::btree_map(0u8..8, ("A|B", -6i64..12), 0..6),
                 ops in prop::collection::vec((0u8..8, prop::option::of(("A|B", -6i64..12))), 0..10),
             ) {
-                let (changes, post) = replay(&initial, &ops);
+                let (changes, post) = replay(&initial, &ops, prow);
                 let cs = cs_of(changes);
                 let pre = amounts_in_a(&initial);
                 let post_a = amounts_in_a(&post);
@@ -2573,6 +2587,55 @@ mod tests {
                         let sub = psub(func, Some("amount"), json!(seed as f64));
                         if let Some(v) = try_ivm(&sub, &cs) {
                             prop_assert_eq!(v, truth, "min/max");
+                        }
+                    }
+                }
+            }
+
+            // Same contract over a `double precision` amount field (KeyValue::Float),
+            // exercising the float reading path. Amounts are integer-valued so the
+            // brute-force oracle stays exact (fractional-float sums are inherently
+            // approximate vs the re-exec and aren't asserted bit-equal).
+            #[test]
+            fn try_ivm_is_never_wrong_float(
+                initial in prop::collection::btree_map(0u8..8, ("A|B", -6i64..12), 0..6),
+                ops in prop::collection::vec((0u8..8, prop::option::of(("A|B", -6i64..12))), 0..10),
+            ) {
+                let (changes, post) = replay(&initial, &ops, prow_float);
+                let cs = cs_of(changes);
+                let pre = amounts_in_a(&initial);
+                let post_a = amounts_in_a(&post);
+
+                if !pre.is_empty() {
+                    let truth_sum = if post_a.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(post_a.iter().sum::<i64>() as f64)
+                    };
+                    let sub = psub(AggFunc::Sum, Some("amount"), json!(pre.iter().sum::<i64>() as f64));
+                    if let Some(v) = try_ivm(&sub, &cs) {
+                        prop_assert_eq!(v, truth_sum, "float sum");
+                    }
+
+                    for (func, is_max) in [(AggFunc::Max, true), (AggFunc::Min, false)] {
+                        let seed = if is_max {
+                            *pre.iter().max().unwrap()
+                        } else {
+                            *pre.iter().min().unwrap()
+                        };
+                        let truth = if post_a.is_empty() {
+                            Value::Null
+                        } else {
+                            let e = if is_max {
+                                *post_a.iter().max().unwrap()
+                            } else {
+                                *post_a.iter().min().unwrap()
+                            };
+                            json!(e as f64)
+                        };
+                        let sub = psub(func, Some("amount"), json!(seed as f64));
+                        if let Some(v) = try_ivm(&sub, &cs) {
+                            prop_assert_eq!(v, truth, "float min/max");
                         }
                     }
                 }
