@@ -496,6 +496,9 @@ async fn node_metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
         "busEvents": events,
         "changes": changes,
         "resyncs": m.resyncs.load(Relaxed),
+        // WAL/CDC: changes dropped because they echo an in-engine write already
+        // applied locally (Mode B). Non-zero ⇒ the WAL consumer is live.
+        "walDeduped": m.deduped.load(Relaxed),
         "busLagMs": avg_ms(m.lag_us_sum.load(Relaxed), changes),
         "applyMs": avg_ms(m.apply_us_sum.load(Relaxed), events),
         // Raw sums (µs) so a benchmark can compute a windowed average via deltas.
