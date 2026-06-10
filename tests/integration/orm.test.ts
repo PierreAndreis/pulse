@@ -373,6 +373,37 @@ describe("ORM reactivity is precise", () => {
       unsub();
     }
   });
+
+  test("a filtered sum() stays correct through inserts/deletes (IVM)", async () => {
+    const ivm = async () =>
+      ((await (await fetch(`${h.baseUrl}/metrics`)).json()) as { ivmApplied: number }).ivmApplied;
+    const seen: (number | null)[] = [];
+    const unsub = c.w.sumScoreActive.subscribe({}, (n) => seen.push(n as number | null));
+    try {
+      // Seed a row first so the server snapshot is a concrete number (the client's
+      // optimistic local-empty initial for a query is `[]`; we wait for the server's
+      // value, never assert right after the first push). The empty→NULL boundary is
+      // covered by the reactor unit test `ivm_sum_falls_back_when_result_is_zero`.
+      await c.w.addWidget.call({ name: "a", qty: 1, score: 5, active: true });
+      await waitFor(() => seen.at(-1) === 5);
+
+      const ivmBefore = await ivm();
+      const w3 = (await c.w.addWidget.call({ name: "b", qty: 1, score: 3, active: true })) as {
+        _id: string;
+      };
+      await waitFor(() => seen.at(-1) === 8); // +3 maintained from the delta
+
+      await c.w.addWidget.call({ name: "c", qty: 1, score: 2, active: false }); // outside filter
+      await new Promise((r) => setTimeout(r, 500));
+      expect(seen.at(-1)).toBe(8); // an inactive insert doesn't match → still 8
+
+      await c.w.remove.call({ id: w3._id as never }); // 8 − 3 = 5, maintained
+      await waitFor(() => seen.at(-1) === 5);
+      expect(await ivm()).toBeGreaterThan(ivmBefore); // the →8 and →5 steps were IVM
+    } finally {
+      unsub();
+    }
+  });
 });
 
 describe("commit LSN watermark (end-to-end via raw SSE)", () => {

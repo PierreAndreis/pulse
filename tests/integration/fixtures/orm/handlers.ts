@@ -53,6 +53,10 @@ export const maxScoreActive = os.w.maxScoreActive.handler(async ({ ctx }) =>
 // the change image too, so this is also maintained incrementally (IVM), not re-run.
 export const maxQtyActive = os.w.maxQtyActive.handler(async ({ ctx }) =>
   q(ctx).filter((x: any) => x.eq("active", true)).max("qty"));
+// sum() over an int field with a filter — maintained from the delta (IVM), with a
+// fall-back to re-exec when the running sum hits 0 (ambiguous: empty set vs cancel).
+export const sumScoreActive = os.w.sumScoreActive.handler(async ({ ctx }) =>
+  q(ctx).filter((x: any) => x.eq("active", true)).sum("score"));
 
 export const byActive = os.w.byActive.handler(async ({ ctx }) => q(ctx).groupBy("active").count());
 export const sumByTag = os.w.sumByTag.handler(async ({ ctx }) => q(ctx).groupBy("tag").sum("price"));
