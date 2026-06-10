@@ -153,6 +153,14 @@ pub enum DbOp {
         table: String,
         id: String,
     },
+    /// Batched point lookup: many ids of one table in a single op. The result is a
+    /// JSON array aligned to `ids` order (a missing/unparseable id → null). Lets the
+    /// worker's DataLoader collapse N concurrent `get()`s into one round-trip while
+    /// keeping per-id key-level read-set capture (M3 precision).
+    GetMany {
+        table: String,
+        ids: Vec<String>,
+    },
     Query {
         table: String,
         #[serde(default)]
@@ -228,9 +236,10 @@ impl DbOp {
     /// to capture read/write-sets. Raw analytical SQL is opaque (returns `None`).
     pub fn access(&self) -> Option<(&str, bool)> {
         match self {
-            DbOp::Get { table, .. } | DbOp::Query { table, .. } | DbOp::GetCollab { table, .. } => {
-                Some((table, false))
-            }
+            DbOp::Get { table, .. }
+            | DbOp::GetMany { table, .. }
+            | DbOp::Query { table, .. }
+            | DbOp::GetCollab { table, .. } => Some((table, false)),
             DbOp::Insert { table, .. }
             | DbOp::Patch { table, .. }
             | DbOp::Replace { table, .. }
@@ -638,6 +647,17 @@ pub fn capture_reads(op: &DbOp, catalog: &Catalog, rs: &mut ReadSet) {
                 Err(_) => rs.add_table(tid),
             }
         }
+        DbOp::GetMany { table: name, ids } => {
+            // One key per id — value-identical to N separate Get reads, so a change
+            // to any one row still invalidates with point-key precision (M3).
+            let tid = TableId::new(name.clone());
+            for id in ids {
+                match Uuid::parse_str(decode_id(id)) {
+                    Ok(uuid) => rs.add_key(tid.clone(), PrimaryKey::single(KeyValue::Uuid(uuid))),
+                    Err(_) => rs.add_table(tid.clone()),
+                }
+            }
+        }
         DbOp::Query {
             table: name,
             predicates,
@@ -877,6 +897,52 @@ pub async fn execute_op(
             );
             let rows = fetch_rows(&mut *conn, &sql, &[Some(decode_id(id).to_string())], t).await?;
             Ok((rows.into_iter().next().unwrap_or(Value::Null), None))
+        }
+        DbOp::GetMany { table: name, ids } => {
+            let t = table(catalog, name)?;
+            // Decode + parse; an unparseable id can't match a row → null at its index.
+            let valid: Vec<String> = ids
+                .iter()
+                .filter_map(|id| Uuid::parse_str(decode_id(id)).ok().map(|u| u.to_string()))
+                .collect();
+            if valid.is_empty() {
+                return Ok((
+                    Value::Array(ids.iter().map(|_| Value::Null).collect()),
+                    None,
+                ));
+            }
+            // One round-trip: `_id = ANY(ARRAY[$1::uuid, …])` (order-independent, dedups).
+            let placeholders: Vec<String> =
+                (1..=valid.len()).map(|i| format!("${i}::uuid")).collect();
+            let sql = format!(
+                "SELECT {} FROM {} WHERE _id = ANY(ARRAY[{}])",
+                t.select_list(),
+                name,
+                placeholders.join(", ")
+            );
+            let binds: Vec<Option<String>> = valid.into_iter().map(Some).collect();
+            let rows = fetch_rows(&mut *conn, &sql, &binds, t).await?;
+            // Key rows by their raw uuid, then align to the requested `ids` order so
+            // the worker can distribute results by index (missing → null).
+            let mut by_id: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
+            for row in rows {
+                if let Some(enc) = row.get("_id").and_then(|v| v.as_str()) {
+                    if let Ok(u) = Uuid::parse_str(decode_id(enc)) {
+                        by_id.insert(u.to_string(), row);
+                    }
+                }
+            }
+            let out: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    Uuid::parse_str(decode_id(id))
+                        .ok()
+                        .and_then(|u| by_id.get(&u.to_string()).cloned())
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            Ok((Value::Array(out), None))
         }
 
         DbOp::Query {
@@ -1536,6 +1602,64 @@ mod tests {
     }
 
     #[test]
+    fn getmany_capture_matches_separate_gets() {
+        // Slice 0 — the M3 precision invariant: a batched GetMany must capture the
+        // SAME read-set as N separate Get ops, so batching is invisible to invalidation.
+        let catalog = catalog_messages();
+        let ids = vec![
+            format!("messages:{UUID_A}"),
+            format!("messages:{UUID_B}"),
+            "not-a-uuid".to_string(),
+        ];
+
+        let mut batched = ReadSet::new();
+        capture_reads(
+            &DbOp::GetMany {
+                table: "messages".to_string(),
+                ids: ids.clone(),
+            },
+            &catalog,
+            &mut batched,
+        );
+
+        let mut separate = ReadSet::new();
+        for id in &ids {
+            capture_reads(
+                &DbOp::Get {
+                    table: "messages".to_string(),
+                    id: id.clone(),
+                },
+                &catalog,
+                &mut separate,
+            );
+        }
+
+        assert_eq!(batched.keys, separate.keys, "keys must match N gets");
+        assert_eq!(batched.tables, separate.tables, "tables must match N gets");
+
+        // Spelled out: two point keys + one table-wildcard (the unparseable id).
+        let keys = batched.keys.get(&TableId::new("messages")).expect("keys");
+        assert!(keys.contains(&PrimaryKey::single(KeyValue::Uuid(uuid(UUID_A)))));
+        assert!(keys.contains(&PrimaryKey::single(KeyValue::Uuid(uuid(UUID_B)))));
+        assert!(batched.tables.contains(&TableId::new("messages")));
+    }
+
+    #[test]
+    fn getmany_empty_captures_nothing() {
+        let catalog = catalog_messages();
+        let mut rs = ReadSet::new();
+        capture_reads(
+            &DbOp::GetMany {
+                table: "messages".to_string(),
+                ids: vec![],
+            },
+            &catalog,
+            &mut rs,
+        );
+        assert!(rs.keys.is_empty() && rs.tables.is_empty() && rs.filters.is_empty());
+    }
+
+    #[test]
     fn write_ops_capture_nothing() {
         let catalog = catalog_messages();
         let mut value = Map::new();
@@ -1631,5 +1755,25 @@ mod tests {
         }))
         .expect("raw deserializes");
         assert_eq!(raw.access(), None);
+    }
+
+    #[test]
+    fn getmany_serde_lowercase_kind_and_access() {
+        // Slice 0b — wire compat: the worker sends `{kind:"getmany",table,ids}`.
+        let op: DbOp = serde_json::from_value(json!({
+            "kind": "getmany",
+            "table": "messages",
+            "ids": [format!("messages:{UUID_A}"), format!("messages:{UUID_B}")],
+        }))
+        .expect("getmany deserializes");
+        match &op {
+            DbOp::GetMany { table, ids } => {
+                assert_eq!(table, "messages");
+                assert_eq!(ids.len(), 2);
+            }
+            other => panic!("expected GetMany, got {other:?}"),
+        }
+        // Batched read → access reports the table, not a write.
+        assert_eq!(op.access(), Some(("messages", false)));
     }
 }
