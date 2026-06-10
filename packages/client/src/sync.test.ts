@@ -39,6 +39,8 @@ function makeClient(opts: Partial<ClientOptions> = {}) {
     release(path: string[], input: unknown): void;
     onStatus(cb: (s: SyncStatus) => void): () => void;
     setStatus(s: SyncStatus): void;
+    lastEventId?: number;
+    serverHasSub: Set<string>;
   };
   return { client, store, calls, options };
 }
@@ -190,6 +192,54 @@ describe("ensure() / release() subscription dedupe", () => {
     await vi.advanceTimersByTimeAsync(0);
     // Reaching here without an unhandled rejection is the assertion.
     expect(true).toBe(true);
+  });
+});
+
+describe("SSE resume (Last-Event-ID / resync)", () => {
+  const frame = (id: number, body: unknown) => `id: ${id}\ndata: ${JSON.stringify(body)}`;
+
+  test("handleEvent tracks the last event id from the id: line", () => {
+    const { client } = makeClient();
+    client.handleEvent(frame(5, { sub: "k", data: [1] }));
+    expect(client.lastEventId).toBe(5);
+  });
+
+  test("an event id <= lastEventId is dropped (replay/duplicate guard)", () => {
+    const { client, calls } = makeClient();
+    client.handleEvent(frame(5, { sub: "k", data: [1] }));
+    calls.length = 0;
+    client.handleEvent(frame(3, { sub: "k", data: [2] })); // stale → dropped
+    expect(calls).toEqual([]);
+    client.handleEvent(frame(6, { sub: "k", data: [3] })); // newer → applied
+    expect(calls).toEqual([["k", [3]]]);
+    expect(client.lastEventId).toBe(6);
+  });
+
+  test("a resync frame re-registers every subscription and adopts its id", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => {
+      throw new Error("no network");
+    });
+    const { client } = makeClient({ fetch: fetchMock as unknown as ClientOptions["fetch"] });
+    client.connected = true;
+    client.ensure(["messages", "list"], { channelId: "c1" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.serverHasSub.size).toBe(1);
+    fetchMock.mockClear();
+
+    // Server lost our state (restart / buffer rolled past) → it sends a resync.
+    client.handleEvent(frame(1, { type: "resync" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const subs = fetchMock.mock.calls.filter((c) => String(c[0]).endsWith("/subscribe"));
+    expect(subs).toHaveLength(1); // re-registered all subs
+    expect(client.lastEventId).toBe(1); // adopted the server's stream position
+  });
+
+  test("a resync frame does not write confirmed data (it carries no sub)", () => {
+    const { client, calls } = makeClient();
+    client.handleEvent(frame(1, { type: "resync" }));
+    expect(calls).toEqual([]);
   });
 });
 

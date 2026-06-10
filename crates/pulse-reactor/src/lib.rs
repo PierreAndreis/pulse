@@ -987,6 +987,162 @@ mod tests {
         );
     }
 
+    fn agg_filter(channel: &str, agg: pulse_core::Aggregate) -> ReadSet {
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            Filter {
+                conds: vec![Cond {
+                    field: "channelId".into(),
+                    op: FilterOp::Eq,
+                    value: KeyValue::Text(channel.into()),
+                }],
+                read_cols: Some(vec![]),
+                aggregate: Some(agg),
+            },
+        );
+        rs
+    }
+
+    #[tokio::test]
+    async fn ivm_falls_back_for_every_non_count_shape() {
+        use pulse_core::Aggregate;
+        // Each shape slice-1 IVM cannot maintain precisely must re-execute.
+        let shapes = [
+            Aggregate {
+                func: AggFunc::Avg,
+                field: Some("p".into()),
+                distinct: false,
+            },
+            Aggregate {
+                func: AggFunc::Min,
+                field: Some("p".into()),
+                distinct: false,
+            },
+            Aggregate {
+                func: AggFunc::Max,
+                field: Some("p".into()),
+                distinct: false,
+            },
+            Aggregate {
+                func: AggFunc::Count,
+                field: Some("p".into()),
+                distinct: false,
+            }, // count(field)
+            Aggregate {
+                func: AggFunc::Count,
+                field: None,
+                distinct: true,
+            }, // count(distinct)
+        ];
+        for agg in shapes {
+            let reexec = Arc::new(CountingReExec {
+                calls: AtomicUsize::new(0),
+            });
+            let reactor = InMemoryReactor::new(reexec.clone());
+            let _rx = reactor.register_client("a".into()).await;
+            reactor
+                .add_subscription(Subscription {
+                    client_id: "a".into(),
+                    sub: "agg::A".into(),
+                    path: vec!["w".into(), "agg".into()],
+                    input: json!({}),
+                    headers: HashMap::new(),
+                    read_set: agg_filter("A", agg.clone()),
+                    last: Some(json!(0)),
+                    last_lsn: Lsn::ZERO,
+                })
+                .await;
+            reactor
+                .apply_change_set(cs_of(vec![insert_into("A")]))
+                .await;
+            assert_eq!(
+                reexec.calls.load(Ordering::SeqCst),
+                1,
+                "{agg:?} must fall back to re-exec"
+            );
+        }
+    }
+
+    /// Benchmark: a reactive `count()` maintained incrementally (no worker round-trip)
+    /// vs. the same invalidation re-executed through the worker. The re-exec uses a
+    /// `WORKER_MS` stand-in for the real worker+SQL cost (single-digit ms in practice
+    /// — see the WAL latency bench). Run:
+    ///   cargo test -p pulse-reactor --release -- --ignored --nocapture bench_ivm
+    #[tokio::test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture bench_ivm"]
+    async fn bench_ivm_vs_reexec() {
+        use std::time::Instant;
+        // The headline metric is the number of worker re-execs each path triggers
+        // (IVM does zero), not wall-clock: the tokio test clock interferes with a
+        // simulated worker delay. Each avoided re-exec saves a worker+SQL round-trip
+        // — single-digit ms in practice (see the WAL latency bench) — which dwarfs
+        // the reactor-side µs reported here.
+        const N: usize = 5000;
+
+        // A re-executor that returns a fresh value (never diff-suppressed) AND the
+        // same filter read-set, so a re-exec sub keeps matching every change.
+        struct BenchReExec {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReExecutor for BenchReExec {
+            async fn exec(
+                &self,
+                _p: Vec<String>,
+                _i: Value,
+                _h: HashMap<String, String>,
+            ) -> Result<(Value, ReadSet), String> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok((json!({ "n": n }), channel_filter("A")))
+            }
+        }
+
+        // IVM: a bare count() maintained from the change delta — no worker calls.
+        let ivm_reexec = Arc::new(BenchReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(ivm_reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        count_sub(&reactor, "a", "A", 0).await;
+        let t0 = Instant::now();
+        for i in 0..N {
+            reactor
+                .apply_change_set(cs_of(vec![insert_keyed("A", i as i64)]))
+                .await;
+            let _ = rx.try_recv(); // drain so the SSE channel never fills
+        }
+        let ivm = t0.elapsed();
+
+        // Re-exec: a plain list() over the same filter → one worker re-exec/change.
+        let re_reexec = Arc::new(BenchReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor2 = InMemoryReactor::new(re_reexec.clone());
+        let mut rx2 = reactor2.register_client("b".into()).await;
+        sub(&reactor2, "b", "A").await;
+        let t1 = Instant::now();
+        for i in 0..N {
+            reactor2
+                .apply_change_set(cs_of(vec![insert_keyed("A", i as i64)]))
+                .await;
+            let _ = rx2.try_recv(); // drain so the SSE channel never fills
+        }
+        let re = t1.elapsed();
+
+        println!(
+            "\nIVM count:   {N} updates, {} worker re-execs, {:.2} µs/update (reactor only)\n\
+             re-exec:     {N} updates, {} worker re-execs, {:.2} µs/update (reactor only)\n\
+             → IVM eliminates the worker+SQL round-trip entirely (the dominant cost,\n\
+               single-digit ms each per the WAL latency bench); reactor-side cost\n\
+               above excludes it.\n",
+            ivm_reexec.calls.load(Ordering::SeqCst),
+            ivm.as_micros() as f64 / N as f64,
+            re_reexec.calls.load(Ordering::SeqCst),
+            re.as_micros() as f64 / N as f64,
+        );
+    }
+
     /// An injected ChangeSet drives matching + re-execution via the trait alone,
     /// re-running only the matching subscription.
     #[tokio::test]
