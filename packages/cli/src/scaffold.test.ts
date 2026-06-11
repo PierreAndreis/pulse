@@ -34,8 +34,10 @@ describe("scaffoldApp", () => {
     expect(files["Dockerfile"]).toContain("node:22-trixie-slim");
     expect(files["Dockerfile"]).toContain("oven/bun");
     expect(files["Dockerfile"]).toContain("npx pulse gen app/schema.ts");
-    // Prod serve uses `pulse start` (no codegen at boot), not the dev command.
-    expect(files["Dockerfile"]).toContain('"pulse", "start", "app/app.ts"');
+    // Prod applies committed migrations, then `pulse start` (no codegen at boot),
+    // not the dev command.
+    expect(files["Dockerfile"]).toContain("pulse migrate deploy");
+    expect(files["Dockerfile"]).toContain("pulse start app/app.ts");
     expect(files["Dockerfile"]).not.toContain('"dev"');
     expect(files[".dockerignore"]).toContain("node_modules");
   });
@@ -85,9 +87,9 @@ describe("scaffoldApp", () => {
     expect(pkg.scripts.db).toBe("docker compose up -d");
   });
 
-  it("ships a migrate script that applies the schema", () => {
+  it("ships a migrate script that generates + applies a migration", () => {
     const pkg = JSON.parse(files["package.json"]!);
-    expect(pkg.scripts.migrate).toBe("pulse migrate --apply");
+    expect(pkg.scripts.migrate).toBe("pulse migrate dev");
   });
 
   it("schema/contract/handlers reference the same table", () => {

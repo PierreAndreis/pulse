@@ -43,9 +43,10 @@ export function scaffoldApp(
           // and Vite (via --start). Just `pnpm dev`.
           dev: "pulse dev app/app.ts --start vite",
           db: "docker compose up -d",
-          // Apply the schema to the database: additive changes auto-apply;
-          // destructive ones prompt for confirmation (or need --force in CI).
-          migrate: "pulse migrate --apply",
+          // Create a migration from your schema changes, apply it to the dev DB,
+          // and update the data model. (For a quick no-files sync while
+          // prototyping, use `pulse db push` instead.)
+          migrate: "pulse migrate dev",
           build: "tsc && vite build",
           typecheck: "tsc --noEmit",
         },
@@ -371,12 +372,12 @@ RUN npx pulse gen app/schema.ts \\
 ENV PULSE_PORT=8787 PULSE_WORKER_BIN=bun
 EXPOSE 8787
 
-# Production serve: run the prebuilt engine + worker (no codegen at boot — it ran
-# at build above). \`--migrate\` applies safe additive schema changes on start,
-# which suits a single container. For multiple replicas, drop \`--migrate\` and run
-# migrations as one explicit step instead (e.g. \`pulse start app/app.ts --migrate\`
-# once, then start the replicas without it). Provide DATABASE_URL at runtime${auth ? ",\n# plus PULSE_JWKS_URL pointing at your hosted Better Auth issuer" : ""}.
-CMD ["npx", "pulse", "start", "app/app.ts", "--migrate"]
+# Production serve: apply the committed migrations, then run the prebuilt engine +
+# worker (no codegen at boot — it ran at build above). \`migrate deploy\` runs the
+# files in migrations/ in order, recorded in a journal table (idempotent, safe to
+# re-run). For multiple replicas, run \`pulse migrate deploy\` once as a separate
+# release step and start the replicas without it. Provide DATABASE_URL at runtime${auth ? ",\n# plus PULSE_JWKS_URL pointing at your hosted Better Auth issuer" : ""}.
+CMD ["sh", "-c", "npx pulse migrate deploy && exec npx pulse start app/app.ts"]
 `;
   files[".dockerignore"] = `node_modules
 dist
