@@ -334,16 +334,22 @@ describe("ORM reactivity is precise", () => {
     try {
       await waitFor(() => counts.length >= 1); // initial snapshot (a real re-exec)
       const before = await ivm();
+      const initial = counts.at(-1);
       // A matching write: the count is maintained from the change delta — the
-      // reactor never calls the worker, so the IVM counter advances. Poll the
-      // server-side counter directly rather than waiting for the client SSE push,
-      // which can lag under CI load (the source of a recurring flake here).
+      // reactor never calls the worker, so the IVM counter advances.
       await c.w.addWidget.call({ name: "ivm-z", qty: 1, active: true });
+      // Gate on the server-side counter: it advances when the reactor maintains the
+      // count, independent of the client SSE push (which can lag under CI load — the
+      // source of a prior flake). This is the test's primary assertion: IVM, not re-exec.
       const deadline = Date.now() + 15000;
       while (Date.now() < deadline && (await ivm()) <= before) {
         await new Promise((r) => setTimeout(r, 50));
       }
       expect(await ivm()).toBeGreaterThan(before);
+      // Belt-and-suspenders: the maintained value also reaches the client over SSE.
+      // Non-gating for the IVM check above — the metric has already advanced, so the
+      // push is in flight; this only covers the final delivery hop (generous bound).
+      await waitFor(() => counts.at(-1) !== initial, 15000);
     } finally {
       unsub();
     }
