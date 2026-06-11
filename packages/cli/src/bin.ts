@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cancel, confirm, isCancel } from "@clack/prompts";
@@ -13,6 +13,7 @@ import { runNew } from "./new.js";
 import {
   diffSchema,
   dropStatement,
+  isEmptyDiff,
   parseLiveColumns,
   renderDiff,
   INTROSPECT_SQL,
@@ -20,13 +21,21 @@ import {
   type Drop,
   type InfoSchemaRow,
 } from "./diff.js";
+import {
+  diffAgainstSnapshot,
+  hashSql,
+  migrationTag,
+  renderMigration,
+  schemaToSnapshot,
+  type Snapshot,
+} from "./migrate.js";
 
 type AnySchema = SchemaDefinition<Record<string, AnyTableDefinition>>;
 
 /** Minimal structural type for the optional `pg` Client we use in `--diff`. */
 interface PgClient {
   connect(): Promise<void>;
-  query(sql: string): Promise<{ rows: unknown[] }>;
+  query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }>;
   end(): Promise<void>;
 }
 
@@ -46,22 +55,25 @@ const HELP = `pulse <command>
   gen [schema.ts] [out.ts]   generate the Doc/Id data model from a schema
                              (schema defaults to app/schema.ts; default out:
                              <schemaDir>/_generated/dataModel.ts)
-  migrate [schema.ts] [--out file.sql]
-                             generate idempotent DDL from a schema (prints to
-                             stdout, or writes to --out). Schema defaults to
-                             app/schema.ts.
-  migrate [schema.ts] --diff [--database-url URL] [--out file.sql]
-                             diff the schema against the live database and emit a
-                             migration script (additive / flagged-alters /
-                             commented destructive). Database URL defaults to
-                             --database-url, else DATABASE_URL, else the local
-                             docker-compose Postgres.
-  migrate [schema.ts] --apply [--database-url URL] [--force]
-                             apply the schema to the live database. Additive
-                             changes apply automatically; destructive ones (drops)
-                             prompt for confirmation when interactive, and are
-                             refused in a non-interactive env (CI / AI) unless
-                             --force is passed.
+  migrate dev [name] [--schema path] [--database-url URL]
+                             create a migration from the schema diff (vs the last
+                             snapshot), apply all pending migrations to the dev
+                             database, and regenerate the data model. Writes
+                             editable SQL to migrations/<NNNN>_<name>.sql.
+  migrate deploy [--dir migrations] [--database-url URL]
+                             apply all pending migration files in order — no
+                             generate, no prompts. For CI / production.
+  migrate status [--dir migrations] [--database-url URL]
+                             list each migration as applied / pending / drifted.
+  db push [--schema path] [--database-url URL] [--force]
+                             sync the schema straight to the database, no migration
+                             files (fast dev loop). Additive auto-applies;
+                             destructive prompts, or needs --force in CI.
+  migrate [schema.ts] [--diff] [--apply] [--out file.sql]
+                             ad-hoc, no files: print DDL, --diff the live database,
+                             or --apply (live sync; same as \`db push\`). Schema
+                             defaults to app/schema.ts; DB URL defaults to
+                             --database-url, else DATABASE_URL, else local Postgres.
   dev [app.ts] [--port P] [--database-url URL] [--worker-bin bun]
                              run the engine against an app module (schema +
                              handlers); streams logs until Ctrl-C. Codegens +
@@ -323,6 +335,189 @@ async function applyMigration(
   }
 }
 
+// ── File-based migrations (Prisma-style: generate editable SQL + a journal) ────
+
+/** The `migrations/` directory next to the schema (e.g. `app/migrations`). */
+function migrationsDirFor(schemaPath: string): string {
+  return resolve(dirname(schemaPath), "migrations");
+}
+
+interface OnDiskMigration {
+  idx: number;
+  tag: string;
+  sql: string;
+  hash: string;
+}
+
+/** Read every `NNNN_name.sql` migration in order (with its content hash). */
+async function readMigrations(dir: string): Promise<OnDiskMigration[]> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return []; // no migrations directory yet
+  }
+  const out: OnDiskMigration[] = [];
+  for (const file of names.filter((n) => /^\d+_.*\.sql$/.test(n)).sort()) {
+    const sql = await readFile(resolve(dir, file), "utf8");
+    out.push({ idx: Number(/^(\d+)_/.exec(file)![1]), tag: file.replace(/\.sql$/, ""), sql, hash: hashSql(sql) });
+  }
+  return out;
+}
+
+/** The most recent schema snapshot (or null before the first migration). */
+async function readLastSnapshot(dir: string): Promise<Snapshot | null> {
+  let names: string[];
+  try {
+    names = await readdir(resolve(dir, "meta"));
+  } catch {
+    return null;
+  }
+  const last = names.filter((n) => /\.snapshot\.json$/.test(n)).sort().at(-1);
+  return last ? (JSON.parse(await readFile(resolve(dir, "meta", last), "utf8")) as Snapshot) : null;
+}
+
+/** Ensure the journal table and return the applied migrations as tag → hash. */
+async function appliedMigrations(client: PgClient): Promise<Map<string, string>> {
+  await client.query(
+    "create table if not exists _pulse_migrations (" +
+      "tag text primary key, hash text not null, applied_at timestamptz not null default now())",
+  );
+  const res = await client.query("select tag, hash from _pulse_migrations");
+  return new Map((res.rows as { tag: string; hash: string }[]).map((r) => [r.tag, r.hash]));
+}
+
+/** Apply every not-yet-recorded migration in order, each in its own transaction.
+ *  Refuses if an already-applied file's SQL changed (hash drift) — applied
+ *  migrations are immutable; add a new one instead. Returns how many ran. */
+async function applyPending(client: PgClient, migrations: OnDiskMigration[]): Promise<number> {
+  const applied = await appliedMigrations(client);
+  let count = 0;
+  for (const m of migrations) {
+    const recorded = applied.get(m.tag);
+    if (recorded !== undefined) {
+      if (recorded !== m.hash) {
+        throw new Error(
+          `migration ${m.tag} was already applied but its file changed (${recorded} → ${m.hash}). ` +
+            `Never edit an applied migration — add a new one instead.`,
+        );
+      }
+      continue;
+    }
+    await client.query("begin");
+    try {
+      await client.query(m.sql);
+      await client.query("insert into _pulse_migrations (tag, hash) values ($1, $2)", [m.tag, m.hash]);
+      await client.query("commit");
+    } catch (e) {
+      await client.query("rollback");
+      throw new Error(`migration ${m.tag} failed: ${(e as Error).message}`);
+    }
+    process.stdout.write(`pulse: applied ${m.tag}\n`);
+    count++;
+  }
+  return count;
+}
+
+/** `pulse migrate dev [name]` — generate a migration from the schema diff (if the
+ *  schema changed), apply all pending migrations to the dev database, and
+ *  regenerate the typed data model. */
+async function migrateDev(
+  schemaPath: string,
+  schema: AnySchema,
+  databaseUrl: string,
+  name: string,
+): Promise<void> {
+  const dir = migrationsDirFor(schemaPath);
+  const diff = diffAgainstSnapshot(schema, await readLastSnapshot(dir));
+
+  if (!isEmptyDiff(diff)) {
+    const existing = await readMigrations(dir);
+    const tag = migrationTag((existing.at(-1)?.idx ?? -1) + 1, name);
+    await mkdir(resolve(dir, "meta"), { recursive: true });
+    await writeFile(resolve(dir, `${tag}.sql`), renderMigration(tag, diff), "utf8");
+    await writeFile(
+      resolve(dir, "meta", `${tag}.snapshot.json`),
+      JSON.stringify(schemaToSnapshot(schema), null, 2) + "\n",
+      "utf8",
+    );
+    process.stdout.write(`pulse: created migrations/${tag}.sql\n`);
+    if (diff.destructive.length) {
+      process.stdout.write(
+        `pulse: note — ${diff.destructive.length} destructive change(s) are commented out in that file; ` +
+          `uncomment to apply (DATA LOSS).\n`,
+      );
+    }
+  } else if ((await readMigrations(dir)).length === 0) {
+    process.stdout.write("pulse: schema is empty — nothing to migrate.\n");
+    return;
+  } else {
+    process.stdout.write("pulse: no schema changes since the last migration.\n");
+  }
+
+  const client = await connectPg(databaseUrl);
+  try {
+    const n = await applyPending(client, await readMigrations(dir));
+    process.stdout.write(
+      n > 0 ? `pulse: dev database up to date (${n} applied).\n` : "pulse: dev database already up to date.\n",
+    );
+  } finally {
+    await client.end();
+  }
+
+  const out = resolve(dirname(schemaPath), "_generated", "dataModel.ts");
+  await mkdir(dirname(out), { recursive: true });
+  await writeFile(out, generateDataModel(schema), "utf8");
+}
+
+/** `pulse migrate deploy` — apply pending migrations only (no generate, no prompts). */
+async function migrateDeploy(dir: string, databaseUrl: string): Promise<void> {
+  const migrations = await readMigrations(dir);
+  if (migrations.length === 0) {
+    process.stdout.write(`pulse: no migrations found in ${dir}.\n`);
+    return;
+  }
+  const client = await connectPg(databaseUrl);
+  try {
+    const n = await applyPending(client, migrations);
+    process.stdout.write(n > 0 ? `pulse: applied ${n} migration(s).\n` : "pulse: database already up to date.\n");
+  } finally {
+    await client.end();
+  }
+}
+
+/** `pulse migrate status` — list each migration as applied, pending, or drifted. */
+async function migrateStatus(dir: string, databaseUrl: string): Promise<void> {
+  const migrations = await readMigrations(dir);
+  if (migrations.length === 0) {
+    process.stdout.write(`pulse: no migrations found in ${dir}.\n`);
+    return;
+  }
+  const client = await connectPg(databaseUrl);
+  try {
+    const applied = await appliedMigrations(client);
+    for (const m of migrations) {
+      const rec = applied.get(m.tag);
+      const state =
+        rec === undefined ? "pending" : rec === m.hash ? "applied" : "applied — FILE CHANGED (drift)";
+      process.stdout.write(`  ${m.tag.padEnd(28)} ${state}\n`);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+/** Resolve the schema path from `--schema` (default `app/schema.ts`), erroring clearly. */
+function resolveSchemaPath(args: string[]): string {
+  const p = resolve(flag(args, "--schema") ?? "app/schema.ts");
+  if (!existsSync(p)) {
+    throw new Error(
+      `schema not found: ${p} — run from your project root, or pass it with \`--schema <path>\``,
+    );
+  }
+  return p;
+}
+
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
 
@@ -352,16 +547,33 @@ async function main(): Promise<void> {
     }
 
     case "migrate": {
-      // Schema defaults to app/schema.ts; a leading flag (e.g. `--diff`) isn't a path.
-      const schemaPath = resolveFileArg(args, "app/schema.ts", "migrate");
-      const schema = await loadSchema(schemaPath);
+      const sub = args[0];
       // Same default as `pulse dev`: --database-url, else DATABASE_URL, else the
       // local docker-compose Postgres — so the DB-backed modes work with no config.
       const dbUrl = () =>
         flag(args, "--database-url") ?? process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL;
 
-      // `--apply`: apply the schema to the live DB (additive auto; destructive
-      // only with confirmation / --force).
+      // Prisma-style file-based migrations.
+      if (sub === "dev" || sub === "deploy" || sub === "status") {
+        if (sub === "deploy" || sub === "status") {
+          // No schema load needed — just locate the migrations dir.
+          const dir = resolve(flag(args, "--dir") ?? "app/migrations");
+          if (sub === "deploy") await migrateDeploy(dir, dbUrl());
+          else await migrateStatus(dir, dbUrl());
+          return;
+        }
+        // `migrate dev [name]`: the first non-flag positional after `dev` is the name.
+        const schemaPath = resolveSchemaPath(args);
+        const schema = await loadSchema(schemaPath);
+        const name = args.slice(1).find((a) => !a.startsWith("-")) ?? "migration";
+        await migrateDev(schemaPath, schema, dbUrl(), name);
+        return;
+      }
+
+      // Ad-hoc (no subcommand): emit DDL, `--diff` the live DB, `--apply` (live
+      // sync — prefer `pulse db push`), with `--out` to write to a file.
+      const schemaPath = resolveFileArg(args, "app/schema.ts", "migrate");
+      const schema = await loadSchema(schemaPath);
       if (has(args, "--apply")) {
         await applyMigration(dbUrl(), schema, {
           force: has(args, "--force") || has(args, "--yes"),
@@ -377,6 +589,24 @@ async function main(): Promise<void> {
       } else {
         process.stdout.write(ddl);
       }
+      return;
+    }
+
+    case "db": {
+      // `pulse db push` — sync the schema straight to the database with no
+      // migration files (fast dev loop). Additive applies automatically;
+      // destructive needs confirmation / --force.
+      if (args[0] === "push") {
+        const schemaPath = resolveSchemaPath(args);
+        const schema = await loadSchema(schemaPath);
+        const dbUrl =
+          flag(args, "--database-url") ?? process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL;
+        await applyMigration(dbUrl, schema, {
+          force: has(args, "--force") || has(args, "--yes"),
+        });
+        return;
+      }
+      process.stdout.write("usage: pulse db push [--schema path] [--database-url URL] [--force]\n");
       return;
     }
 
