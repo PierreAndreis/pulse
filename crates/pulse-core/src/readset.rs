@@ -70,6 +70,28 @@ pub struct Aggregate {
     pub distinct: bool,
 }
 
+/// The engine-computed `sum`+`count` behind an `avg`, carried on the read-set so
+/// the reactor can seed incremental avg maintenance (`avg = sum/count`). Transient
+/// — never serialized. `sum` is stored as raw bits so the read-set stays
+/// `Eq`/`Hash`-derivable (a float field would break those).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AvgSeed {
+    sum_bits: u64,
+    pub count: i64,
+}
+
+impl AvgSeed {
+    pub fn new(sum: f64, count: i64) -> Self {
+        Self {
+            sum_bits: sum.to_bits(),
+            count,
+        }
+    }
+    pub fn sum(&self) -> f64 {
+        f64::from_bits(self.sum_bits)
+    }
+}
+
 /// One analyzed read of a table. `conds` are AND-ed; an empty `conds` would be a
 /// whole-table read (but we record those as `tables` wildcards instead).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +163,11 @@ pub struct ReadSet {
     pub filters: HashMap<TableId, Vec<Filter>>,
     /// Index ranges — reserved for CDC/range work; not consulted by the live matcher.
     pub ranges: HashMap<TableId, Vec<IndexRange>>,
+    /// Transient seed for an `avg` subscription: the `sum`+`count` the engine
+    /// computed alongside the avg, used by the reactor to seed incremental
+    /// maintenance. Never serialized; absent for non-avg reads.
+    #[serde(skip)]
+    pub avg_seed: Option<AvgSeed>,
 }
 
 fn eval(cond: &Cond, row: &RowValues) -> bool {

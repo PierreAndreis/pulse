@@ -22,8 +22,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use pulse_core::{Change, ProcedureKind, ReadSet};
-use pulse_sql::{capture_reads, execute_op, execute_op_pool, introspect, Catalog, PgPool};
+use pulse_core::{AvgSeed, Change, ProcedureKind, ReadSet};
+use pulse_sql::{
+    capture_reads, execute_op, execute_op_pool, fetch_avg_seed, introspect, Catalog, PgPool,
+};
 
 use protocol::{EngineMsg, WorkerOut};
 pub use protocol::{ProcInfo, WorkerError};
@@ -137,6 +139,15 @@ impl Inner {
         }
     }
 
+    /// Record the `sum`+`count` behind an `avg` query on the capture's read-set, so
+    /// the reactor can seed incremental avg maintenance from this run.
+    async fn set_avg_seed(&self, request_id: &str, sum: f64, count: i64) {
+        let mut caps = self.captures.lock().await;
+        if let Some(capture) = caps.get_mut(request_id) {
+            capture.read_set.avg_seed = Some(AvgSeed::new(sum, count));
+        }
+    }
+
     /// Record a change an op produced into the request's capture.
     async fn record_change(&self, request_id: &str, change: Change) {
         let mut caps = self.captures.lock().await;
@@ -236,6 +247,13 @@ async fn tx_task(
                 if let Err(e) = &result {
                     if sql_err_is_serialization(e) {
                         serialization_failed = true;
+                    }
+                }
+                // For a reactive `avg`, also fetch the sum+count behind it (same tx,
+                // same WHERE) so the reactor can maintain the avg incrementally.
+                if result.is_ok() {
+                    if let Ok(Some((sum, count))) = fetch_avg_seed(&mut tx, &catalog, &op).await {
+                        inner.set_avg_seed(&request_id, sum, count).await;
                     }
                 }
                 inner
@@ -614,6 +632,18 @@ async fn reader_loop(
                         let result = execute_op_pool(pool, catalog, &op)
                             .await
                             .map_err(|e| e.to_string());
+                        // For a reactive `avg`, also seed the reactor with the
+                        // sum+count behind it (a separate autocommit read on the
+                        // same pool), so the avg is maintained incrementally.
+                        if result.is_ok() {
+                            if let Ok(mut conn) = pool.acquire().await {
+                                if let Ok(Some((sum, count))) =
+                                    fetch_avg_seed(&mut conn, catalog, &op).await
+                                {
+                                    inner.set_avg_seed(&request_id, sum, count).await;
+                                }
+                            }
+                        }
                         inner.reply_dbop(request_id, op_id, result).await;
                     });
                 }

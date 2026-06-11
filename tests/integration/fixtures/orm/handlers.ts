@@ -57,6 +57,10 @@ export const maxQtyActive = os.w.maxQtyActive.handler(async ({ ctx }) =>
 // fall-back to re-exec when the running sum hits 0 (ambiguous: empty set vs cancel).
 export const sumScoreActive = os.w.sumScoreActive.handler(async ({ ctx }) =>
   q(ctx).filter((x: any) => x.eq("active", true)).sum("score"));
+// avg() over a filtered int field — the reactor maintains it from the running
+// sum+count the engine seeds, recomputing sum/count from the change delta.
+export const avgScoreActive = os.w.avgScoreActive.handler(async ({ ctx }) =>
+  q(ctx).filter((x: any) => x.eq("active", true)).avg("score"));
 
 export const byActive = os.w.byActive.handler(async ({ ctx }) => q(ctx).groupBy("active").count());
 export const sumByTag = os.w.sumByTag.handler(async ({ ctx }) => q(ctx).groupBy("tag").sum("price"));

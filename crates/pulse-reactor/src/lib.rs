@@ -495,11 +495,18 @@ impl InMemoryReactor {
         commit_lsn: Lsn,
     ) -> Option<Lsn> {
         let key = sub_key(client_id, sub);
+        // A fresh re-exec re-seeds an `avg` sub's running sum+count (the re-exec is
+        // the source of truth; the prior incrementally-maintained state is replaced).
+        let avg_state = read_set.avg_seed.map(|s| AvgState {
+            sum: s.sum(),
+            count: s.count,
+        });
         let (result, newly_watched) = {
             let mut reg = self.reg.lock().await;
             // Dependencies may have shifted since the last run → reindex if so.
             let newly_watched = reg.set_read_set(&key, read_set);
             let result = reg.subs.get_mut(&key).map(|s| {
+                s.agg_state = avg_state;
                 let effective = commit_lsn.max(s.last_lsn);
                 s.last_lsn = effective;
                 if s.last.as_ref() == Some(value) {
@@ -795,8 +802,16 @@ impl Reactor for InMemoryReactor {
         }
     }
 
-    async fn add_subscription(&self, sub: Subscription) {
+    async fn add_subscription(&self, mut sub: Subscription) {
         let key = sub_key(&sub.client_id, &sub.sub);
+        // Seed an `avg` sub's running sum+count from the initial subscribe's read-set,
+        // so the very first matching change is maintained incrementally (not re-run).
+        if let Some(seed) = sub.read_set.avg_seed {
+            sub.agg_state = Some(AvgState {
+                sum: seed.sum(),
+                count: seed.count,
+            });
+        }
         let newly_watched = self.reg.lock().await.insert(key, sub);
         self.announce_interest(newly_watched).await;
     }

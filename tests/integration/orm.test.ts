@@ -407,6 +407,25 @@ describe("ORM reactivity is precise", () => {
       unsub();
     }
   });
+
+  test("a filtered avg() is maintained from auxiliary sum+count (ivmApplied++)", async () => {
+    // avg can't be reconstructed from its scalar, so the engine seeds the reactor
+    // with the sum+count behind it; the reactor advances both by the change delta.
+    const ivm = async () =>
+      ((await (await fetch(`${h.baseUrl}/metrics`)).json()) as { ivmApplied: number }).ivmApplied;
+    await c.w.addWidget.call({ name: "v1", qty: 1, score: 4, active: true }); // seed avg = 4
+    const seen: (number | null)[] = [];
+    const unsub = c.w.avgScoreActive.subscribe({}, (n) => seen.push(n as number | null));
+    try {
+      await waitFor(() => seen.at(-1) === 4); // initial snapshot (a real re-exec, seeds sum=4/count=1)
+      const before = await ivm();
+      await c.w.addWidget.call({ name: "v2", qty: 1, score: 8, active: true }); // (4+8)/2 = 6
+      await waitFor(() => seen.at(-1) === 6);
+      expect(await ivm()).toBeGreaterThan(before); // maintained from sum+count, no re-exec
+    } finally {
+      unsub();
+    }
+  });
 });
 
 describe("commit LSN watermark (end-to-end via raw SSE)", () => {

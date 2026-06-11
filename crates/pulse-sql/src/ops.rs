@@ -1393,6 +1393,74 @@ async fn replace(
     Ok((Value::Null, change))
 }
 
+/// For a scalar `avg(field)` query, compute the `sum`+`count` behind it so the
+/// reactor can seed incremental avg maintenance (`avg = sum/count`). Returns None
+/// for any non-avg / grouped / distinct shape. The WHERE clause mirrors the Query
+/// execute path exactly, so the seed matches the rows the avg was computed over.
+pub async fn fetch_avg_seed(
+    conn: &mut PgConnection,
+    catalog: &Catalog,
+    op: &DbOp,
+) -> Result<Option<(f64, i64)>, SqlError> {
+    let DbOp::Query {
+        table: name,
+        predicates,
+        filters,
+        aggregate: Some(agg),
+        group_by: None,
+        ..
+    } = op
+    else {
+        return Ok(None);
+    };
+    if !matches!(agg.func, AggFn::Avg) || agg.distinct {
+        return Ok(None);
+    }
+    let Some(field) = agg.field.as_deref() else {
+        return Ok(None);
+    };
+    let t = table(catalog, name)?;
+    let col = column(t, field)?;
+
+    let mut binds: Vec<Option<String>> = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
+    for p in predicates {
+        let pcol = column(t, &p.field)?;
+        if p.op.is_unary() {
+            clauses.push(format!("{} {}", pcol.column, p.op.sql()));
+            continue;
+        }
+        binds.push(json_to_bind(&p.value, pcol));
+        clauses.push(format!(
+            "{} {} ${}::{}",
+            pcol.column,
+            p.op.sql(),
+            binds.len(),
+            pcol.type_class.cast()
+        ));
+    }
+    for f in filters {
+        clauses.push(render_expr(f, t, &mut binds)?);
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    // `coalesce(sum, 0)` so the empty set seeds (0, 0) rather than NULL; count is 0
+    // there, which the reactor reads as "empty → NULL avg".
+    let sql = format!(
+        "SELECT coalesce(sum({0}), 0)::double precision, count({0})::bigint FROM {1}{2}",
+        col.column, name, where_sql
+    );
+    let mut q = sqlx::query_as::<_, (f64, i64)>(&sql);
+    for b in &binds {
+        q = q.bind(b.clone());
+    }
+    let (sum, count) = q.fetch_one(&mut *conn).await?;
+    Ok(Some((sum, count)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
