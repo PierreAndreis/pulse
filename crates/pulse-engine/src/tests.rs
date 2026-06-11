@@ -217,6 +217,7 @@ async fn mutation_propagation_stamps_lsn_publishes_and_applies_locally() {
             headers: HashMap::new(),
             read_set: channel_filter("c1"),
             last: Some(json!({ "n": 0 })),
+            agg_state: None,
             last_lsn: Lsn::ZERO,
         })
         .await;
@@ -270,6 +271,7 @@ async fn mode_b_dedups_wal_echo_but_applies_out_of_band_writes() {
             headers: HashMap::new(),
             read_set: channel_filter("c1"),
             last: Some(json!({ "n": 0 })),
+            agg_state: None,
             last_lsn: Lsn::ZERO,
         })
         .await;
@@ -435,6 +437,7 @@ async fn heartbeat_refreshes_watched_tables_and_prunes() {
             headers: HashMap::new(),
             read_set: channel_filter("c1"),
             last: None,
+            agg_state: None,
             last_lsn: Lsn::ZERO,
         })
         .await;

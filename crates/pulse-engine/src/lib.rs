@@ -311,6 +311,7 @@ impl Coordinator {
                 headers,
                 read_set: res.read_set,
                 last: Some(res.value.clone()),
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;

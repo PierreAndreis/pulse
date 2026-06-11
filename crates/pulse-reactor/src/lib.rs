@@ -44,6 +44,17 @@ fn resync_frame(id: u64) -> String {
     json!({ "id": id.to_string(), "seq": id, "type": "resync" }).to_string()
 }
 
+/// Auxiliary running state for an incrementally-maintained `avg` subscription.
+/// `avg` can't be reconstructed from its scalar alone, so the reactor carries the
+/// running `sum` and `count` and recomputes `avg = sum / count` (NULL when count is
+/// 0). Seeded by the engine on each re-execution (it returns the sum+count behind
+/// the avg) and advanced by the change delta on every IVM step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AvgState {
+    pub sum: f64,
+    pub count: i64,
+}
+
 #[derive(Clone)]
 pub struct Subscription {
     pub client_id: String,
@@ -54,6 +65,10 @@ pub struct Subscription {
     pub read_set: ReadSet,
     /// Last value pushed, for redundant-push suppression.
     pub last: Option<Value>,
+    /// Running `sum`/`count` for an `avg` sub (None for any other aggregate). Lets
+    /// `avg` be maintained from the delta without re-deriving it from the scalar.
+    #[doc(hidden)]
+    pub agg_state: Option<AvgState>,
     /// Highest commit LSN emitted to this subscriber. The emitted `commitLsn` is
     /// clamped to be monotonically non-decreasing per subscription, so a client's
     /// watermark never goes backwards even if invalidations arrive out of order.
@@ -507,7 +522,7 @@ impl InMemoryReactor {
 /// returning the new value — or `None` to fall back to a full re-execution. IVM
 /// is opportunistic; `None` is always safe (the re-exec path is exact). Slice 1
 /// supports bare `count(*)`; every other shape falls back.
-fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
+fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<(Value, Option<AvgState>)> {
     // Only a clean single scalar aggregate over one table is IVM-able: no coarse
     // table-wildcard, no point-key, exactly one filter on one table.
     let rs = &sub.read_set;
@@ -547,7 +562,7 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
                 let (old_m, new_m) = filter.membership_images(*old, *new);
                 delta += new_m as i64 - old_m as i64;
             }
-            Some(json!(last.as_i64()? + delta))
+            Some((json!(last.as_i64()? + delta), None))
         }
         // sum(field): +new on enter, −old on leave, (new−old) on a stay where the
         // value changed. Maintained for `int8` and `double precision` fields — both
@@ -581,7 +596,7 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
             if result == 0.0 {
                 return None;
             }
-            Some(json!(result))
+            Some((json!(result), None))
         }
         // max(field) / min(field): a *rising* extreme (a row entering or growing
         // to/above the current extreme) is cheap to maintain from the delta — the
@@ -643,9 +658,45 @@ fn try_ivm(sub: &Subscription, cs: &ChangeSet) -> Option<Value> {
                     _ => return None,
                 }
             };
-            Some(json!(new_extreme))
+            Some((json!(new_extreme), None))
         }
-        // avg / count(field) / count(distinct) → re-exec (later slices).
+        // avg(field): maintained from auxiliary running sum+count (avg = sum/count).
+        // The engine seeds `agg_state` (the sum+count behind the avg) on each
+        // re-exec; here we advance both by the delta and recompute. When the set
+        // empties (count → 0) we fall back to a re-exec, which re-seeds cleanly and
+        // returns NULL — avoiding float-drift accumulation across an empty boundary.
+        AggFunc::Avg if agg.field.is_some() && !agg.distinct => {
+            let field = agg.field.as_ref().unwrap();
+            let state = sub.agg_state?; // not seeded by the engine → fall back
+            let num = |row: Option<&RowValues>| -> Option<f64> {
+                match row?.get(field)? {
+                    KeyValue::Int(n) => Some(*n as f64),
+                    KeyValue::Float(f) => Some(*f),
+                    _ => None,
+                }
+            };
+            let mut sum = state.sum;
+            let mut count = state.count;
+            for (old, new) in &nets {
+                match filter.membership_images(*old, *new) {
+                    (false, true) => {
+                        sum += num(*new)?;
+                        count += 1;
+                    }
+                    (true, false) => {
+                        sum -= num(*old)?;
+                        count -= 1;
+                    }
+                    (true, true) => sum += num(*new)? - num(*old)?,
+                    (false, false) => {}
+                }
+            }
+            if count <= 0 {
+                return None; // emptied → re-exec re-seeds (count==0 → NULL)
+            }
+            Some((json!(sum / count as f64), Some(AvgState { sum, count })))
+        }
+        // count(field) / count(distinct) → re-exec (need the dataset, not a delta).
         _ => None,
     }
 }
@@ -771,18 +822,19 @@ impl Reactor for InMemoryReactor {
         // re-exec path's.
         let (ivm, dirty) = {
             let reg = self.reg.lock().await;
-            let mut ivm: Vec<(String, String, ReadSet, Value)> = Vec::new();
+            let mut ivm: Vec<(String, String, ReadSet, Value, Option<AvgState>)> = Vec::new();
             let mut dirty = Vec::new();
             reg.for_each_candidate(&changed, |s| {
                 if !s.read_set.matches(&change_set) {
                     return;
                 }
                 match try_ivm(s, &change_set) {
-                    Some(value) => ivm.push((
+                    Some((value, agg)) => ivm.push((
                         s.client_id.clone(),
                         s.sub.clone(),
                         s.read_set.clone(),
                         value,
+                        agg,
                     )),
                     None => dirty.push(ReExecJob::of(s)),
                 }
@@ -792,13 +844,27 @@ impl Reactor for InMemoryReactor {
         self.ivm_applied.fetch_add(ivm.len() as u64, Relaxed);
         // IVM pushes reuse record_value (diff-suppression + watermark clamp) and
         // send, exactly like a re-exec push — minus the worker call.
-        for (client_id, sub, read_set, value) in ivm {
+        let mut agg_updates: Vec<(String, AvgState)> = Vec::new();
+        for (client_id, sub, read_set, value, agg) in ivm {
+            // An advanced `avg` running state must persist even if the pushed avg is
+            // unchanged (diff-suppressed) — the underlying sum/count still moved.
+            if let Some(st) = agg {
+                agg_updates.push((sub_key(&client_id, &sub), st));
+            }
             if let Some(lsn) = self
                 .record_value(&client_id, &sub, &value, read_set, change_set.commit_lsn)
                 .await
             {
                 if !self.send(&client_id, &sub, &value, lsn).await {
                     self.remove_client(&client_id).await;
+                }
+            }
+        }
+        if !agg_updates.is_empty() {
+            let mut reg = self.reg.lock().await;
+            for (key, st) in agg_updates {
+                if let Some(s) = reg.subs.get_mut(&key) {
+                    s.agg_state = Some(st);
                 }
             }
         }
@@ -905,6 +971,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: channel_filter(channel),
                 last: None,
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;
@@ -963,6 +1030,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: count_filter(channel),
                 last: Some(json!(initial)),
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;
@@ -1097,6 +1165,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: sum_filter(channel),
                 last: Some(json!(initial)),
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;
@@ -1300,6 +1369,7 @@ mod tests {
                     rs
                 },
                 last: Some(initial),
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;
@@ -1465,19 +1535,177 @@ mod tests {
         assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
     }
 
+    // ── IVM: avg(field) via auxiliary running sum+count ──────────────────────
+
+    async fn avg_sub(
+        reactor: &InMemoryReactor,
+        client: &str,
+        channel: &str,
+        last: f64,
+        state: Option<AvgState>,
+    ) {
+        let mut rs = ReadSet::new();
+        rs.add_filter(
+            TableId::new("messages"),
+            Filter {
+                conds: vec![Cond {
+                    field: "channelId".into(),
+                    op: FilterOp::Eq,
+                    value: KeyValue::Text(channel.into()),
+                }],
+                read_cols: Some(vec!["amount".into()]),
+                aggregate: Some(pulse_core::Aggregate {
+                    func: AggFunc::Avg,
+                    field: Some("amount".into()),
+                    distinct: false,
+                }),
+            },
+        );
+        reactor
+            .add_subscription(Subscription {
+                client_id: client.into(),
+                sub: format!("messages.avg::{channel}"),
+                path: vec!["messages".into(), "avg".into()],
+                input: json!({ "channelId": channel }),
+                headers: HashMap::new(),
+                read_set: rs,
+                last: Some(json!(last)),
+                agg_state: state,
+                last_lsn: Lsn::ZERO,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ivm_avg_maintained_on_insert() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        // avg = 10/2 = 5; insert 8 → 18/3 = 6, with no re-exec.
+        avg_sub(
+            &reactor,
+            "a",
+            "A",
+            5.0,
+            Some(AvgState {
+                sum: 10.0,
+                count: 2,
+            }),
+        )
+        .await;
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 8)]))
+            .await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(6.0));
+    }
+
+    #[tokio::test]
+    async fn ivm_avg_maintained_on_value_change() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        // avg = 10/2 = 5; a row stays, 3→8 → sum 15/2 = 7.5, count unchanged.
+        avg_sub(
+            &reactor,
+            "a",
+            "A",
+            5.0,
+            Some(AvgState {
+                sum: 10.0,
+                count: 2,
+            }),
+        )
+        .await;
+        reactor
+            .apply_change_set(cs_of(vec![update_amount("A", 3, 8)]))
+            .await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(7.5));
+    }
+
+    #[tokio::test]
+    async fn ivm_avg_falls_back_when_set_empties() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        // The only row leaves → count 0 → re-exec re-seeds (and returns NULL).
+        avg_sub(
+            &reactor,
+            "a",
+            "A",
+            5.0,
+            Some(AvgState { sum: 5.0, count: 1 }),
+        )
+        .await;
+        reactor
+            .apply_change_set(cs_of(vec![delete_amount("A", 5)]))
+            .await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ivm_avg_falls_back_when_not_seeded() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let _rx = reactor.register_client("a".into()).await;
+        // No agg_state (the engine hasn't supplied sum+count) → fall back.
+        avg_sub(&reactor, "a", "A", 5.0, None).await;
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 8)]))
+            .await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ivm_avg_running_state_persists_across_changesets() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        avg_sub(
+            &reactor,
+            "a",
+            "A",
+            5.0,
+            Some(AvgState {
+                sum: 10.0,
+                count: 2,
+            }),
+        )
+        .await;
+
+        // First insert: 18/3 = 6, advancing the running state to sum=18, count=3.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 8)]))
+            .await;
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(6.0));
+
+        // Second insert computes from the PERSISTED state: 18/4 = 4.5 (not from the
+        // original 10/2). Proves the advanced sum+count was written back.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 2, 0)]))
+            .await;
+        assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(4.5));
+    }
+
     #[tokio::test]
     async fn ivm_falls_back_for_unmaintainable_shapes() {
         use pulse_core::Aggregate;
-        // Shapes IVM cannot maintain from a delta alone must re-execute: avg (needs
-        // auxiliary sum+count the initial query doesn't return), count(field) and
-        // count(distinct) (need the dataset). count(*), sum, and min/max have their
-        // own dedicated tests.
+        // Shapes IVM cannot maintain from a delta alone must re-execute: count(field)
+        // and count(distinct) need the dataset, not just a delta. count(*), sum,
+        // min/max, and avg (seeded) have their own dedicated tests.
         let shapes = [
-            Aggregate {
-                func: AggFunc::Avg,
-                field: Some("p".into()),
-                distinct: false,
-            },
             Aggregate {
                 func: AggFunc::Count,
                 field: Some("p".into()),
@@ -1504,6 +1732,7 @@ mod tests {
                     headers: HashMap::new(),
                     read_set: agg_filter("A", agg.clone()),
                     last: Some(json!(0)),
+                    agg_state: None,
                     last_lsn: Lsn::ZERO,
                 })
                 .await;
@@ -2122,6 +2351,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: channel_filter("A"),
                 last: Some(json!({ "n": 1 })),
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;
@@ -2333,6 +2563,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: users_rs,
                 last: None,
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             })
             .await;
@@ -2367,6 +2598,7 @@ mod tests {
                     headers: HashMap::new(),
                     read_set: rs,
                     last: None,
+                    agg_state: None,
                     last_lsn: Lsn::ZERO,
                 })
                 .await;
@@ -2479,6 +2711,7 @@ mod tests {
                 headers: HashMap::new(),
                 read_set: rs,
                 last: Some(last),
+                agg_state: None,
                 last_lsn: Lsn::ZERO,
             }
         }
@@ -2550,7 +2783,7 @@ mod tests {
                 // count(*): always maintainable; an empty set is 0 (not NULL).
                 {
                     let sub = psub(AggFunc::Count, None, json!(pre.len() as i64));
-                    if let Some(v) = try_ivm(&sub, &cs) {
+                    if let Some((v, _)) = try_ivm(&sub, &cs) {
                         prop_assert_eq!(v, json!(post_a.len() as i64), "count");
                     }
                 }
@@ -2564,7 +2797,7 @@ mod tests {
                         json!(post_a.iter().sum::<i64>() as f64)
                     };
                     let sub = psub(AggFunc::Sum, Some("amount"), json!(pre.iter().sum::<i64>() as f64));
-                    if let Some(v) = try_ivm(&sub, &cs) {
+                    if let Some((v, _)) = try_ivm(&sub, &cs) {
                         prop_assert_eq!(v, truth_sum, "sum");
                     }
 
@@ -2585,7 +2818,7 @@ mod tests {
                             json!(e as f64)
                         };
                         let sub = psub(func, Some("amount"), json!(seed as f64));
-                        if let Some(v) = try_ivm(&sub, &cs) {
+                        if let Some((v, _)) = try_ivm(&sub, &cs) {
                             prop_assert_eq!(v, truth, "min/max");
                         }
                     }
@@ -2613,7 +2846,7 @@ mod tests {
                         json!(post_a.iter().sum::<i64>() as f64)
                     };
                     let sub = psub(AggFunc::Sum, Some("amount"), json!(pre.iter().sum::<i64>() as f64));
-                    if let Some(v) = try_ivm(&sub, &cs) {
+                    if let Some((v, _)) = try_ivm(&sub, &cs) {
                         prop_assert_eq!(v, truth_sum, "float sum");
                     }
 
@@ -2634,7 +2867,7 @@ mod tests {
                             json!(e as f64)
                         };
                         let sub = psub(func, Some("amount"), json!(seed as f64));
-                        if let Some(v) = try_ivm(&sub, &cs) {
+                        if let Some((v, _)) = try_ivm(&sub, &cs) {
                             prop_assert_eq!(v, truth, "float min/max");
                         }
                     }
