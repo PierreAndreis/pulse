@@ -14,14 +14,15 @@ an npm token; after that, `git tag vX.Y.Z && git push --tags` ships everything.
 3. Add it to the GitHub repo as the secret **`NPM_TOKEN`**
    (Settings → Secrets and variables → Actions → New repository secret).
 4. Configure the **`production`** environment (Settings → Environments) with
-   **required reviewers** — both `publish.yml` and `release.yml` are gated on it,
-   so a tag push can't ship without a human approval.
+   **required reviewers** — the `release.yml` job that does the GitHub Release
+   upload *and* the npm publish is gated on it, so a tag push can't ship without
+   a human approval.
 5. Run **`scripts/protect-repo.sh`** once to apply branch + tag protection
    (requires admin on the repo).
 
 > **Better end state — eliminate the static token.** Once provenance is live
 > (it is, via `id-token: write` + `--provenance`), configure npm **Trusted
-> Publishing (OIDC)** for `repo=PierreAndreis/pulse, workflow=publish.yml,
+> Publishing (OIDC)** for `repo=PierreAndreis/pulse, workflow=release.yml,
 > environment=production` and **delete `NPM_TOKEN` entirely** — OIDC replaces it,
 > so there is no long-lived credential to leak.
 
@@ -36,19 +37,23 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Pushing the tag triggers two workflows in parallel:
+Pushing the tag triggers a single workflow, **`release.yml`** ("Release (GitHub + npm)"):
 
-- **`release.yml`** — builds `pulse-server` for every target
-  (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
-  `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`) and attaches the
-  binaries + `SHA256SUMS` to the GitHub Release for that tag.
-- **`publish.yml`** — builds each package's `dist` and runs
-  `pnpm -r publish --access public`, publishing every non-private
-  `@onveloz/pulse-*` package to npm using `NPM_TOKEN`.
+1. **Build (ungated, in parallel)** — compiles `pulse-server` for every target
+   (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+   `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`).
+2. **Release (gated on the `production` environment — one human approval)** —
+   attaches the binaries + `SHA256SUMS` to the GitHub Release for that tag, bakes
+   those exact checksums into `@onveloz/pulse-engine` (so the immutable npm
+   tarball, not the mutable Release, is the trust root), refuses to publish if any
+   package version disagrees with the tag, then runs `pnpm publish` for every
+   non-private `@onveloz/pulse-*` package to npm — with **provenance** via OIDC
+   (`id-token: write`), authenticated with `NPM_TOKEN`.
 
-`@onveloz/pulse-engine`'s `postinstall` then downloads the matching engine binary
-from that Release on the consumer's machine (Prisma-style), or honors a
-`PULSE_SERVER_BIN` override / `PULSE_ENGINE_SKIP_DOWNLOAD`.
+`@onveloz/pulse-engine` has **no `postinstall`**. The matching engine binary is
+fetched **lazily on first run** — the CLI's `ensureEngine()` (invoked by
+`pulse dev` / `pulse start`) downloads and SHA256-verifies it from that Release,
+or honors a `PULSE_SERVER_BIN` override / `PULSE_ENGINE_SKIP_DOWNLOAD`.
 
 ## What ships where
 
@@ -56,7 +61,7 @@ from that Release on the consumer's machine (Prisma-style), or honors a
 | --- | --- | --- |
 | `@onveloz/pulse-schema` `-contract` `-server` `-client` `-react` `-runtime-node` | npm | compiled `dist` + `.d.ts` |
 | `@onveloz/pulse-cli` | npm | `bin: pulse` |
-| `@onveloz/pulse-engine` | npm | postinstall fetches the binary |
+| `@onveloz/pulse-engine` | npm | resolver only; fetches the binary lazily on first run (no postinstall) |
 | `pulse-server` (Rust binary, per target) | GitHub Releases | fetched by `pulse-engine` |
 | `@onveloz/pulse-tsconfig`, `@onveloz/pulse-examples-chat` | — | `private: true`, never published |
 

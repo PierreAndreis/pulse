@@ -103,3 +103,12 @@ _Initial release — the foundational Pulse engine and SDK._
 
 - Fanned-out subscriptions re-execute in parallel, so a single write affecting N subscriptions no longer pays N sequential worker + Postgres round-trips.
 - The reactor no longer holds the global clients lock across an SSE channel send, so one stalled/slow consumer can't head-of-line-block pushes and client registration for everyone else.
+
+<!-- Version diffs (commit ranges) -->
+[0.2.0]: https://github.com/PierreAndreis/pulse/compare/v0.1.5...v0.2.0
+[0.1.5]: https://github.com/PierreAndreis/pulse/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/PierreAndreis/pulse/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/PierreAndreis/pulse/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/PierreAndreis/pulse/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/PierreAndreis/pulse/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/PierreAndreis/pulse/releases/tag/v0.1.0
