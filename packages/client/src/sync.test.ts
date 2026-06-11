@@ -57,6 +57,26 @@ describe("handleEvent / SSE frame parsing", () => {
     expect(calls).toEqual([["k1", [{ _id: "m1" }]]]);
   });
 
+  test("a null aggregate result stays null (not coerced to []) — honors number|null", () => {
+    const { client, calls } = makeClient();
+    // A reactive sum/min/max over an empty set is SQL NULL; the server sends
+    // `data: null`. It must reach the store as null, not an empty collection.
+    client.handleEvent(`data: ${JSON.stringify({ sub: "agg", data: null })}`);
+    expect(calls).toEqual([["agg", null]]);
+  });
+
+  test("a scalar aggregate value passes through unchanged", () => {
+    const { client, calls } = makeClient();
+    client.handleEvent(`data: ${JSON.stringify({ sub: "agg", data: 42 })}`);
+    expect(calls).toEqual([["agg", 42]]);
+  });
+
+  test("a frame with no data field defaults to [] (the missing-data safety net)", () => {
+    const { client, calls } = makeClient();
+    client.handleEvent(`data: ${JSON.stringify({ sub: "k" })}`);
+    expect(calls).toEqual([["k", []]]);
+  });
+
   test("multi-line data frames are joined before JSON.parse", () => {
     const { client, calls } = makeClient();
     const payload = JSON.stringify({ sub: "multi", data: [1, 2] });

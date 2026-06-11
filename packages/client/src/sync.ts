@@ -208,7 +208,12 @@ export class SyncClient {
     // Drop an event we've already processed (replayed-and-also-delivered guard).
     if (eventId !== undefined && this.lastEventId !== undefined && eventId <= this.lastEventId) return;
     if (payload?.sub) {
-      this.store.setConfirmed(payload.sub, (payload.data ?? []) as unknown[]);
+      // A push carries `data`: a collection array, or a scalar/null for a reactive
+      // aggregate. Only a genuinely missing field defaults to []; a `null` aggregate
+      // result (empty set) must stay null — coercing it to [] would break the
+      // `number | null` contract of a reactive sum/min/max/avg.
+      const data = payload.data === undefined ? [] : payload.data;
+      this.store.setConfirmed(payload.sub, data as unknown[]);
     }
     if (eventId !== undefined) this.lastEventId = eventId;
   }

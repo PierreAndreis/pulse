@@ -374,18 +374,18 @@ describe("ORM reactivity is precise", () => {
     }
   });
 
-  test("a filtered sum() stays correct through inserts/deletes (IVM)", async () => {
+  test("a filtered sum() stays correct through inserts/deletes incl the empty↔NULL boundary", async () => {
     const ivm = async () =>
       ((await (await fetch(`${h.baseUrl}/metrics`)).json()) as { ivmApplied: number }).ivmApplied;
     const seen: (number | null)[] = [];
     const unsub = c.w.sumScoreActive.subscribe({}, (n) => seen.push(n as number | null));
     try {
-      // Seed a row first so the server snapshot is a concrete number (the client's
-      // optimistic local-empty initial for a query is `[]`; we wait for the server's
-      // value, never assert right after the first push). The empty→NULL boundary is
-      // covered by the reactor unit test `ivm_sum_falls_back_when_result_is_zero`.
-      await c.w.addWidget.call({ name: "a", qty: 1, score: 5, active: true });
-      await waitFor(() => seen.at(-1) === 5);
+      await waitFor(() => seen.at(-1) === null); // empty set → SQL sum is NULL (not [])
+
+      const w5 = (await c.w.addWidget.call({ name: "a", qty: 1, score: 5, active: true })) as {
+        _id: string;
+      };
+      await waitFor(() => seen.at(-1) === 5); // null→first re-execs (base was null)
 
       const ivmBefore = await ivm();
       const w3 = (await c.w.addWidget.call({ name: "b", qty: 1, score: 3, active: true })) as {
@@ -400,6 +400,9 @@ describe("ORM reactivity is precise", () => {
       await c.w.remove.call({ id: w3._id as never }); // 8 − 3 = 5, maintained
       await waitFor(() => seen.at(-1) === 5);
       expect(await ivm()).toBeGreaterThan(ivmBefore); // the →8 and →5 steps were IVM
+
+      await c.w.remove.call({ id: w5._id as never }); // 5 − 5 = 0 → ambiguous → re-exec → NULL
+      await waitFor(() => seen.at(-1) === null); // empty again → NULL, not []
     } finally {
       unsub();
     }
