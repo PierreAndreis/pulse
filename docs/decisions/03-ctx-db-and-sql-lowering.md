@@ -37,7 +37,7 @@ Because the engine sees every op, it captures the read/write-set *before* execut
 `execute_op` lowers each op to a parameterized statement. Key shapes:
 
 - **Get:** `SELECT <select_list> FROM <table> WHERE _id = $1::uuid`, returning the first row or `null`.
-- **Query:** `SELECT <select_list> FROM <table>` + optional `WHERE` (predicates AND-joined as `<col> <op> $n::<cast>`) + optional `ORDER BY _creation_time ASC|DESC` + a `LIMIT` chosen by mode (`take` → user limit, `first` → `LIMIT 1`, `unique` → `LIMIT 2`, `collect` → none). `unique` errors (`NotUnique`) if more than one row comes back. Order is always by `_creation_time`; index names from `withIndex` are accepted by the builder but **ignored** by lowering.
+- **Query:** `SELECT <select_list> FROM <table>` + optional `WHERE` (predicates AND-joined as `<col> <op> $n::<cast>`) + optional `ORDER BY _creation_time ASC|DESC` + a `LIMIT` chosen by mode (`take` → user limit, `first` → `LIMIT 1`, `unique` → `LIMIT 2`, `collect` → none). `unique` errors (`NotUnique`) if more than one row comes back. Order defaults to `_creation_time`, but `withIndex(name)` orders by that index's declared columns (a bare `.order(dir)` sets their direction; an explicit `.order(field)` overrides). True index *range scans* and index-fine-grained read-sets are still future — `withIndex` drives ordering, not yet a range scan.
 - **Insert:** `INSERT INTO <table> (...) VALUES (...) RETURNING <select_list>` (or `DEFAULT VALUES` when no fields are given). Returns only the new `_id` string.
 - **Patch:** lowers to `UPDATE <table> SET <col> = $n::<cast>, ... WHERE _id = $k::uuid` over only the provided fields; an empty field map is a no-op returning `null`. **Replace:** lowers to an `UPDATE` over **every** user column — provided fields to their value, omitted ones to `NULL` — preserving the system columns (`_id`, `_creationTime`). An omitted `NOT NULL` column surfaces a constraint error, since a full replace must supply every required field. Unknown fields are rejected in both.
 - **Delete:** `DELETE FROM <table> WHERE _id = $1::uuid`, returns `null`.
@@ -84,7 +84,7 @@ Rules: a `_id` column always references its own table; a user-declared `id` fiel
 - **Text round-tripping leans on Postgres text representations.** Float precision, timestamp formatting, and `Bool` parsing (`"true"|"t"`) are tied to PG's text I/O; edge cases (e.g. numeric precision, non-UTC timestamps) may need revisiting. `Other` types silently degrade to `text`.
 - **Read-set is table-level only.** Every reactive query invalidates on any write to a touched table; the key/range tiering in ARCHITECTURE.md §3.5 is not implemented here. `Raw` captures nothing, so analytical queries are not reactive.
 - **Patch vs Replace are now distinguished in SQL.** Patch `SET`s only the provided fields (empty map → no-op). Replace writes every user column — omitted ones to `NULL` — for true full-document overwrite, preserving `_id`/`_creationTime`; an omitted `NOT NULL` column errors. (Was a latent correctness gap; fixed.)
-- **`withIndex` is cosmetic.** Index names are ignored and ordering is hard-coded to `_creation_time`; predicates always become a flat `WHERE ... AND ...`. There is no index selection or true range scan yet.
+- **`withIndex` drives ordering, not yet range scans.** `withIndex(name)` now orders by the index's declared columns (the worker resolves the name against the schema's index defs and sets the `ORDER BY`); predicates still become a flat `WHERE ... AND ...`. There is no index-range scan or index-fine-grained read-set yet.
 - **Raw id decoding is heuristic.** `decode_id_param` guesses based on a valid-uuid suffix; a non-id string shaped like `prefix:<valid-uuid>` would be silently rewritten.
 - **Catalog is built once from a manifest snapshot.** Schema changes after startup are not reflected without re-introspection.
 
@@ -104,7 +104,7 @@ What a good *new* test looks like for the gaps above: a client-level test that s
 - **Tiered (key/range-level) read-set capture** and fine-grained invalidation — deferred (ARCHITECTURE.md M2/M3); current capture is table-level.
 - **Reactivity for `ctx.sql`** / static analysis of raw SQL read-sets — deferred; `Raw` is opaque.
 - **Correct `replace` semantics** (nulling unspecified columns) — **shipped**.
-- **Real index selection / range scans** behind `withIndex` — ignored today; ordering fixed to `_creation_time`.
+- **Real index selection / range scans** behind `withIndex` — ordering now uses the index's columns, but a true index-range scan (and the fine-grained read-set it enables) is still future.
 - **Embedded V8 deterministic sandbox** for handlers — deferred to M4; current runtime is a Node/Bun worker.
 - **Richer / exact Postgres type handling** beyond the coarse `PgTypeClass` (precise numerics, timestamp normalization, arrays, enums, extension types) — deferred.
 - **Re-introspection on schema change** — catalog is built once from the manifest.

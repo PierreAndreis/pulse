@@ -88,6 +88,16 @@ describe("ORM ordering + pagination", () => {
     expect(names(await c.w.page.call({ limit: 2, offset: 1 }))).toEqual(["avocado", "banana"]);
     expect(await c.w.page.call({ limit: 10, offset: 100 })).toHaveLength(0);
   });
+
+  test("withIndex(name) orders by the index's columns (asc by default, .order('desc') flips)", async () => {
+    // The schema declares .index("by_qty", ["qty"]); withIndex orders by qty, not
+    // the default _creationTime — proven by inserting out of qty order.
+    await c.w.addWidget.call({ name: "c", qty: 3, active: true });
+    await c.w.addWidget.call({ name: "a", qty: 1, active: true });
+    await c.w.addWidget.call({ name: "b", qty: 2, active: true });
+    expect(names(await c.w.byQty.call({}))).toEqual(["a", "b", "c"]); // qty 1,2,3
+    expect(names(await c.w.byQtyDesc.call({}))).toEqual(["c", "b", "a"]); // qty 3,2,1
+  });
 });
 
 describe("ORM aggregates (SQL NULL semantics, like Drizzle/Prisma)", () => {

@@ -19,5 +19,5 @@ export default defineSchema({
     // Freeform JSON (jsonb) — exercises object/array/nested round-trip through the
     // text → ::jsonb → text boundary.
     meta: v.optional(v.any()),
-  }),
+  }).index("by_qty", ["qty"]),
 });

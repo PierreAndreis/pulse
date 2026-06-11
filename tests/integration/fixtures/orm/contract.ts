@@ -21,6 +21,8 @@ export const contract = {
     notEmptyIn: rows(),
     inject: rows(),
     // ordering + pagination
+    byQty: rows(), // withIndex("by_qty") → ordered by the index's column (qty asc)
+    byQtyDesc: rows(), // withIndex("by_qty").order("desc") → qty desc
     multiSort: rows(),
     page: oc.reactive().input(v.object({ limit: v.number(), offset: v.number() })).output(v.array(v.any())),
     // aggregates

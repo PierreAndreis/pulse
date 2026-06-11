@@ -31,6 +31,12 @@ export const notEmptyIn = os.w.notEmptyIn.handler(async ({ ctx }) =>
 export const inject = os.w.inject.handler(async ({ ctx }) =>
   q(ctx).filter((x: any) => x.eq("name", EVIL)).collect());
 
+// withIndex orders by the named index's columns (qty), no explicit .order field.
+export const byQty = os.w.byQty.handler(async ({ ctx }) =>
+  q(ctx).withIndex("by_qty").collect());
+export const byQtyDesc = os.w.byQtyDesc.handler(async ({ ctx }) =>
+  q(ctx).withIndex("by_qty").order("desc").collect());
+
 export const multiSort = os.w.multiSort.handler(async ({ ctx }) =>
   q(ctx).order("asc", "active").order("desc", "name").collect());
 export const page = os.w.page.handler(async ({ ctx, input }: any) =>

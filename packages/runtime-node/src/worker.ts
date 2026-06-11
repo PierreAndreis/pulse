@@ -66,6 +66,10 @@ function tableOf(id: unknown): string {
   return i === -1 ? "" : s.slice(0, i);
 }
 
+// table → indexName → ordered field list, from the schema's `.index(name, cols)`
+// declarations. Populated once at startup; `withIndex(name)` orders by these.
+let tableIndexes: Record<string, Record<string, string[]>> = {};
+
 function makeDb(requestId: string) {
   const call = (op: Record<string, unknown>) => dbop(requestId, op);
 
@@ -115,9 +119,21 @@ function makeDb(requestId: string) {
     const filters: unknown[] = [];
     const orderBy: Array<{ field?: string; dir: string }> = [];
     let offset: number | undefined;
-    const base = () => ({ kind: "query", table, predicates, filters, orderBy, offset });
+    // Index-driven ordering: `withIndex(name)` records the index's columns; with no
+    // explicit `.order(field)` the query is ordered by them (a bare `.order(dir)`
+    // sets their direction). An explicit `.order(field)` overrides the index order.
+    let indexCols: string[] | null = null;
+    let indexDir = "asc";
+    const base = () => {
+      const order =
+        indexCols && orderBy.length === 0
+          ? indexCols.map((field) => ({ field, dir: indexDir }))
+          : orderBy;
+      return { kind: "query", table, predicates, filters, orderBy: order, offset };
+    };
     const builder = {
-      withIndex(_indexName: string, fn?: (q: ReturnType<typeof rangeBuilder>) => unknown) {
+      withIndex(indexName: string, fn?: (q: ReturnType<typeof rangeBuilder>) => unknown) {
+        indexCols = tableIndexes[table]?.[indexName] ?? null;
         if (fn) fn(rangeBuilder(predicates));
         return builder;
       },
@@ -126,7 +142,11 @@ function makeDb(requestId: string) {
         return builder;
       },
       order(direction: string, field?: string) {
-        orderBy.push({ field, dir: direction });
+        if (field === undefined && indexCols) {
+          indexDir = direction; // order by the index's columns in this direction
+        } else {
+          orderBy.push({ field, dir: direction });
+        }
         return builder;
       },
       paginate(opts: { limit: number; offset?: number }) {
@@ -256,7 +276,10 @@ const procedures = new Map<string, RegisteredProcedure>();
 
 interface SchemaLike {
   tables: unknown;
-  describe(): Record<string, { fields: Record<string, FieldDesc> }>;
+  describe(): Record<
+    string,
+    { fields: Record<string, FieldDesc>; indexes?: { name: string; columns: string[] }[] }
+  >;
 }
 type FieldDesc = { kind: string; table?: string; inner?: FieldDesc };
 
@@ -296,6 +319,13 @@ async function start(): Promise<void> {
   if (!schema && isSchema(mod.default)) schema = mod.default;
 
   const described = schema ? schema.describe() : {};
+  // Index map for `withIndex(name)` → ordered columns.
+  tableIndexes = Object.fromEntries(
+    Object.entries(described).map(([table, td]) => [
+      table,
+      Object.fromEntries((td.indexes ?? []).map((ix) => [ix.name, ix.columns])),
+    ]),
+  );
   const schemaMeta = {
     tables: Object.fromEntries(
       Object.entries(described).map(([table, td]) => [
