@@ -1,6 +1,6 @@
 {
   "name": "@onveloz/pulse-engine",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "description": "Downloads and resolves the Pulse reactivity engine (pulse-server) binary for the host platform.",
