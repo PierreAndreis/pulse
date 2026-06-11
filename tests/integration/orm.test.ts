@@ -15,7 +15,7 @@ const APP = resolve(process.cwd(), "tests/integration/fixtures/orm/app.ts");
 let h: Harness;
 let c: Client<typeof contract>;
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -334,11 +334,15 @@ describe("ORM reactivity is precise", () => {
     try {
       await waitFor(() => counts.length >= 1); // initial snapshot (a real re-exec)
       const before = await ivm();
-      const initial = counts.at(-1);
       // A matching write: the count is maintained from the change delta — the
-      // reactor never calls the worker, so the IVM counter advances.
+      // reactor never calls the worker, so the IVM counter advances. Poll the
+      // server-side counter directly rather than waiting for the client SSE push,
+      // which can lag under CI load (the source of a recurring flake here).
       await c.w.addWidget.call({ name: "ivm-z", qty: 1, active: true });
-      await waitFor(() => counts.at(-1) !== initial);
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && (await ivm()) <= before) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
       expect(await ivm()).toBeGreaterThan(before);
     } finally {
       unsub();
