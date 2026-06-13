@@ -98,17 +98,32 @@ describe("pulse migrate — DDL generation + apply (M7)", () => {
 });
 
 // The file-based migration lifecycle, end-to-end against real Postgres: generate
-// editable SQL from the schema diff, apply it through the real `applyPending`
-// (each migration in its own transaction over one persistent connection), and
-// verify the journal, idempotency, drift refusal, and index redefinition.
-interface PgConn {
-  query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
-  connect(): Promise<void>;
-  end(): Promise<void>;
-}
+// editable SQL from the schema diff, apply it through the real `applyPending`,
+// and verify the journal, idempotency, drift refusal, and index redefinition.
+//
+// `applyPending` talks to a `MigrationClient`; we back it with the same `psql`
+// runner the rest of this file uses (CI has psql but `pg` isn't hoisted to the
+// repo root). Each statement autocommits, so the begin/commit wrapping is inert
+// here — transaction atomicity is covered by the fake-client unit tests; this
+// test proves the generated SQL, journal, drift, and reindex against real PG.
+const psqlClient = {
+  async query(sql: string, params: unknown[] = []): Promise<{ rows: { tag: string; hash: string }[] }> {
+    const bound = sql.replace(/\$(\d+)/g, (_m, n) => `'${String(params[Number(n) - 1]).replace(/'/g, "''")}'`);
+    const out = await psql(bound);
+    if (/^\s*select\s+tag\s*,\s*hash/i.test(sql)) {
+      const rows = out
+        ? out.split("\n").map((line) => {
+            const [tag, hash] = line.split("|");
+            return { tag: tag!, hash: hash! };
+          })
+        : [];
+      return { rows };
+    }
+    return { rows: [] };
+  },
+};
 
 describe("pulse migrate — file lifecycle on real Postgres (deploy / journal / drift / reindex)", () => {
-  let client: PgConn;
   let dir: string;
 
   // Write a migration (and its snapshot) for `schema` against `prev`, returning
@@ -130,16 +145,15 @@ describe("pulse migrate — file lifecycle on real Postgres (deploy / journal / 
 
   // The ordered columns Postgres reports for an index (empty if it's gone).
   async function indexColumns(name: string): Promise<string[]> {
-    const { rows } = await client.query(
-      "SELECT a.attname AS col FROM pg_index ix " +
+    const out = await psql(
+      "SELECT a.attname FROM pg_index ix " +
         "JOIN pg_class ic ON ic.oid = ix.indexrelid " +
         "JOIN pg_class tc ON tc.oid = ix.indrelid " +
         "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true " +
         "LEFT JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = k.attnum " +
-        "WHERE ic.relname = $1 ORDER BY k.ord",
-      [name],
+        `WHERE ic.relname = '${name}' ORDER BY k.ord`,
     );
-    return rows.map((r) => r.col as string);
+    return out ? out.split("\n") : [];
   }
 
   const v1 = defineSchema({
@@ -147,36 +161,29 @@ describe("pulse migrate — file lifecycle on real Postgres (deploy / journal / 
   });
 
   beforeAll(async () => {
-    const pg = (await import("pg" as string)) as {
-      Client: new (cfg: { connectionString: string }) => PgConn;
-    };
-    client = new pg.Client({ connectionString: DATABASE_URL });
-    await client.connect();
-    await client.query("drop table if exists gizmos cascade");
-    await client.query("drop table if exists _pulse_migrations cascade");
+    await psql("drop table if exists gizmos cascade");
+    await psql("drop table if exists _pulse_migrations cascade");
     dir = await mkdtemp(join(tmpdir(), "pulse-mig-it-"));
   });
 
   afterAll(async () => {
-    await client.query("drop table if exists gizmos cascade");
-    await client.query("drop table if exists _pulse_migrations cascade");
-    await client.end();
+    await psql("drop table if exists gizmos cascade");
+    await psql("drop table if exists _pulse_migrations cascade");
   });
 
   test("generate then deploy creates the table + index, records the journal, and is idempotent", async () => {
     await generate(v1, null, 0, "init");
-    const n = await applyPending(client, await readMigrations(dir));
+    const n = await applyPending(psqlClient, await readMigrations(dir));
     expect(n).toBe(1);
 
-    const { rows: tbl } = await client.query("select to_regclass('gizmos') as t");
-    expect(tbl[0]!.t).toBe("gizmos");
+    expect(await psql("select to_regclass('gizmos')")).toBe("gizmos");
     expect(await indexColumns("gizmos_by_qty")).toEqual(["qty"]);
 
-    const applied = await readAppliedMigrations(client);
+    const applied = await readAppliedMigrations(psqlClient);
     expect([...applied.keys()]).toEqual(["0000_init"]);
 
     // Re-running applies nothing (already recorded).
-    expect(await applyPending(client, await readMigrations(dir))).toBe(0);
+    expect(await applyPending(psqlClient, await readMigrations(dir))).toBe(0);
   });
 
   test("redefining an index's columns generates drop+create and re-creates it in Postgres", async () => {
@@ -189,13 +196,13 @@ describe("pulse migrate — file lifecycle on real Postgres (deploy / journal / 
     expect(sql).toContain("drop index if exists gizmos_by_qty;");
     expect(sql).toContain("create index if not exists gizmos_by_qty on gizmos (name);");
 
-    expect(await applyPending(client, await readMigrations(dir))).toBe(1);
+    expect(await applyPending(psqlClient, await readMigrations(dir))).toBe(1);
     expect(await indexColumns("gizmos_by_qty")).toEqual(["name"]); // now covers (name)
   });
 
   test("deploy refuses a migration whose already-applied file was edited (hash drift)", async () => {
     await writeFile(join(dir, "0000_init.sql"), "-- tampered after apply\n");
-    await expect(applyPending(client, await readMigrations(dir))).rejects.toThrow(
+    await expect(applyPending(psqlClient, await readMigrations(dir))).rejects.toThrow(
       /already applied but its file changed/,
     );
   });
