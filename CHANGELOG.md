@@ -3,6 +3,15 @@
 All notable changes to Pulse (the `@onveloz/pulse-*` packages and the `pulse-server` engine) are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Pulse is pre-1.0: a **minor** bump signals new features, a **patch** signals fixes. Each version's GitHub Release carries the prebuilt `pulse-server` binaries that `@onveloz/pulse-engine` downloads.
 
+## [Unreleased]
+
+#### CLI (`@onveloz/pulse-cli`)
+- **File-based migrations (Prisma/Drizzle style).** `pulse migrate dev [name]` diffs the schema against the last snapshot and writes an editable `migrations/NNNN_<name>.sql` (destructive drops commented out) plus a snapshot, then applies pending migrations to the dev DB and regenerates the data model. `pulse migrate deploy` applies pending files in order (each in its own transaction), recorded in a `_pulse_migrations` journal, and **refused if an already-applied file was edited** (content-hash drift). `pulse migrate status` lists each as applied / pending / drifted. `pulse db push` keeps the old no-files live sync.
+- Generated migrations now handle **index removal** (`DROP INDEX`, scoped so primary keys and engine-managed indexes are never touched) and **index redefinition** (an index that keeps its name but changes columns is dropped and re-created).
+
+#### Engine (`pulse-server` binary)
+- New `/metrics` field **`ivmPushed`**: IVM-maintained values actually delivered to a client (post diff-suppression), the delivery-confirmed companion to `ivmApplied`.
+
 ## [0.2.0] - 2026-06-10
 
 _Reactive queries + incremental aggregates, multi-node scale-out, WAL/CDC ingest, and a production CLI. Grouped by package._
@@ -109,6 +118,7 @@ _Initial release — the foundational Pulse engine and SDK._
 - The reactor no longer holds the global clients lock across an SSE channel send, so one stalled/slow consumer can't head-of-line-block pushes and client registration for everyone else.
 
 <!-- Version diffs (commit ranges) -->
+[Unreleased]: https://github.com/PierreAndreis/pulse/compare/v0.2.0...main
 [0.2.0]: https://github.com/PierreAndreis/pulse/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/PierreAndreis/pulse/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/PierreAndreis/pulse/compare/v0.1.3...v0.1.4
