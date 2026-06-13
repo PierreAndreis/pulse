@@ -121,3 +121,145 @@ describe("snapshot persistence", () => {
     expect(diffAgainstSnapshot(v1, round).additive).toHaveLength(0);
   });
 });
+
+// Scenarios ported from Prisma's schema-engine migration tests
+// (schema-engine/sql-migration-tests/tests/migrations/{basic,indexes}.rs),
+// translated to our snapshot-diff model. We only port what our surface supports:
+// tables, columns, types, nullability, and named multi-column indexes — not
+// Prisma's foreign keys, unique constraints, enums, defaults, or renames-as-rename
+// (we have no rename detection; a renamed index is a drop + create).
+describe("prisma-derived scenarios", () => {
+  // basic.rs::adding_multiple_optional_fields_to_an_existing_model_works
+  it("adding multiple optional fields is all-additive, no alters", () => {
+    const prev = schemaToSnapshot(v1);
+    const v2 = defineSchema({
+      widgets: defineTable({
+        name: v.string(),
+        qty: v.int(),
+        tag: v.optional(v.string()),
+        note: v.optional(v.string()),
+        score: v.optional(v.int()),
+      }).index("by_qty", ["qty"]),
+    });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.additive).toEqual([
+      "alter table widgets add column if not exists note text;",
+      "alter table widgets add column if not exists score bigint;",
+    ]);
+    expect(diff.alters).toHaveLength(0);
+    expect(diff.destructive).toHaveLength(0);
+  });
+
+  // basic.rs::a_model_can_be_removed
+  it("removing a whole table is destructive, never additive", () => {
+    const prev = schemaToSnapshot(
+      defineSchema({
+        widgets: defineTable({ name: v.string() }),
+        gadgets: defineTable({ label: v.string() }),
+      }),
+    );
+    const v2 = defineSchema({ widgets: defineTable({ name: v.string() }) });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.destructive).toEqual([{ kind: "table", table: "gadgets" }]);
+    expect(diff.additive).toHaveLength(0);
+  });
+
+  // basic.rs::created_at_does_not_get_arbitrarily_migrated — the engine-managed
+  // system columns (_id / _creation_time) must never show spurious drift.
+  it("re-applying an identical schema is a no-op (system columns never drift)", () => {
+    const wide = defineSchema({
+      things: defineTable({
+        title: v.string(),
+        count: v.int(),
+        ratio: v.number(),
+        active: v.boolean(),
+        meta: v.optional(v.string()),
+      }).index("by_count", ["count"]),
+    });
+    const diff = diffAgainstSnapshot(wide, schemaToSnapshot(wide));
+    expect(diff.additive).toHaveLength(0);
+    expect(diff.alters).toHaveLength(0);
+    expect(diff.destructive).toHaveLength(0);
+  });
+
+  // indexes.rs::model_with_multiple_indexes_works — multiple indexes on one table;
+  // removing some drops only those, leaving the rest untouched.
+  it("a table can carry multiple indexes; removing some drops only those", () => {
+    const prev = schemaToSnapshot(
+      defineSchema({
+        widgets: defineTable({ name: v.string(), qty: v.int(), tag: v.optional(v.string()) })
+          .index("by_qty", ["qty"])
+          .index("by_name", ["name"])
+          .index("by_tag", ["tag"]),
+      }),
+    );
+    const v2 = defineSchema({
+      widgets: defineTable({ name: v.string(), qty: v.int(), tag: v.optional(v.string()) }).index(
+        "by_qty",
+        ["qty"],
+      ),
+    });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.additive).toContain("drop index if exists widgets_by_name;");
+    expect(diff.additive).toContain("drop index if exists widgets_by_tag;");
+    expect(diff.additive).not.toContain("drop index if exists widgets_by_qty;");
+    expect(diff.destructive).toHaveLength(0);
+  });
+
+  // indexes.rs::index_renaming_must_work — we have no rename detection, so a
+  // renamed index is a drop of the old name plus a create of the new one.
+  it("renaming an index drops the old and creates the new", () => {
+    const prev = schemaToSnapshot(v1); // index widgets_by_qty
+    const v2 = defineSchema({
+      widgets: defineTable({ name: v.string(), qty: v.int(), tag: v.optional(v.string()) }).index(
+        "by_quantity",
+        ["qty"],
+      ),
+    });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.additive).toContain("create index if not exists widgets_by_quantity on widgets (qty);");
+    expect(diff.additive).toContain("drop index if exists widgets_by_qty;");
+  });
+
+  // indexes.rs::column_type_migrations_should_not_implicitly_drop_indexes — a
+  // column type change must ALTER the column, never drop the index that covers it.
+  it("a column type change never implicitly drops its index", () => {
+    const prev = schemaToSnapshot(
+      defineSchema({
+        widgets: defineTable({ name: v.string(), qty: v.int() }).index("by_qty", ["qty"]),
+      }),
+    );
+    const v2 = defineSchema({
+      widgets: defineTable({ name: v.string(), qty: v.number() }).index("by_qty", ["qty"]),
+    }); // qty: int8 → double precision
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.alters.join("\n")).toContain("alter table widgets alter column qty type double precision");
+    expect(diff.additive.join("\n")).not.toContain("drop index");
+  });
+
+  // indexes.rs::column_type_migrations_should_not_implicitly_drop_compound_indexes
+  it("a column type change never drops a compound index", () => {
+    const prev = schemaToSnapshot(
+      defineSchema({
+        widgets: defineTable({ name: v.string(), qty: v.int() }).index("by_qty_name", [
+          "qty",
+          "name",
+        ]),
+      }),
+    );
+    const v2 = defineSchema({
+      widgets: defineTable({ name: v.string(), qty: v.number() }).index("by_qty_name", [
+        "qty",
+        "name",
+      ]),
+    });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.additive.join("\n")).not.toContain("drop index");
+  });
+
+  // indexes.rs::index_updates_with_rename_must_work — Prisma detects when an
+  // index keeps its NAME but changes its COLUMNS and re-creates it. Our snapshot
+  // stores only index NAMES (not their columns), so a same-name column change is
+  // currently invisible. KNOWN GAP — same class as the (now-fixed) drop gap.
+  it.todo("redefining an index's columns under the same name re-creates it");
+});
