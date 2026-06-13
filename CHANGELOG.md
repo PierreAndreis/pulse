@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 #### CLI (`@onveloz/pulse-cli`)
 - **File-based migrations (Prisma/Drizzle style).** `pulse migrate dev [name]` diffs the schema against the last snapshot and writes an editable `migrations/NNNN_<name>.sql` (destructive drops commented out) plus a snapshot, then applies pending migrations to the dev DB and regenerates the data model. `pulse migrate deploy` applies pending files in order (each in its own transaction), recorded in a `_pulse_migrations` journal, and **refused if an already-applied file was edited** (content-hash drift). `pulse migrate status` lists each as applied / pending / drifted. `pulse db push` keeps the old no-files live sync.
 - Generated migrations now handle **index removal** (`DROP INDEX`, scoped so primary keys and engine-managed indexes are never touched) and **index redefinition** (an index that keeps its name but changes columns is dropped and re-created).
+- `pulse migrate dev --create-only` writes the migration file without applying it, so you can edit a destructive or data-backfill migration before running it (Prisma parity).
 
 #### Engine (`pulse-server` binary)
 - New `/metrics` field **`ivmPushed`**: IVM-maintained values actually delivered to a client (post diff-suppression), the delivery-confirmed companion to `ivmApplied`.

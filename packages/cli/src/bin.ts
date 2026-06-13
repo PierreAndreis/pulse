@@ -61,13 +61,15 @@ const HELP = `pulse <command>
   gen [schema.ts] [out.ts]   generate the Doc/Id data model from a schema
                              (schema defaults to app/schema.ts; default out:
                              <schemaDir>/_generated/dataModel.ts)
-  migrate dev [name] [--schema path] [--database-url URL]
+  migrate dev [name] [--schema path] [--database-url URL] [--create-only]
                              create a migration from the schema diff (vs the last
                              snapshot), apply all pending migrations to the dev
                              database, and regenerate the data model. Writes
                              editable SQL to migrations/<NNNN>_<name>.sql.
+                             --create-only writes the file but stops before
+                             applying, so you can edit it first.
   migrate deploy [--dir migrations] [--database-url URL]
-                             apply all pending migration files in order — no
+                             apply all pending migration files in order, no
                              generate, no prompts. For CI / production.
   migrate status [--dir migrations] [--database-url URL]
                              list each migration as applied / pending / drifted.
@@ -349,12 +351,15 @@ const logApplied = (tag: string): void => void process.stdout.write(`pulse: appl
 
 /** `pulse migrate dev [name]` — generate a migration from the schema diff (if the
  *  schema changed), apply all pending migrations to the dev database, and
- *  regenerate the typed data model. */
+ *  regenerate the typed data model. With `createOnly`, write the migration file
+ *  but stop before applying or regenerating (so you can edit a destructive or
+ *  data-backfill migration first, then run `migrate dev` again to apply it). */
 async function migrateDev(
   schemaPath: string,
   schema: AnySchema,
   databaseUrl: string,
   name: string,
+  createOnly = false,
 ): Promise<void> {
   const dir = migrationsDirFor(schemaPath);
   const diff = diffAgainstSnapshot(schema, await readLastSnapshot(dir));
@@ -372,12 +377,21 @@ async function migrateDev(
     process.stdout.write(`pulse: created migrations/${tag}.sql\n`);
     if (diff.destructive.length) {
       process.stdout.write(
-        `pulse: note — ${diff.destructive.length} destructive change(s) are commented out in that file; ` +
+        `pulse: note: ${diff.destructive.length} destructive change(s) are commented out in that file; ` +
           `uncomment to apply (DATA LOSS).\n`,
       );
     }
+    if (createOnly) {
+      process.stdout.write(
+        "pulse: --create-only, not applied. Edit the file, then run `pulse migrate dev` to apply it.\n",
+      );
+      return;
+    }
+  } else if (createOnly) {
+    process.stdout.write("pulse: no schema changes since the last migration; nothing to create.\n");
+    return;
   } else if ((await readMigrations(dir)).length === 0) {
-    process.stdout.write("pulse: schema is empty — nothing to migrate.\n");
+    process.stdout.write("pulse: schema is empty; nothing to migrate.\n");
     return;
   } else {
     process.stdout.write("pulse: no schema changes since the last migration.\n");
@@ -492,7 +506,7 @@ async function main(): Promise<void> {
         const schemaPath = resolveSchemaPath(args);
         const schema = await loadSchema(schemaPath);
         const name = args.slice(1).find((a) => !a.startsWith("-")) ?? "migration";
-        await migrateDev(schemaPath, schema, dbUrl(), name);
+        await migrateDev(schemaPath, schema, dbUrl(), name, has(args, "--create-only"));
         return;
       }
 

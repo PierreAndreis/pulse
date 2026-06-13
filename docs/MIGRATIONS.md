@@ -25,7 +25,12 @@ pulse migrate dev <name>      # diff schema vs the last snapshot → migrations/
                               # then apply it (and any pending) to the dev DB, and regen the model
 pulse migrate deploy          # apply pending files in order, no prompts (CI / production)
 pulse migrate status          # list each migration: applied / pending / drifted
+pulse migrate dev <name> --create-only   # write the migration file but don't apply it yet
 ```
+
+Use `--create-only` when you want to hand-edit a migration before it runs (uncomment
+a destructive drop, add a data backfill, turn a drop+add into a rename). It writes
+the file and snapshot, then stops; the next `pulse migrate dev` applies it.
 
 Layout (a `migrations/` directory next to your schema):
 
