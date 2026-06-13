@@ -4,7 +4,7 @@ Pulse evolves your Postgres schema two ways, mirroring Prisma/Drizzle: a fast
 no-files sync for prototyping, and versioned, reviewable migration files for a
 team or production.
 
-## Fast loop — `pulse db push`
+## Fast loop: `pulse db push`
 
 `pulse dev` already syncs your schema to the database on boot (additive changes
 auto-apply; destructive ones prompt). For an explicit one-off sync with no
@@ -14,9 +14,9 @@ migration files:
 pulse db push                 # additive auto-applies; destructive prompts (or --force in CI)
 ```
 
-No history is kept — best for early prototyping.
+No history is kept; best for early prototyping.
 
-## Versioned migrations — `pulse migrate`
+## Versioned migrations: `pulse migrate`
 
 For a team / production, generate committed, editable SQL migrations:
 
@@ -31,7 +31,7 @@ Layout (a `migrations/` directory next to your schema):
 
 ```
 migrations/
-  0000_init.sql               # editable SQL — destructive drops are commented out
+  0000_init.sql               # editable SQL, destructive drops commented out
   0001_add_score.sql
   meta/
     0000_init.snapshot.json    # the schema's "shape" recorded after each migration
