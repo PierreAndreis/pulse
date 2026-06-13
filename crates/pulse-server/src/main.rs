@@ -504,6 +504,10 @@ async fn node_metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
         // Subscription updates served incrementally (IVM) instead of by a worker
         // re-exec — the IVM hit signal.
         "ivmApplied": state.coord.ivm_applied(),
+        // Of those, the count actually pushed to a client (post diff-suppression):
+        // the delivery-confirmed IVM signal. `ivmApplied - ivmPushed` is suppressed
+        // byte-identical recomputes.
+        "ivmPushed": state.coord.ivm_pushed(),
         "busLagMs": avg_ms(m.lag_us_sum.load(Relaxed), changes),
         "applyMs": avg_ms(m.apply_us_sum.load(Relaxed), events),
         // Raw sums (µs) so a benchmark can compute a windowed average via deltas.

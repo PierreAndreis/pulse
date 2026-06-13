@@ -189,6 +189,12 @@ impl Coordinator {
         self.reactor.ivm_applied()
     }
 
+    /// Count of IVM-maintained values actually pushed to a client (post diff-
+    /// suppression) — the delivery-side companion to [`Coordinator::ivm_applied`].
+    pub fn ivm_pushed(&self) -> u64 {
+        self.reactor.ivm_pushed()
+    }
+
     /// Run a procedure. On a mutation that produced writes, the result carries a
     /// `propagate` change-set already stamped with the sampled commit watermark;
     /// the caller spawns [`Coordinator::propagate`] for it off the response path.

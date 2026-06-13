@@ -166,6 +166,10 @@ pub trait Reactor: Send + Sync {
     /// Count of subscription updates served incrementally (IVM) rather than by a
     /// worker re-exec — an observability signal exposed on `/metrics`.
     fn ivm_applied(&self) -> u64;
+    /// Count of IVM-maintained values that were actually *pushed* to a client (a
+    /// real, non-suppressed delivery). Always ≤ `ivm_applied`, which counts every
+    /// IVM match before diff-suppression; the gap is byte-identical recomputes.
+    fn ivm_pushed(&self) -> u64;
     /// The tables this node currently has at least one subscription on — the set to
     /// (re)register as cross-node interest on the bus heartbeat.
     async fn interest_tables(&self) -> Vec<TableId>;
@@ -311,6 +315,9 @@ pub struct InMemoryReactor {
     /// aggregate maintained from the change delta) instead of a worker re-exec —
     /// an observability signal for the IVM hit-rate.
     ivm_applied: AtomicU64,
+    /// Count of IVM-maintained values actually pushed to a client (post diff-
+    /// suppression) — the delivery-side companion to `ivm_applied`.
+    ivm_pushed: AtomicU64,
 }
 
 impl InMemoryReactor {
@@ -322,6 +329,7 @@ impl InMemoryReactor {
             interest: None,
             sse_buffer: DEFAULT_SSE_BUFFER,
             ivm_applied: AtomicU64::new(0),
+            ivm_pushed: AtomicU64::new(0),
         }
     }
 
@@ -870,7 +878,9 @@ impl Reactor for InMemoryReactor {
                 .record_value(&client_id, &sub, &value, read_set, change_set.commit_lsn)
                 .await
             {
-                if !self.send(&client_id, &sub, &value, lsn).await {
+                if self.send(&client_id, &sub, &value, lsn).await {
+                    self.ivm_pushed.fetch_add(1, Relaxed);
+                } else {
                     self.remove_client(&client_id).await;
                 }
             }
@@ -910,6 +920,10 @@ impl Reactor for InMemoryReactor {
 
     fn ivm_applied(&self) -> u64 {
         self.ivm_applied.load(Relaxed)
+    }
+
+    fn ivm_pushed(&self) -> u64 {
+        self.ivm_pushed.load(Relaxed)
     }
 
     async fn interest_tables(&self) -> Vec<TableId> {
@@ -1235,6 +1249,40 @@ mod tests {
 
         assert_eq!(reexec.calls.load(Ordering::SeqCst), 0);
         assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15.0));
+    }
+
+    #[tokio::test]
+    async fn ivm_pushed_counts_deliveries_not_suppressed_recomputes() {
+        // `ivm_applied` counts every IVM match; `ivm_pushed` counts only the ones
+        // whose value actually changed and was sent. A +0 insert keeps the sum, so
+        // it's a match (applied++) that diff-suppresses (pushed unchanged).
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+        let mut rx = reactor.register_client("a".into()).await;
+        sum_sub(&reactor, "a", "A", 10.0).await;
+
+        // Matching insert moves the sum 10 → 15: applied and pushed.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 1, 5)]))
+            .await;
+        assert_eq!(reactor.ivm_applied(), 1);
+        assert_eq!(reactor.ivm_pushed(), 1);
+        assert_eq!(pushed_data(&rx.try_recv().unwrap()), json!(15.0));
+
+        // Matching +0 insert keeps the sum at 15: applied again, but suppressed —
+        // no push, so `ivm_pushed` does NOT advance and the client gets nothing.
+        reactor
+            .apply_change_set(cs_of(vec![insert_amount("A", 2, 0)]))
+            .await;
+        assert_eq!(reactor.ivm_applied(), 2);
+        assert_eq!(
+            reactor.ivm_pushed(),
+            1,
+            "suppressed recompute must not count as a push"
+        );
+        assert!(rx.try_recv().is_err(), "no second push delivered");
     }
 
     #[tokio::test]
