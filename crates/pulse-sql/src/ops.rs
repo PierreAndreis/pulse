@@ -1556,6 +1556,91 @@ mod tests {
         c
     }
 
+    /// `messages` with a text `body` and an int `n` — for WHERE-clause rendering.
+    fn body_table() -> Table {
+        Table::from_columns(
+            "messages",
+            vec![
+                col("body", "body", PgTypeClass::Text, None),
+                col("n", "n", PgTypeClass::Int8, None),
+            ],
+        )
+    }
+
+    // Injection safety: a comparison value is ALWAYS a `$N` placeholder with the
+    // raw value pushed to binds — never interpolated into the SQL text.
+    #[test]
+    fn render_expr_parameterizes_values_no_injection() {
+        let t = body_table();
+        let mut binds = Vec::new();
+        let evil = "x'; DROP TABLE messages;--";
+        let e = FilterExpr::Cmp(Predicate {
+            field: "body".into(),
+            op: PredOp::Eq,
+            value: json!(evil),
+        });
+        let sql = render_expr(&e, &t, &mut binds).unwrap();
+        assert_eq!(sql, "body = $1::text"); // placeholder, not the literal
+        assert_eq!(binds, vec![Some(evil.to_string())]); // raw value is bound
+        assert!(!sql.contains("DROP")); // payload never reaches the SQL text
+    }
+
+    #[test]
+    fn render_expr_unary_is_null_takes_no_bind() {
+        let t = body_table();
+        let mut binds = Vec::new();
+        let e = FilterExpr::Cmp(Predicate {
+            field: "body".into(),
+            op: PredOp::IsNull,
+            value: Value::Null,
+        });
+        let sql = render_expr(&e, &t, &mut binds).unwrap();
+        assert_eq!(sql, "body IS NULL");
+        assert!(binds.is_empty()); // a unary op has no right-hand operand to bind
+    }
+
+    // Empty boolean groups: AND of nothing is TRUE (match all), OR of nothing is
+    // FALSE (match none) — the `in([])` / `not(in([]))` corner.
+    #[test]
+    fn render_expr_empty_and_is_true_empty_or_is_false() {
+        let t = body_table();
+        let mut binds = Vec::new();
+        assert_eq!(
+            render_expr(&FilterExpr::And { and: vec![] }, &t, &mut binds).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            render_expr(&FilterExpr::Or { or: vec![] }, &t, &mut binds).unwrap(),
+            "false"
+        );
+        assert!(binds.is_empty());
+    }
+
+    #[test]
+    fn render_expr_composes_and_or_not_with_sequential_binds() {
+        let t = body_table();
+        let mut binds = Vec::new();
+        let e = FilterExpr::Not {
+            not: Box::new(FilterExpr::Or {
+                or: vec![
+                    FilterExpr::Cmp(Predicate {
+                        field: "body".into(),
+                        op: PredOp::Eq,
+                        value: json!("hi"),
+                    }),
+                    FilterExpr::Cmp(Predicate {
+                        field: "n".into(),
+                        op: PredOp::Gt,
+                        value: json!(5),
+                    }),
+                ],
+            }),
+        };
+        let sql = render_expr(&e, &t, &mut binds).unwrap();
+        assert_eq!(sql, "NOT ((body = $1::text OR n > $2::int8))");
+        assert_eq!(binds, vec![Some("hi".to_string()), Some("5".to_string())]);
+    }
+
     fn catalog_messages_channels() -> Catalog {
         let mut c = Catalog::default();
         c.tables.insert("messages".to_string(), messages_table());
