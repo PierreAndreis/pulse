@@ -1745,6 +1745,72 @@ mod tests {
         assert!(expr_dnf(&abc_table(), &FilterExpr::And { and: ors }).is_none());
     }
 
+    // ── agg_sql: the aggregate function rendering. A wrong column name or shape
+    // here means a reactive count/sum/min/max/avg returns the wrong number.
+    fn priced_table() -> Table {
+        // field `unitPrice` maps to column `unit_price` — agg_sql must use the column.
+        Table::from_columns(
+            "orders",
+            vec![col("unit_price", "unitPrice", PgTypeClass::Int8, None)],
+        )
+    }
+    fn agg(func: AggFn, field: Option<&str>, distinct: bool) -> Agg {
+        Agg {
+            func,
+            field: field.map(str::to_string),
+            distinct,
+        }
+    }
+
+    #[test]
+    fn agg_sql_renders_each_aggregate_using_the_column_name() {
+        let t = priced_table();
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Count, None, false)).unwrap(),
+            "count(*)"
+        );
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Count, Some("unitPrice"), false)).unwrap(),
+            "count(unit_price)"
+        );
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Count, Some("unitPrice"), true)).unwrap(),
+            "count(distinct unit_price)"
+        );
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Sum, Some("unitPrice"), false)).unwrap(),
+            "sum(unit_price)"
+        );
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Min, Some("unitPrice"), false)).unwrap(),
+            "min(unit_price)"
+        );
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Max, Some("unitPrice"), false)).unwrap(),
+            "max(unit_price)"
+        );
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Avg, Some("unitPrice"), false)).unwrap(),
+            "avg(unit_price)"
+        );
+    }
+
+    #[test]
+    fn agg_sql_count_distinct_without_a_field_is_plain_count_star() {
+        // `count(distinct)` with no field degrades to count(*), not malformed SQL.
+        let t = priced_table();
+        assert_eq!(
+            agg_sql(&t, &agg(AggFn::Count, None, true)).unwrap(),
+            "count(*)"
+        );
+    }
+
+    #[test]
+    fn agg_sql_errors_on_an_unknown_field() {
+        let t = priced_table();
+        assert!(agg_sql(&t, &agg(AggFn::Sum, Some("nope"), false)).is_err());
+    }
+
     // Property: render_expr is injection-safe for ANY filter shape. Values (which
     // may contain quotes/semicolons) are always `$N` binds, never inlined — so the
     // rendered SQL can never contain a single quote, and there's exactly one
