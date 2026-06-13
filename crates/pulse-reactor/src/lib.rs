@@ -1980,6 +1980,49 @@ mod tests {
         }
     }
 
+    /// Same path + input but DIFFERENT auth headers must NOT coalesce: each gets
+    /// its own re-exec, so one client's result is never fanned to another. The
+    /// dedup key includes headers precisely to prevent that cross-auth leak.
+    #[tokio::test]
+    async fn subs_with_different_headers_do_not_coalesce() {
+        let reexec = Arc::new(CountingReExec {
+            calls: AtomicUsize::new(0),
+        });
+        let reactor = InMemoryReactor::new(reexec.clone());
+
+        for (client, token) in [("a", "alice"), ("b", "bob")] {
+            reactor.register_client(client.into()).await;
+            let mut headers = HashMap::new();
+            headers.insert("authorization".to_string(), token.to_string());
+            reactor
+                .add_subscription(Subscription {
+                    client_id: client.into(),
+                    sub: "messages.list::A".into(),
+                    path: vec!["messages".into(), "list".into()],
+                    input: json!({ "channelId": "A" }),
+                    headers, // identical query, different auth
+                    read_set: channel_filter("A"),
+                    last: None,
+                    agg_state: None,
+                    last_lsn: Lsn::ZERO,
+                })
+                .await;
+        }
+
+        reactor
+            .apply_change_set(ChangeSet {
+                commit_lsn: Lsn::ZERO,
+                changes: vec![insert_into("A")],
+            })
+            .await;
+
+        assert_eq!(
+            reexec.calls.load(Ordering::SeqCst),
+            2,
+            "different auth headers must not share a coalesced re-exec"
+        );
+    }
+
     /// Matching subscriptions must re-execute concurrently, not one-at-a-time —
     /// otherwise a fan-out wave's tail waits behind every prior worker round-trip.
     #[tokio::test]
