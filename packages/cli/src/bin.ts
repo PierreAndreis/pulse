@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cancel, confirm, isCancel } from "@clack/prompts";
@@ -26,14 +26,14 @@ import {
 import {
   applyPending,
   diffAgainstSnapshot,
-  hashSql,
+  migrationsDirFor,
   migrationStates,
   migrationTag,
   readAppliedMigrations,
+  readLastSnapshot,
+  readMigrations,
   renderMigration,
   schemaToSnapshot,
-  type OnDiskMigration,
-  type Snapshot,
 } from "./migrate.js";
 
 type AnySchema = SchemaDefinition<Record<string, AnyTableDefinition>>;
@@ -344,38 +344,6 @@ async function applyMigration(
 // ── File-based migrations (Prisma-style: generate editable SQL + a journal) ────
 
 /** The `migrations/` directory next to the schema (e.g. `app/migrations`). */
-function migrationsDirFor(schemaPath: string): string {
-  return resolve(dirname(schemaPath), "migrations");
-}
-
-/** Read every `NNNN_name.sql` migration in order (with its content hash). */
-async function readMigrations(dir: string): Promise<OnDiskMigration[]> {
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
-    return []; // no migrations directory yet
-  }
-  const out: OnDiskMigration[] = [];
-  for (const file of names.filter((n) => /^\d+_.*\.sql$/.test(n)).sort()) {
-    const sql = await readFile(resolve(dir, file), "utf8");
-    out.push({ idx: Number(/^(\d+)_/.exec(file)![1]), tag: file.replace(/\.sql$/, ""), sql, hash: hashSql(sql) });
-  }
-  return out;
-}
-
-/** The most recent schema snapshot (or null before the first migration). */
-async function readLastSnapshot(dir: string): Promise<Snapshot | null> {
-  let names: string[];
-  try {
-    names = await readdir(resolve(dir, "meta"));
-  } catch {
-    return null;
-  }
-  const last = names.filter((n) => /\.snapshot\.json$/.test(n)).sort().at(-1);
-  return last ? (JSON.parse(await readFile(resolve(dir, "meta", last), "utf8")) as Snapshot) : null;
-}
-
 /** Write a `pulse: applied <tag>` progress line as each migration runs. */
 const logApplied = (tag: string): void => void process.stdout.write(`pulse: applied ${tag}\n`);
 

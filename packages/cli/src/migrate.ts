@@ -4,6 +4,8 @@
 // so generation never touches a database. The same `diffSchema` engine used for
 // live diffing does the work; the snapshot just stands in for the live DB.
 
+import { readdir, readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { AnyTableDefinition, SchemaDefinition } from "@onveloz/pulse-schema";
 import { fieldToColumn, pgType } from "./ddl.js";
 import {
@@ -203,4 +205,47 @@ export function hashSql(sql: string): string {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/** The `migrations/` directory that sits next to a schema file. */
+export function migrationsDirFor(schemaPath: string): string {
+  return resolve(dirname(schemaPath), "migrations");
+}
+
+/** Read every `NNNN_name.sql` migration in `dir`, in order, each with its content
+ *  hash. Names are zero-padded, so a lexical sort is also the numeric order.
+ *  Returns `[]` when the directory doesn't exist yet. */
+export async function readMigrations(dir: string): Promise<OnDiskMigration[]> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return []; // no migrations directory yet
+  }
+  const out: OnDiskMigration[] = [];
+  for (const file of names.filter((n) => /^\d+_.*\.sql$/.test(n)).sort()) {
+    const sql = await readFile(resolve(dir, file), "utf8");
+    out.push({
+      idx: Number(/^(\d+)_/.exec(file)![1]),
+      tag: file.replace(/\.sql$/, ""),
+      sql,
+      hash: hashSql(sql),
+    });
+  }
+  return out;
+}
+
+/** The most recent schema snapshot in `dir/meta` (or null before the first migration). */
+export async function readLastSnapshot(dir: string): Promise<Snapshot | null> {
+  let names: string[];
+  try {
+    names = await readdir(resolve(dir, "meta"));
+  } catch {
+    return null;
+  }
+  const last = names
+    .filter((n) => /\.snapshot\.json$/.test(n))
+    .sort()
+    .at(-1);
+  return last ? (JSON.parse(await readFile(resolve(dir, "meta", last), "utf8")) as Snapshot) : null;
 }

@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   applyPending,
   diffAgainstSnapshot,
   hashSql,
+  migrationsDirFor,
   migrationStates,
   migrationTag,
   readAppliedMigrations,
+  readLastSnapshot,
+  readMigrations,
   renderMigration,
   schemaToSnapshot,
   type MigrationClient,
@@ -210,6 +216,46 @@ describe("applyPending (migration runner)", () => {
     await expect(applyPending(c, migs)).rejects.toThrow(/migration 0000_bad failed: syntax error/);
     expect(c.log).toContain("rollback");
     expect(c.journal.size).toBe(0);
+  });
+});
+
+describe("readMigrations / readLastSnapshot (filesystem)", () => {
+  it("reads NNNN_*.sql in order with content hashes, ignoring other files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pulse-mig-"));
+    // written out of order, with non-migration files mixed in
+    await writeFile(join(dir, "0001_add.sql"), "alter table a add b int;");
+    await writeFile(join(dir, "0000_init.sql"), "create table a ();");
+    await writeFile(join(dir, "README.md"), "# not a migration");
+    await writeFile(join(dir, "notes.sql"), "-- missing NNNN_ prefix");
+
+    const migs = await readMigrations(dir);
+    expect(migs.map((m) => m.tag)).toEqual(["0000_init", "0001_add"]); // sorted, filtered
+    expect(migs.map((m) => m.idx)).toEqual([0, 1]);
+    expect(migs[0]!.hash).toBe(hashSql("create table a ();"));
+  });
+
+  it("returns [] when the migrations directory does not exist", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pulse-mig-"));
+    expect(await readMigrations(join(dir, "nope"))).toEqual([]);
+  });
+
+  it("reads the latest snapshot from meta/, or null when there is none", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pulse-mig-"));
+    expect(await readLastSnapshot(dir)).toBeNull(); // no meta/ yet
+
+    await mkdir(join(dir, "meta"), { recursive: true });
+    const snap = schemaToSnapshot(v1);
+    await writeFile(join(dir, "meta", "0000_init.snapshot.json"), JSON.stringify(snap));
+    await writeFile(join(dir, "meta", "0001_add.snapshot.json"), JSON.stringify(snap));
+    const last = await readLastSnapshot(dir);
+    expect(last).toEqual(snap); // highest-numbered snapshot wins
+  });
+});
+
+describe("migrationsDirFor", () => {
+  it("is the `migrations/` dir next to the schema file", () => {
+    expect(migrationsDirFor("/app/schema.ts")).toBe("/app/migrations");
+    expect(migrationsDirFor("/app/db/schema.ts")).toBe("/app/db/migrations");
   });
 });
 
