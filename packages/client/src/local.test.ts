@@ -26,6 +26,29 @@ describe("LocalStore", () => {
     expect(bodies(s)).toEqual(["new", "old"]);
   });
 
+  it("a throwing optimistic updater can't corrupt the cache or halt the others", () => {
+    const s = new LocalStore();
+    s.setConfirmed(KEY, [{ _id: "a", body: "a" }]);
+    // A good updater, then one that throws, then another good one. The throw must
+    // be swallowed so the surrounding updaters still apply in order.
+    s.addOptimistic("good1", (st) => {
+      const cur = st.getQuery<Doc>(PATH, INPUT);
+      st.setQuery(PATH, INPUT, [...cur, { _id: "opt1", body: "b" }]);
+    });
+    s.addOptimistic("bad", () => {
+      throw new Error("boom in updater");
+    });
+    s.addOptimistic("good2", (st) => {
+      const cur = st.getQuery<Doc>(PATH, INPUT);
+      st.setQuery(PATH, INPUT, [...cur, { _id: "opt2", body: "c" }]);
+    });
+    // The bad updater is skipped; both good overlays survive on top of confirmed.
+    expect(bodies(s)).toEqual(["a", "b", "c"]);
+    // Removing only the bad one is a no-op for the view (it never contributed).
+    s.removeOptimistic("bad");
+    expect(bodies(s)).toEqual(["a", "b", "c"]);
+  });
+
   it("rolls back when the optimistic mutation is removed", () => {
     const s = new LocalStore();
     s.setConfirmed(KEY, [{ _id: "a" }]);
