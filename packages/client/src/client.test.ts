@@ -43,6 +43,22 @@ describe("client proxy", () => {
     ]);
   });
 
+  it("caches nested accessors so their identity is stable (referential equality)", () => {
+    const client = createClient<ContractRouter>({ url: "/" }) as unknown as AnyClient;
+    expect(client.messages).toBe(client.messages); // same namespace proxy each access
+    expect(client.messages.list).toBe(client.messages.list); // same procedure proxy
+    expect(client.messages).not.toBe(client.users); // distinct namespaces are distinct
+  });
+
+  it("exposes the local-first + status handles only at the root", () => {
+    const client = createClient<ContractRouter>({ url: "/" }) as unknown as AnyClient;
+    expect(typeof client.$onSyncStatus).toBe("function");
+    expect(client.$local).toBeDefined();
+    // A nested path does not shadow them: `messages.$local` is a plain sub-proxy,
+    // not the engine handle, so the root-only guard holds.
+    expect(client.messages.$local).not.toBe(client.$local);
+  });
+
   it("throws PulseClientError on error envelope", async () => {
     const fetchMock = vi.fn(
       async (_url: string | URL | Request, _init?: RequestInit) =>
