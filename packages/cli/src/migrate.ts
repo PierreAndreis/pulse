@@ -114,6 +114,86 @@ export function migrationTag(idx: number, name: string): string {
   return `${String(idx).padStart(4, "0")}_${slug}`;
 }
 
+/** A migration file read from disk: its sequence index, tag, SQL, and content hash. */
+export interface OnDiskMigration {
+  idx: number;
+  tag: string;
+  sql: string;
+  hash: string;
+}
+
+/** The minimal Postgres client surface the migration runner needs — a structural
+ *  subset of node-postgres' `Client`, so the runner can be unit-tested with a fake. */
+export interface MigrationClient {
+  query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }>;
+}
+
+/** Ensure the journal table exists and return the applied migrations as tag → hash. */
+export async function readAppliedMigrations(client: MigrationClient): Promise<Map<string, string>> {
+  await client.query(
+    "create table if not exists _pulse_migrations (" +
+      "tag text primary key, hash text not null, applied_at timestamptz not null default now())",
+  );
+  const res = await client.query("select tag, hash from _pulse_migrations");
+  return new Map((res.rows as { tag: string; hash: string }[]).map((r) => [r.tag, r.hash]));
+}
+
+/** Apply every not-yet-recorded migration in order, each in its own transaction.
+ *  Refuses if an already-applied file's SQL changed (hash drift) — applied
+ *  migrations are immutable; add a new one instead. `onApplied` is invoked per
+ *  applied tag (for progress output). Returns how many ran. */
+export async function applyPending(
+  client: MigrationClient,
+  migrations: OnDiskMigration[],
+  onApplied?: (tag: string) => void,
+): Promise<number> {
+  const applied = await readAppliedMigrations(client);
+  let count = 0;
+  for (const m of migrations) {
+    const recorded = applied.get(m.tag);
+    if (recorded !== undefined) {
+      if (recorded !== m.hash) {
+        throw new Error(
+          `migration ${m.tag} was already applied but its file changed (${recorded} → ${m.hash}). ` +
+            `Never edit an applied migration — add a new one instead.`,
+        );
+      }
+      continue;
+    }
+    await client.query("begin");
+    try {
+      await client.query(m.sql);
+      await client.query("insert into _pulse_migrations (tag, hash) values ($1, $2)", [m.tag, m.hash]);
+      await client.query("commit");
+    } catch (e) {
+      await client.query("rollback");
+      throw new Error(`migration ${m.tag} failed: ${(e as Error).message}`);
+    }
+    onApplied?.(m.tag);
+    count++;
+  }
+  return count;
+}
+
+/** A migration's state relative to the journal: recorded with a matching hash
+ *  (`applied`), not yet recorded (`pending`), or recorded but the file's SQL no
+ *  longer matches (`drift` — someone edited an applied migration). */
+export type MigrationState = "applied" | "pending" | "drift";
+
+/** Classify each migration against the applied-journal (pure — no DB). */
+export function migrationStates(
+  migrations: OnDiskMigration[],
+  applied: ReadonlyMap<string, string>,
+): { tag: string; state: MigrationState }[] {
+  return migrations.map((m) => {
+    const rec = applied.get(m.tag);
+    return {
+      tag: m.tag,
+      state: rec === undefined ? "pending" : rec === m.hash ? "applied" : "drift",
+    };
+  });
+}
+
 /** Deterministic short hash of a migration's SQL (FNV-1a, no deps), so an edit to
  *  an already-applied file can be detected as drift at `deploy` time. */
 export function hashSql(sql: string): string {

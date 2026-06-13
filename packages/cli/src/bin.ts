@@ -24,11 +24,15 @@ import {
   type IndexColumnRow,
 } from "./diff.js";
 import {
+  applyPending,
   diffAgainstSnapshot,
   hashSql,
+  migrationStates,
   migrationTag,
+  readAppliedMigrations,
   renderMigration,
   schemaToSnapshot,
+  type OnDiskMigration,
   type Snapshot,
 } from "./migrate.js";
 
@@ -344,13 +348,6 @@ function migrationsDirFor(schemaPath: string): string {
   return resolve(dirname(schemaPath), "migrations");
 }
 
-interface OnDiskMigration {
-  idx: number;
-  tag: string;
-  sql: string;
-  hash: string;
-}
-
 /** Read every `NNNN_name.sql` migration in order (with its content hash). */
 async function readMigrations(dir: string): Promise<OnDiskMigration[]> {
   let names: string[];
@@ -379,47 +376,8 @@ async function readLastSnapshot(dir: string): Promise<Snapshot | null> {
   return last ? (JSON.parse(await readFile(resolve(dir, "meta", last), "utf8")) as Snapshot) : null;
 }
 
-/** Ensure the journal table and return the applied migrations as tag → hash. */
-async function appliedMigrations(client: PgClient): Promise<Map<string, string>> {
-  await client.query(
-    "create table if not exists _pulse_migrations (" +
-      "tag text primary key, hash text not null, applied_at timestamptz not null default now())",
-  );
-  const res = await client.query("select tag, hash from _pulse_migrations");
-  return new Map((res.rows as { tag: string; hash: string }[]).map((r) => [r.tag, r.hash]));
-}
-
-/** Apply every not-yet-recorded migration in order, each in its own transaction.
- *  Refuses if an already-applied file's SQL changed (hash drift) — applied
- *  migrations are immutable; add a new one instead. Returns how many ran. */
-async function applyPending(client: PgClient, migrations: OnDiskMigration[]): Promise<number> {
-  const applied = await appliedMigrations(client);
-  let count = 0;
-  for (const m of migrations) {
-    const recorded = applied.get(m.tag);
-    if (recorded !== undefined) {
-      if (recorded !== m.hash) {
-        throw new Error(
-          `migration ${m.tag} was already applied but its file changed (${recorded} → ${m.hash}). ` +
-            `Never edit an applied migration — add a new one instead.`,
-        );
-      }
-      continue;
-    }
-    await client.query("begin");
-    try {
-      await client.query(m.sql);
-      await client.query("insert into _pulse_migrations (tag, hash) values ($1, $2)", [m.tag, m.hash]);
-      await client.query("commit");
-    } catch (e) {
-      await client.query("rollback");
-      throw new Error(`migration ${m.tag} failed: ${(e as Error).message}`);
-    }
-    process.stdout.write(`pulse: applied ${m.tag}\n`);
-    count++;
-  }
-  return count;
-}
+/** Write a `pulse: applied <tag>` progress line as each migration runs. */
+const logApplied = (tag: string): void => void process.stdout.write(`pulse: applied ${tag}\n`);
 
 /** `pulse migrate dev [name]` — generate a migration from the schema diff (if the
  *  schema changed), apply all pending migrations to the dev database, and
@@ -459,7 +417,7 @@ async function migrateDev(
 
   const client = await connectPg(databaseUrl);
   try {
-    const n = await applyPending(client, await readMigrations(dir));
+    const n = await applyPending(client, await readMigrations(dir), logApplied);
     process.stdout.write(
       n > 0 ? `pulse: dev database up to date (${n} applied).\n` : "pulse: dev database already up to date.\n",
     );
@@ -481,7 +439,7 @@ async function migrateDeploy(dir: string, databaseUrl: string): Promise<void> {
   }
   const client = await connectPg(databaseUrl);
   try {
-    const n = await applyPending(client, migrations);
+    const n = await applyPending(client, migrations, logApplied);
     process.stdout.write(n > 0 ? `pulse: applied ${n} migration(s).\n` : "pulse: database already up to date.\n");
   } finally {
     await client.end();
@@ -497,12 +455,10 @@ async function migrateStatus(dir: string, databaseUrl: string): Promise<void> {
   }
   const client = await connectPg(databaseUrl);
   try {
-    const applied = await appliedMigrations(client);
-    for (const m of migrations) {
-      const rec = applied.get(m.tag);
-      const state =
-        rec === undefined ? "pending" : rec === m.hash ? "applied" : "applied — FILE CHANGED (drift)";
-      process.stdout.write(`  ${m.tag.padEnd(28)} ${state}\n`);
+    const applied = await readAppliedMigrations(client);
+    const labels = { applied: "applied", pending: "pending", drift: "applied — FILE CHANGED (drift)" };
+    for (const { tag, state } of migrationStates(migrations, applied)) {
+      process.stdout.write(`  ${tag.padEnd(28)} ${labels[state]}\n`);
     }
   } finally {
     await client.end();

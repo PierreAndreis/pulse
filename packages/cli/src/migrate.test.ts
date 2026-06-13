@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { defineSchema, defineTable, v } from "@onveloz/pulse-schema";
 import {
+  applyPending,
   diffAgainstSnapshot,
   hashSql,
+  migrationStates,
   migrationTag,
+  readAppliedMigrations,
   renderMigration,
   schemaToSnapshot,
+  type MigrationClient,
+  type OnDiskMigration,
   type Snapshot,
 } from "./migrate.js";
 
@@ -120,6 +125,116 @@ describe("snapshot persistence", () => {
     const round: Snapshot = JSON.parse(JSON.stringify(snap));
     expect(round).toEqual(snap);
     expect(diffAgainstSnapshot(v1, round).additive).toHaveLength(0);
+  });
+});
+
+// A fake Postgres client for the migration runner: an in-memory `_pulse_migrations`
+// journal, an ordered log of every SQL it saw (to assert tx wrapping), and an
+// optional substring that makes a migration's SQL throw (to exercise rollback).
+class FakeClient implements MigrationClient {
+  journal = new Map<string, string>();
+  log: string[] = [];
+  failOn?: string;
+  async query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> {
+    this.log.push(sql);
+    if (/^create table if not exists _pulse_migrations/.test(sql)) return { rows: [] };
+    if (/^select tag, hash from _pulse_migrations/.test(sql)) {
+      return { rows: [...this.journal].map(([tag, hash]) => ({ tag, hash })) };
+    }
+    if (sql === "begin" || sql === "commit" || sql === "rollback") return { rows: [] };
+    if (/^insert into _pulse_migrations/.test(sql)) {
+      const [tag, hash] = params as [string, string];
+      this.journal.set(tag, hash);
+      return { rows: [] };
+    }
+    if (this.failOn && sql.includes(this.failOn)) throw new Error("syntax error");
+    return { rows: [] };
+  }
+}
+
+const mig = (idx: number, tag: string, sql: string): OnDiskMigration => ({
+  idx,
+  tag,
+  sql,
+  hash: hashSql(sql),
+});
+
+describe("applyPending (migration runner)", () => {
+  it("applies pending migrations in order, each in a begin/commit tx, and records them", async () => {
+    const c = new FakeClient();
+    const applied: string[] = [];
+    const migs = [mig(0, "0000_a", "create table a ();"), mig(1, "0001_b", "create table b ();")];
+    const n = await applyPending(c, migs, (t) => applied.push(t));
+
+    expect(n).toBe(2);
+    expect(applied).toEqual(["0000_a", "0001_b"]);
+    expect([...c.journal.keys()]).toEqual(["0000_a", "0001_b"]);
+    const begin = c.log.indexOf("begin");
+    expect(c.log.slice(begin, begin + 4)).toEqual([
+      "begin",
+      "create table a ();",
+      "insert into _pulse_migrations (tag, hash) values ($1, $2)",
+      "commit",
+    ]);
+    expect(c.log).not.toContain("rollback");
+  });
+
+  it("is idempotent — a second run applies nothing", async () => {
+    const c = new FakeClient();
+    const migs = [mig(0, "0000_a", "create table a ();")];
+    await applyPending(c, migs);
+    expect(await applyPending(c, migs)).toBe(0);
+  });
+
+  it("skips already-applied migrations and runs only the new ones", async () => {
+    const c = new FakeClient();
+    c.journal.set("0000_a", hashSql("create table a ();"));
+    const migs = [mig(0, "0000_a", "create table a ();"), mig(1, "0001_b", "create table b ();")];
+    const applied: string[] = [];
+    expect(await applyPending(c, migs, (t) => applied.push(t))).toBe(1);
+    expect(applied).toEqual(["0001_b"]);
+  });
+
+  it("throws on hash drift — an applied migration's file was edited", async () => {
+    const c = new FakeClient();
+    c.journal.set("0000_a", hashSql("create table a ();"));
+    const migs = [mig(0, "0000_a", "create table a_edited ();")];
+    await expect(applyPending(c, migs)).rejects.toThrow(/already applied but its file changed/);
+    expect(c.log).not.toContain("begin"); // refuses before running anything
+  });
+
+  it("rolls back and wraps the error when a migration's SQL fails — nothing recorded", async () => {
+    const c = new FakeClient();
+    c.failOn = "explode";
+    const migs = [mig(0, "0000_bad", "explode now;")];
+    await expect(applyPending(c, migs)).rejects.toThrow(/migration 0000_bad failed: syntax error/);
+    expect(c.log).toContain("rollback");
+    expect(c.journal.size).toBe(0);
+  });
+});
+
+describe("migrationStates", () => {
+  it("classifies each migration as applied / pending / drift", () => {
+    const migs = [mig(0, "0000_a", "A;"), mig(1, "0001_b", "B;"), mig(2, "0002_c", "C;")];
+    const applied = new Map([
+      ["0000_a", hashSql("A;")], // matches → applied
+      ["0001_b", "deadbeef"], // recorded but hash differs → drift
+    ]); // 0002_c absent → pending
+    expect(migrationStates(migs, applied)).toEqual([
+      { tag: "0000_a", state: "applied" },
+      { tag: "0001_b", state: "drift" },
+      { tag: "0002_c", state: "pending" },
+    ]);
+  });
+});
+
+describe("readAppliedMigrations", () => {
+  it("ensures the journal table first, then returns the recorded tag → hash", async () => {
+    const c = new FakeClient();
+    c.journal.set("0000_a", "h1");
+    const m = await readAppliedMigrations(c);
+    expect(m.get("0000_a")).toBe("h1");
+    expect(c.log[0]).toMatch(/^create table if not exists _pulse_migrations/);
   });
 });
 
