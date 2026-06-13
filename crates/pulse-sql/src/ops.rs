@@ -1797,6 +1797,105 @@ mod tests {
                 prop_assert_eq!(sql.matches('$').count(), binds.len());
             }
         }
+
+        use std::collections::BTreeMap;
+
+        fn apply_pred(op: PredOp, lhs: i64, rhs: i64) -> bool {
+            match op {
+                PredOp::Eq => lhs == rhs,
+                PredOp::Neq => lhs != rhs,
+                PredOp::Gt => lhs > rhs,
+                PredOp::Gte => lhs >= rhs,
+                PredOp::Lt => lhs < rhs,
+                PredOp::Lte => lhs <= rhs,
+                _ => unreachable!("strategy only emits comparison ops"),
+            }
+        }
+        fn apply_filter(op: FilterOp, lhs: i64, rhs: i64) -> bool {
+            match op {
+                FilterOp::Eq => lhs == rhs,
+                FilterOp::Neq => lhs != rhs,
+                FilterOp::Gt => lhs > rhs,
+                FilterOp::Gte => lhs >= rhs,
+                FilterOp::Lt => lhs < rhs,
+                FilterOp::Lte => lhs <= rhs,
+                _ => unreachable!("lowering of comparison ops only"),
+            }
+        }
+        // Ground truth: evaluate the ORIGINAL expression tree against a row.
+        fn eval_expr(e: &FilterExpr, row: &BTreeMap<String, i64>) -> bool {
+            match e {
+                FilterExpr::Cmp(p) => apply_pred(p.op, row[&p.field], p.value.as_i64().unwrap()),
+                FilterExpr::And { and } => and.iter().all(|c| eval_expr(c, row)),
+                FilterExpr::Or { or } => or.iter().any(|c| eval_expr(c, row)),
+                FilterExpr::Not { not } => !eval_expr(not, row),
+            }
+        }
+        // Evaluate the lowered DNF (OR of AND-groups of conds) against the same row.
+        fn eval_dnf(dnf: &[Vec<Cond>], row: &BTreeMap<String, i64>) -> bool {
+            dnf.iter().any(|group| {
+                group.iter().all(|c| {
+                    let KeyValue::Int(rhs) = &c.value else {
+                        unreachable!("int strategy only produces Int conds")
+                    };
+                    apply_filter(c.op, row[&c.field], *rhs)
+                })
+            })
+        }
+
+        fn arb_cmp_op() -> impl Strategy<Value = PredOp> {
+            prop_oneof![
+                Just(PredOp::Eq),
+                Just(PredOp::Neq),
+                Just(PredOp::Gt),
+                Just(PredOp::Gte),
+                Just(PredOp::Lt),
+                Just(PredOp::Lte),
+            ]
+        }
+        fn arb_int_expr() -> impl Strategy<Value = FilterExpr> {
+            let leaf = (
+                prop::sample::select(vec!["a", "b", "c"]),
+                arb_cmp_op(),
+                0i64..4,
+            )
+                .prop_map(|(f, op, v)| {
+                    FilterExpr::Cmp(Predicate {
+                        field: f.into(),
+                        op,
+                        value: serde_json::json!(v),
+                    })
+                });
+            leaf.prop_recursive(3, 16, 3, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 1..3)
+                        .prop_map(|and| FilterExpr::And { and }),
+                    prop::collection::vec(inner.clone(), 1..3).prop_map(|or| FilterExpr::Or { or }),
+                    inner.prop_map(|e| FilterExpr::Not { not: Box::new(e) }),
+                ]
+            })
+        }
+        fn arb_row() -> impl Strategy<Value = BTreeMap<String, i64>> {
+            (0i64..4, 0i64..4, 0i64..4).prop_map(|(a, b, c)| {
+                BTreeMap::from([
+                    ("a".to_string(), a),
+                    ("b".to_string(), b),
+                    ("c".to_string(), c),
+                ])
+            })
+        }
+
+        proptest! {
+            // The DNF lowering must preserve truth value: distribution + De Morgan +
+            // double-negation can't change which rows the filter selects, or a
+            // reactive query would silently miss (or over-fire on) a row change.
+            #[test]
+            fn dnf_lowering_preserves_truth_value(e in arb_int_expr(), row in arb_row()) {
+                let dnf = expr_dnf(&abc_table(), &e);
+                prop_assume!(dnf.is_some()); // a capped filter degrades to coarse; not a logical claim
+                prop_assert_eq!(eval_expr(&e, &row), eval_dnf(&dnf.unwrap(), &row));
+            }
+        }
     }
 
     fn catalog_messages_channels() -> Catalog {
