@@ -1641,6 +1641,110 @@ mod tests {
         assert_eq!(binds, vec![Some("hi".to_string()), Some("5".to_string())]);
     }
 
+    // ── DNF lowering: the boolean algebra that drives reactive read-set precision.
+    // A bug here means under-invalidation (silently stale reads) or coarse fallback.
+    fn abc_table() -> Table {
+        Table::from_columns(
+            "t",
+            vec![
+                col("a", "a", PgTypeClass::Int8, None),
+                col("b", "b", PgTypeClass::Int8, None),
+                col("c", "c", PgTypeClass::Int8, None),
+            ],
+        )
+    }
+    fn cmp(field: &str, op: PredOp, v: i64) -> FilterExpr {
+        FilterExpr::Cmp(Predicate {
+            field: field.into(),
+            op,
+            value: json!(v),
+        })
+    }
+    fn cond(field: &str, op: FilterOp, v: i64) -> Cond {
+        Cond {
+            field: field.into(),
+            op,
+            value: KeyValue::Int(v),
+        }
+    }
+
+    #[test]
+    fn expr_dnf_distributes_or_over_and() {
+        // (a=1 OR b=2) AND c=3  →  (a=1 AND c=3) OR (b=2 AND c=3)
+        let e = FilterExpr::And {
+            and: vec![
+                FilterExpr::Or {
+                    or: vec![cmp("a", PredOp::Eq, 1), cmp("b", PredOp::Eq, 2)],
+                },
+                cmp("c", PredOp::Eq, 3),
+            ],
+        };
+        assert_eq!(
+            expr_dnf(&abc_table(), &e).unwrap(),
+            vec![
+                vec![cond("a", FilterOp::Eq, 1), cond("c", FilterOp::Eq, 3)],
+                vec![cond("b", FilterOp::Eq, 2), cond("c", FilterOp::Eq, 3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn expr_dnf_de_morgan_negates_and_and_or() {
+        let t = abc_table();
+        // NOT(a=1 AND b=2) = (a<>1) OR (b<>2)
+        let not_and = FilterExpr::Not {
+            not: Box::new(FilterExpr::And {
+                and: vec![cmp("a", PredOp::Eq, 1), cmp("b", PredOp::Eq, 2)],
+            }),
+        };
+        assert_eq!(
+            expr_dnf(&t, &not_and).unwrap(),
+            vec![
+                vec![cond("a", FilterOp::Neq, 1)],
+                vec![cond("b", FilterOp::Neq, 2)],
+            ]
+        );
+        // NOT(a=1 OR b=2) = (a<>1) AND (b<>2)
+        let not_or = FilterExpr::Not {
+            not: Box::new(FilterExpr::Or {
+                or: vec![cmp("a", PredOp::Eq, 1), cmp("b", PredOp::Eq, 2)],
+            }),
+        };
+        assert_eq!(
+            expr_dnf(&t, &not_or).unwrap(),
+            vec![vec![
+                cond("a", FilterOp::Neq, 1),
+                cond("b", FilterOp::Neq, 2)
+            ]]
+        );
+    }
+
+    #[test]
+    fn expr_dnf_double_negation_cancels() {
+        // NOT(NOT(a>5)) = a>5 (not the flipped a<=5)
+        let e = FilterExpr::Not {
+            not: Box::new(FilterExpr::Not {
+                not: Box::new(cmp("a", PredOp::Gt, 5)),
+            }),
+        };
+        assert_eq!(
+            expr_dnf(&abc_table(), &e).unwrap(),
+            vec![vec![cond("a", FilterOp::Gt, 5)]]
+        );
+    }
+
+    #[test]
+    fn expr_dnf_past_the_cap_degrades_to_coarse_none() {
+        // AND of seven 2-way ORs → 2^7 = 128 conjunctions > DNF_CAP(64) → None, so
+        // the caller broadens to a coarse table read instead of a giant OR.
+        let ors: Vec<FilterExpr> = (0..7)
+            .map(|_| FilterExpr::Or {
+                or: vec![cmp("a", PredOp::Eq, 1), cmp("b", PredOp::Eq, 2)],
+            })
+            .collect();
+        assert!(expr_dnf(&abc_table(), &FilterExpr::And { and: ors }).is_none());
+    }
+
     fn catalog_messages_channels() -> Catalog {
         let mut c = Catalog::default();
         c.tables.insert("messages".to_string(), messages_table());
