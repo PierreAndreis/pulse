@@ -577,4 +577,35 @@ mod tests {
         // No reactive change accumulated → commit emits nothing.
         assert!(d.feed(&commit_msg(1)).unwrap().is_none());
     }
+
+    #[test]
+    fn read_tuple_decodes_each_value_kind() {
+        // A pgoutput tuple with one of each column kind: text, null, unchanged
+        // TOAST, and binary. null / unchanged-TOAST / binary all decode to None;
+        // only the text column carries a value.
+        let mut buf = 4i16.to_be_bytes().to_vec();
+        put_text_col(&mut buf, "hi"); // 't'
+        buf.push(b'n'); // null
+        buf.push(b'u'); // unchanged TOAST
+        buf.push(b'b'); // binary value (not indexed → treated as absent)
+        buf.extend_from_slice(&3i32.to_be_bytes());
+        buf.extend_from_slice(&[1u8, 2, 3]);
+
+        let mut r = Reader::new(&buf);
+        let tuple = read_tuple(&mut r).unwrap();
+        assert_eq!(tuple, vec![Some("hi".to_string()), None, None, None]);
+    }
+
+    #[test]
+    fn read_tuple_rejects_an_unknown_column_tag() {
+        // A malformed/unknown tuple tag must surface a clean error, never panic —
+        // the decoder parses replication bytes we don't fully control.
+        let mut buf = 1i16.to_be_bytes().to_vec();
+        buf.push(b'x'); // not n/u/t/b
+        let mut r = Reader::new(&buf);
+        assert!(matches!(
+            read_tuple(&mut r),
+            Err(WalError::BadTupleTag(b'x'))
+        ));
+    }
 }
