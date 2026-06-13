@@ -173,6 +173,25 @@ describe("diffSchema", () => {
     expect(d.destructive).toEqual([]);
   });
 
+  it("emits DROP INDEX when a managed index is removed from the schema", () => {
+    // schema no longer declares any index; the DB still has users_by_email
+    const schema = defineSchema({
+      users: defineTable({ name: v.string(), email: v.string() }),
+    });
+    const d = diffSchema(liveUsers, schema, new Set(["users_pkey", "users_by_email"]));
+    expect(d.additive).toContain("drop index if exists users_by_email;");
+    // never the primary key index
+    expect(d.additive.join("\n")).not.toContain("users_pkey");
+    expect(d.destructive).toEqual([]);
+  });
+
+  it("never drops a primary key or an index on an unmanaged table", () => {
+    // baseSchema still declares users_by_email, so it stays. The live DB also has
+    // a pkey and an index on a table not in the schema — neither must be dropped.
+    const d = diffSchema(liveUsers, baseSchema, new Set(["users_by_email", "users_pkey", "posts_by_slug"]));
+    expect(d.additive.join("\n")).not.toContain("drop index");
+  });
+
   it("renders all three sections with their headers when each is non-empty", () => {
     const schema = defineSchema({
       users: defineTable({ name: v.string(), email: v.string(), age: v.number() }),

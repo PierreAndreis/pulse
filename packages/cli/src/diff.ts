@@ -119,6 +119,7 @@ export function diffSchema(
   const additive: string[] = [];
   const alters: string[] = [];
   const destructive: Drop[] = [];
+  const desiredIndexNames = new Set<string>();
 
   const SYSTEM_COLS = new Set(["_id", "_creation_time"]);
 
@@ -189,10 +190,25 @@ export function diffSchema(
     // empty). A new table has none of its indexes yet → all emitted.
     for (const index of indexes) {
       const name = `${table}_${index.name}`;
+      desiredIndexNames.add(name);
       if (liveIndexes.has(name)) continue;
       const columns = index.columns.map(fieldToColumn).join(", ");
       additive.push(`create index if not exists ${name} on ${table} (${columns});`);
     }
+  }
+
+  // Indexes in the DB/snapshot but no longer in the schema → `DROP INDEX`.
+  // Dropping an index loses no data and is idempotent, so it's additive (auto-
+  // applied), like `CREATE INDEX`. But the live path feeds us *every* index in
+  // the schema — primary keys (`*_pkey`) and engine-managed `_pulse*` indexes
+  // included — so we only drop an index that follows our `<table>_<name>`
+  // convention for a table we manage, and never a primary key.
+  const managedTables = Object.keys(described);
+  for (const name of liveIndexes) {
+    if (desiredIndexNames.has(name)) continue;
+    if (name.endsWith("_pkey")) continue;
+    if (!managedTables.some((t) => name.startsWith(`${t}_`))) continue;
+    additive.push(`drop index if exists ${name};`);
   }
 
   // Tables in the DB but not the schema → destructive. Skip engine-managed

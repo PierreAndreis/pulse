@@ -64,6 +64,16 @@ describe("diffAgainstSnapshot", () => {
     expect(diff.additive).toHaveLength(0);
   });
 
+  it("a removed index is a DROP INDEX against the last snapshot", () => {
+    const prev = schemaToSnapshot(v1); // snapshot has index widgets_by_qty
+    const v2 = defineSchema({
+      widgets: defineTable({ name: v.string(), qty: v.int(), tag: v.optional(v.string()) }),
+    });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.additive).toEqual(["drop index if exists widgets_by_qty;"]);
+    expect(diff.destructive).toHaveLength(0);
+  });
+
   it("no schema change against its own snapshot yields an empty diff", () => {
     const diff = diffAgainstSnapshot(v1, schemaToSnapshot(v1));
     expect(diff.additive).toHaveLength(0);
