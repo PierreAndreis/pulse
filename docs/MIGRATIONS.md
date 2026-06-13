@@ -23,7 +23,7 @@ For a team / production, generate committed, editable SQL migrations:
 ```bash
 pulse migrate dev <name>      # diff schema vs the last snapshot → migrations/NNNN_<name>.sql,
                               # then apply it (and any pending) to the dev DB, and regen the model
-pulse migrate deploy          # apply pending files in order — no prompts (CI / production)
+pulse migrate deploy          # apply pending files in order, no prompts (CI / production)
 pulse migrate status          # list each migration: applied / pending / drifted
 ```
 
@@ -39,17 +39,19 @@ migrations/
 ```
 
 **How `generate` works.** It diffs the current schema against the **last
-snapshot**, not the database — so it needs no DB and is deterministic. Additive
-and type/nullability changes are written live; destructive drops are commented
-out by default, so nothing is lost unless you uncomment it. Edit the SQL freely —
-turn a drop+add into a rename, add a data backfill, etc. The file is the source
-of truth.
+snapshot**, not the database, so it needs no DB and is deterministic. Additive
+and type/nullability changes are written live; index removal and index
+redefinition (an index that keeps its name but changes columns) are generated as
+`drop`/`create`; destructive column and table drops are commented out by default,
+so nothing is lost unless you uncomment them. Edit the SQL freely: turn a
+drop+add into a rename, add a data backfill, etc. The file is the source of
+truth.
 
 **How `deploy` works.** It runs each migration file not yet recorded, in order,
 each in a transaction, writing its name + content hash to a `_pulse_migrations`
 journal table. It's idempotent (safe to re-run) and refuses if a migration that
-was already applied has since been edited (hash drift) — applied migrations are
-immutable; add a new one instead.
+was already applied has since been edited (hash drift): applied migrations are
+immutable, so add a new one instead.
 
 Commit `migrations/` to git. `app/_generated/` is regenerated on `migrate dev` /
 `pulse dev` and is gitignored.
