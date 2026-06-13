@@ -256,6 +256,32 @@ describe("SSE resume (Last-Event-ID / resync)", () => {
     expect(client.lastEventId).toBe(1); // adopted the server's stream position
   });
 
+  test("a resync after a server restart (id below lastEventId) is not dropped by the dedup guard", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      throw new Error("no network");
+    });
+    const { client } = makeClient({ fetch: fetchMock as unknown as ClientOptions["fetch"] });
+    client.connected = true;
+    client.ensure(["messages", "list"], { channelId: "c1" });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The stream advances to a high id.
+    client.handleEvent(frame(10, { sub: "messages.list::c1", data: [1] }));
+    expect(client.lastEventId).toBe(10);
+    fetchMock.mockClear();
+
+    // The server restarts: its stream ids reset, so the resync's id (2) is BELOW
+    // ours (10). Because resync is handled before the replay/duplicate guard, it
+    // must still re-register everything (otherwise the client is stuck forever).
+    client.handleEvent(frame(2, { type: "resync" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const subs = fetchMock.mock.calls.filter((c) => String(c[0]).endsWith("/subscribe"));
+    expect(subs).toHaveLength(1); // re-registered despite the lower id
+    expect(client.lastEventId).toBe(2); // adopted the restarted stream position
+  });
+
   test("a resync frame does not write confirmed data (it carries no sub)", () => {
     const { client, calls } = makeClient();
     client.handleEvent(frame(1, { type: "resync" }));
