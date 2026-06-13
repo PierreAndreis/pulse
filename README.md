@@ -40,8 +40,10 @@ puts the reactive programming model and end-to-end-typed DX on top of it:
   and your schema with runtime validators that double as types.
 - 🔗 **Call with zero codegen.** The client is inferred straight from your
   contract — an oRPC-style API that plugs into TanStack Query.
-- ⚡ **Realtime by default.** Reactive queries re-run and push over SSE only when
-  a write actually touches their read-set — precise, not table-wide.
+- ⚡ **Realtime by default.** Reactive queries push over SSE only when a write
+  actually touches their read-set (precise, not table-wide), and aggregates like
+  `count`/`sum`/`min`/`max`/`avg` are maintained incrementally from the change
+  delta with no worker re-execution.
 - 📴 **Local-first.** A durable IndexedDB offline queue, optimistic overlay with
   rebase, and a persisted read cache mean the UI works with the server down.
 - 🔒 **Correct under contention.** Mutations are atomic and `SERIALIZABLE` with
@@ -113,13 +115,20 @@ pnpm pulse dev packages/examples-chat/src/app.ts
 ## The CLI
 
 ```
-pulse new <name>                          scaffold a fully-configured app
-pulse gen <schema.ts> [out.ts]            generate the Doc/Id data model
-pulse migrate <schema.ts> [--out f.sql]   idempotent DDL from a schema
-pulse migrate <schema.ts> --diff          diff schema vs the live DB → migration
-pulse dev <app.ts> [--port P]             run the engine against an app
-pulse deploy <app.ts> [--out dir]         build a release bundle (schema + run)
+pulse new <name>                  scaffold a fully-configured app
+pulse gen [schema.ts]             generate the Doc/Id data model
+pulse migrate dev [name]          create a migration from the schema diff, then apply it
+                                  (--create-only writes the file without applying)
+pulse migrate deploy              apply pending migrations in order (CI / production)
+pulse migrate status              show each migration as applied / pending / drifted
+pulse db push                     sync the schema straight to the DB, no files (fast loop)
+pulse dev [app.ts]                run the engine + worker against an app
+pulse start [app.ts]              run the engine in production (after migrate deploy)
+pulse deploy [app.ts]             build a release bundle
 ```
+
+Migrations are file-based and editable, Prisma/Drizzle style. See
+[`docs/MIGRATIONS.md`](docs/MIGRATIONS.md).
 
 ## Project layout
 
@@ -141,7 +150,7 @@ packages/              TypeScript workspace — the SDK
   @pulse/client        createClient inference, local-first, offline queue
   @pulse/react         TanStack Query React bindings
   @pulse/runtime-node  the handler/action worker entrypoint
-  @pulse/cli           pulse gen | migrate | dev | deploy
+  @pulse/cli           pulse new | gen | migrate dev/deploy/status | db push | dev | start
   @pulse/examples-chat end-to-end example app
 ```
 
