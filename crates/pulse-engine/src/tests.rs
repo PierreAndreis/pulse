@@ -307,6 +307,61 @@ async fn mode_b_dedups_wal_echo_but_applies_out_of_band_writes() {
     assert_eq!(r.coord.metrics().deduped.load(SeqCst), 1, "no extra dedup");
 }
 
+// The dedup marker is CONSUMED by one echo (`one echo per write`), not matched
+// forever — so a later out-of-band write that happens to be byte-identical to a
+// past in-engine write is still applied, never silently swallowed.
+#[tokio::test]
+async fn dedup_marker_is_consumed_so_an_identical_later_write_still_applies() {
+    let exec = Arc::new(FakeExecutor::reads(
+        &["messages", "list"],
+        json!([]),
+        channel_filter("c1"),
+    ));
+    let r = rig(exec);
+    let mut rx = r.coord.register_client("a".into()).await;
+    r.reactor
+        .add_subscription(Subscription {
+            client_id: "a".into(),
+            sub: "messages.list::c1".into(),
+            path: vec!["messages".into(), "list".into()],
+            input: json!({ "channelId": "c1" }),
+            headers: HashMap::new(),
+            read_set: channel_filter("c1"),
+            last: Some(json!({ "n": 0 })),
+            agg_state: None,
+            last_lsn: Lsn::ZERO,
+        })
+        .await;
+
+    let change = insert_into_key("c1", 1);
+
+    // In-engine write → records exactly one dedup marker, pushes once.
+    r.coord.propagate(stamp(vec![change.clone()])).await;
+    assert!(recv(&mut rx).await.is_some());
+
+    // Its WAL echo consumes that one marker → deduped, no push.
+    r.coord
+        .apply_wal(stamp(vec![change.clone()]), Some(0))
+        .await;
+    assert!(recv(&mut rx).await.is_none());
+    assert_eq!(r.coord.metrics().deduped.load(SeqCst), 1);
+
+    // A LATER byte-identical write (e.g. raw SQL setting the same row again) finds
+    // no marker (it was consumed) → it must apply, not be swallowed as an echo.
+    r.coord
+        .apply_wal(stamp(vec![change.clone()]), Some(0))
+        .await;
+    assert!(
+        recv(&mut rx).await.is_some(),
+        "an identical write after the echo is applied, not over-deduped"
+    );
+    assert_eq!(
+        r.coord.metrics().deduped.load(SeqCst),
+        1,
+        "the marker is consumed once, never reused"
+    );
+}
+
 #[tokio::test]
 async fn read_with_no_changes_does_not_propagate() {
     let exec = Arc::new(FakeExecutor::reads(
