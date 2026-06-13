@@ -1862,6 +1862,7 @@ name = "pulse-sql"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "proptest",
  "pulse-collab",
  "pulse-core",
  "serde",

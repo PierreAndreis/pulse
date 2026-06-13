@@ -1745,6 +1745,60 @@ mod tests {
         assert!(expr_dnf(&abc_table(), &FilterExpr::And { and: ors }).is_none());
     }
 
+    // Property: render_expr is injection-safe for ANY filter shape. Values (which
+    // may contain quotes/semicolons) are always `$N` binds, never inlined — so the
+    // rendered SQL can never contain a single quote, and there's exactly one
+    // placeholder per bind. The example test pins one payload; this pins the shape.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_op() -> impl Strategy<Value = PredOp> {
+            prop_oneof![
+                Just(PredOp::Eq),
+                Just(PredOp::Neq),
+                Just(PredOp::Like),
+                Just(PredOp::Ilike),
+                Just(PredOp::IsNull),
+                Just(PredOp::IsNotNull),
+            ]
+        }
+
+        fn arb_expr() -> impl Strategy<Value = FilterExpr> {
+            // Leaf: a comparison on the text column `s` with an arbitrary printable
+            // value (may include ' ; -- and other injection metacharacters).
+            let leaf = (arb_op(), "[\\x20-\\x7e]{0,12}").prop_map(|(op, v)| {
+                FilterExpr::Cmp(Predicate {
+                    field: "s".into(),
+                    op,
+                    value: serde_json::json!(v),
+                })
+            });
+            leaf.prop_recursive(4, 24, 4, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 1..4)
+                        .prop_map(|and| FilterExpr::And { and }),
+                    prop::collection::vec(inner.clone(), 1..4).prop_map(|or| FilterExpr::Or { or }),
+                    inner.prop_map(|e| FilterExpr::Not { not: Box::new(e) }),
+                ]
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn render_expr_never_inlines_a_value(e in arb_expr()) {
+                let t = Table::from_columns("t", vec![col("s", "s", PgTypeClass::Text, None)]);
+                let mut binds = Vec::new();
+                let sql = render_expr(&e, &t, &mut binds).expect("text column always renders");
+                // No value is inlined as a literal, so no single quote can appear:
+                // a quote/semicolon payload in a value cannot break out of a bind.
+                prop_assert!(!sql.contains('\''), "value was inlined into SQL: {}", sql);
+                // Exactly one `$N` placeholder per bound value.
+                prop_assert_eq!(sql.matches('$').count(), binds.len());
+            }
+        }
+    }
+
     fn catalog_messages_channels() -> Catalog {
         let mut c = Catalog::default();
         c.tables.insert("messages".to_string(), messages_table());
