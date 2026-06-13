@@ -326,9 +326,9 @@ describe("ORM reactivity is precise", () => {
     }
   });
 
-  test("a filtered count() update is served by IVM and delivered (ivmPushed++)", async () => {
+  test("filtered count() updates are served by IVM and delivered (ivmPushed++)", async () => {
     // `ivmPushed` counts maintained values the reactor actually *pushed* to a
-    // client (post diff-suppression) — a server-confirmed delivery decision. We
+    // client (post diff-suppression): a server-confirmed delivery decision. We
     // gate on it rather than on the client SSE arrival, whose final hop can lag
     // under CI load (the source of a prior flake); it's also stronger than
     // `ivmApplied`, which counts IVM matches before suppression.
@@ -342,22 +342,28 @@ describe("ORM reactivity is precise", () => {
     try {
       await waitFor(() => counts.length >= 1); // initial snapshot (a real re-exec)
       const before = await metrics();
-      const initial = counts.at(-1);
-      // A matching write: the count is maintained from the change delta — the
-      // reactor never calls the worker (ivmApplied++) and pushes it (ivmPushed++).
-      await c.w.addWidget.call({ name: "ivm-z", qty: 1, active: true });
+      // Drive several matching writes. Each enters the filter and bumps the count
+      // to a NEW value, so none diff-suppresses; a filtered count is maintained
+      // from the delta with no worker re-exec, so the reactor pushes each
+      // (ivmPushed++). We drive a few rather than one because the very first write
+      // after a fresh subscription can race column-interest registration and fall
+      // back to a single re-exec; the rest are IVM-served.
+      for (let i = 0; i < 5; i++) {
+        await c.w.addWidget.call({ name: `ivm-${i}`, qty: 1, active: true });
+        await new Promise((r) => setTimeout(r, 100));
+      }
       const deadline = Date.now() + 15000;
       while (Date.now() < deadline && (await metrics()).ivmPushed <= before.ivmPushed) {
         await new Promise((r) => setTimeout(r, 50));
       }
       const after = await metrics();
-      expect(after.ivmPushed).toBeGreaterThan(before.ivmPushed); // maintained AND delivered
-      expect(after.ivmApplied).toBeGreaterThan(before.ivmApplied); // via IVM, not re-exec
-      // Best-effort: the pushed value also reaches this client over SSE. Truly
-      // non-gating — delivery of a maintained count is already proven server-side
-      // above and gated end-to-end by the sibling tests; the final client hop can
-      // lag past any fixed bound under CI load, so a timeout here must not fail.
-      await waitFor(() => counts.at(-1) !== initial, 5000).catch(() => {});
+      expect(after.ivmPushed).toBeGreaterThan(before.ivmPushed); // maintained AND delivered, via IVM
+      expect(after.ivmApplied).toBeGreaterThan(before.ivmApplied); // not a worker re-exec
+      // Best-effort: the maintained value also reaches this client over SSE. Truly
+      // non-gating — delivery is proven server-side above and gated end-to-end by
+      // the sibling tests; the final client hop can lag under CI load, so a timeout
+      // here must not fail.
+      await waitFor(() => counts.at(-1)! >= 1, 5000).catch(() => {});
     } finally {
       unsub();
     }
