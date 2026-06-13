@@ -4,7 +4,9 @@ import {
   diffSchema,
   isEmptyDiff,
   parseLiveColumns,
+  parseLiveIndexes,
   renderDiff,
+  type IndexColumnRow,
   type InfoSchemaRow,
   type LiveSchema,
 } from "./diff.js";
@@ -42,14 +44,14 @@ describe("parseLiveColumns", () => {
 
 describe("diffSchema", () => {
   it("is empty when the live DB already matches the schema", () => {
-    const d = diffSchema(liveUsers, baseSchema, new Set(["users_by_email"]));
+    const d = diffSchema(liveUsers, baseSchema, new Map([["users_by_email", ["email"]]]));
     expect(isEmptyDiff(d)).toBe(true);
     expect(renderDiff(d)).toContain("no changes");
   });
 
   it("emits CREATE INDEX only for an index the DB lacks", () => {
     // same columns, but the index doesn't exist yet → emitted
-    const d = diffSchema(liveUsers, baseSchema, new Set());
+    const d = diffSchema(liveUsers, baseSchema, new Map());
     expect(d.additive.join("\n")).toContain("create index if not exists users_by_email");
     expect(d.additive.length).toBe(1); // ONLY the index, no spurious column work
   });
@@ -101,7 +103,7 @@ describe("diffSchema", () => {
         email: { type: "text", notNull: true },
       },
     };
-    const d = diffSchema(live, baseSchema, new Set(["users_by_email"]));
+    const d = diffSchema(live, baseSchema, new Map([["users_by_email", ["email"]]]));
     expect(isEmptyDiff(d)).toBe(true);
   });
 
@@ -159,7 +161,7 @@ describe("diffSchema", () => {
         email: { type: "text", notNull: false }, // schema email is non-optional v.string()
       },
     };
-    const d = diffSchema(live, baseSchema, new Set(["users_by_email"]));
+    const d = diffSchema(live, baseSchema, new Map([["users_by_email", ["email"]]]));
     expect(d.alters.join("\n")).toContain("review: users.email should be NOT NULL");
   });
 
@@ -168,7 +170,7 @@ describe("diffSchema", () => {
       ...liveUsers,
       _pulse_mutations: { _id: { type: "uuid", notNull: true } },
     };
-    const d = diffSchema(live, baseSchema, new Set(["users_by_email"]));
+    const d = diffSchema(live, baseSchema, new Map([["users_by_email", ["email"]]]));
     expect(d.destructive).not.toContainEqual({ kind: "table", table: "_pulse_mutations" });
     expect(d.destructive).toEqual([]);
   });
@@ -178,17 +180,49 @@ describe("diffSchema", () => {
     const schema = defineSchema({
       users: defineTable({ name: v.string(), email: v.string() }),
     });
-    const d = diffSchema(liveUsers, schema, new Set(["users_pkey", "users_by_email"]));
+    const d = diffSchema(
+      liveUsers,
+      schema,
+      new Map([
+        ["users_pkey", ["_id"]],
+        ["users_by_email", ["email"]],
+      ]),
+    );
     expect(d.additive).toContain("drop index if exists users_by_email;");
     // never the primary key index
     expect(d.additive.join("\n")).not.toContain("users_pkey");
     expect(d.destructive).toEqual([]);
   });
 
+  it("re-creates an index that kept its name but changed columns", () => {
+    // live users_by_email covers (name); the schema's index covers (email)
+    const d = diffSchema(liveUsers, baseSchema, new Map([["users_by_email", ["name"]]]));
+    expect(d.additive).toContain("drop index if exists users_by_email;");
+    expect(d.additive).toContain("create index if not exists users_by_email on users (email);");
+    // drop precedes the re-create
+    expect(d.additive.indexOf("drop index if exists users_by_email;")).toBeLessThan(
+      d.additive.indexOf("create index if not exists users_by_email on users (email);"),
+    );
+  });
+
+  it("does not re-create an index whose columns are unknown (legacy snapshot)", () => {
+    // empty column list = "columns unknown" → treated as a match, no churn
+    const d = diffSchema(liveUsers, baseSchema, new Map([["users_by_email", []]]));
+    expect(isEmptyDiff(d)).toBe(true);
+  });
+
   it("never drops a primary key or an index on an unmanaged table", () => {
     // baseSchema still declares users_by_email, so it stays. The live DB also has
     // a pkey and an index on a table not in the schema — neither must be dropped.
-    const d = diffSchema(liveUsers, baseSchema, new Set(["users_by_email", "users_pkey", "posts_by_slug"]));
+    const d = diffSchema(
+      liveUsers,
+      baseSchema,
+      new Map([
+        ["users_by_email", ["email"]],
+        ["users_pkey", ["_id"]],
+        ["posts_by_slug", ["slug"]],
+      ]),
+    );
     expect(d.additive.join("\n")).not.toContain("drop index");
   });
 
@@ -208,5 +242,27 @@ describe("diffSchema", () => {
     expect(out).toContain("additive (safe to apply)");
     expect(out).toContain("alters (review before applying)");
     expect(out).toContain("destructive (auto-applied only when empty; else review)");
+  });
+});
+
+describe("parseLiveIndexes", () => {
+  it("groups index-column rows into name → ordered columns", () => {
+    const rows: IndexColumnRow[] = [
+      { indexname: "widgets_by_qty_name", column_name: "qty", ord: 1 },
+      { indexname: "widgets_by_qty_name", column_name: "name", ord: 2 },
+      { indexname: "widgets_pkey", column_name: "_id", ord: 1 },
+    ];
+    const map = parseLiveIndexes(rows);
+    expect(map.get("widgets_by_qty_name")).toEqual(["qty", "name"]); // order preserved
+    expect(map.get("widgets_pkey")).toEqual(["_id"]);
+  });
+
+  it("keeps an expression-member index present but with its null column skipped", () => {
+    const rows: IndexColumnRow[] = [
+      { indexname: "widgets_expr", column_name: null, ord: 1 },
+      { indexname: "widgets_expr", column_name: "qty", ord: 2 },
+    ];
+    const map = parseLiveIndexes(rows);
+    expect(map.get("widgets_expr")).toEqual(["qty"]);
   });
 });

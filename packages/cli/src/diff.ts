@@ -16,6 +16,13 @@ export interface LiveColumn {
 /** The live database shape: table → column name → column info. */
 export type LiveSchema = Record<string, Record<string, LiveColumn>>;
 
+/** Indexes already present in the DB/snapshot: index name → its ordered column
+ *  names (e.g. "users_by_email" → ["email"]). Columns let us notice when an
+ *  index keeps its name but changes which columns it covers. An empty column
+ *  list means "columns unknown" (e.g. a legacy snapshot) — treated as a match so
+ *  we never spuriously re-create. */
+export type LiveIndexes = ReadonlyMap<string, readonly string[]>;
+
 /** A single information_schema.columns row (the subset we read). */
 export interface InfoSchemaRow {
   table_name: string;
@@ -90,6 +97,12 @@ export interface SchemaDiff {
   destructive: Drop[];
 }
 
+/** Whether two index column lists are identical (order-sensitive — `(a, b)` is a
+ *  different index from `(b, a)`). */
+function sameColumns(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((c, i) => c === b[i]);
+}
+
 /** True when there is nothing to apply. */
 export function isEmptyDiff(d: SchemaDiff): boolean {
   return d.additive.length === 0 && d.alters.length === 0 && d.destructive.length === 0;
@@ -111,9 +124,10 @@ export function isEmptyDiff(d: SchemaDiff): boolean {
 export function diffSchema(
   live: LiveSchema,
   schema: SchemaDefinition<Record<string, AnyTableDefinition>>,
-  /** Names of indexes already present in the DB (e.g. "users_by_email"), so an
-   *  existing index isn't re-emitted and a matching DB shows an empty diff. */
-  liveIndexes: ReadonlySet<string> = new Set(),
+  /** Indexes already present in the DB/snapshot (name → its columns), so an
+   *  existing index isn't re-emitted, a matching DB shows an empty diff, and a
+   *  same-name column change is re-created rather than silently kept. */
+  liveIndexes: LiveIndexes = new Map(),
 ): SchemaDiff {
   const described = schema.describe();
   const additive: string[] = [];
@@ -191,9 +205,16 @@ export function diffSchema(
     for (const index of indexes) {
       const name = `${table}_${index.name}`;
       desiredIndexNames.add(name);
-      if (liveIndexes.has(name)) continue;
-      const columns = index.columns.map(fieldToColumn).join(", ");
-      additive.push(`create index if not exists ${name} on ${table} (${columns});`);
+      const wantCols = index.columns.map(fieldToColumn);
+      const create = `create index if not exists ${name} on ${table} (${wantCols.join(", ")});`;
+      const liveCols = liveIndexes.get(name);
+      if (!liveCols) {
+        additive.push(create); // index doesn't exist yet
+      } else if (liveCols.length > 0 && !sameColumns(liveCols, wantCols)) {
+        // Same name, different columns → drop the stale definition and re-create.
+        additive.push(`drop index if exists ${name};`, create);
+      }
+      // else: present with matching (or unknown) columns → leave it.
     }
   }
 
@@ -204,7 +225,7 @@ export function diffSchema(
   // included — so we only drop an index that follows our `<table>_<name>`
   // convention for a table we manage, and never a primary key.
   const managedTables = Object.keys(described);
-  for (const name of liveIndexes) {
+  for (const name of liveIndexes.keys()) {
     if (desiredIndexNames.has(name)) continue;
     if (name.endsWith("_pkey")) continue;
     if (!managedTables.some((t) => name.startsWith(`${t}_`))) continue;
@@ -249,6 +270,36 @@ export const INTROSPECT_SQL =
   "FROM information_schema.columns WHERE table_schema = 'public' " +
   "ORDER BY table_name, ordinal_position";
 
-/** SQL that lists existing index names in the public schema. */
+/** A single index-column row from {@link INTROSPECT_INDEXES_SQL}. */
+export interface IndexColumnRow {
+  indexname: string;
+  /** A column the index covers (null for an expression member, which we skip). */
+  column_name: string | null;
+  /** 1-based position of this column within the index. */
+  ord: number;
+}
+
+/** SQL that lists each public-schema index with its ordered columns. One row per
+ *  (index, column); `unnest … WITH ORDINALITY` preserves column order, and the
+ *  `attnum = ANY(indkey)` join drops expression members (attnum 0). */
 export const INTROSPECT_INDEXES_SQL =
-  "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'";
+  "SELECT ic.relname AS indexname, a.attname AS column_name, k.ord AS ord " +
+  "FROM pg_index ix " +
+  "JOIN pg_class ic ON ic.oid = ix.indexrelid " +
+  "JOIN pg_class tc ON tc.oid = ix.indrelid " +
+  "JOIN pg_namespace n ON n.oid = tc.relnamespace " +
+  "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true " +
+  "LEFT JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = k.attnum " +
+  "WHERE n.nspname = 'public' " +
+  "ORDER BY ic.relname, k.ord";
+
+/** Build a {@link LiveIndexes} map (index name → ordered columns) from the rows
+ *  returned by {@link INTROSPECT_INDEXES_SQL}. */
+export function parseLiveIndexes(rows: IndexColumnRow[]): Map<string, string[]> {
+  const byName = new Map<string, string[]>();
+  for (const r of rows) {
+    const cols = byName.get(r.indexname) ?? byName.set(r.indexname, []).get(r.indexname)!;
+    if (r.column_name !== null) cols.push(r.column_name);
+  }
+  return byName;
+}

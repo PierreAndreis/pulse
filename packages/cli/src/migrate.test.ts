@@ -27,6 +27,7 @@ describe("schemaToSnapshot", () => {
     expect(cols.qty).toEqual({ type: "bigint", notNull: true }); // v.int → bigint
     expect(cols.tag).toEqual({ type: "text", notNull: false }); // optional
     expect(snap.indexes).toEqual(["widgets_by_qty"]);
+    expect(snap.indexColumns).toEqual({ widgets_by_qty: ["qty"] });
   });
 });
 
@@ -257,9 +258,23 @@ describe("prisma-derived scenarios", () => {
     expect(diff.additive.join("\n")).not.toContain("drop index");
   });
 
-  // indexes.rs::index_updates_with_rename_must_work — Prisma detects when an
-  // index keeps its NAME but changes its COLUMNS and re-creates it. Our snapshot
-  // stores only index NAMES (not their columns), so a same-name column change is
-  // currently invisible. KNOWN GAP — same class as the (now-fixed) drop gap.
-  it.todo("redefining an index's columns under the same name re-creates it");
+  // indexes.rs::index_updates_with_rename_must_work — an index that keeps its
+  // NAME but changes its COLUMNS is dropped and re-created. The snapshot records
+  // each index's columns, so the change is no longer invisible.
+  it("redefining an index's columns under the same name re-creates it", () => {
+    const prev = schemaToSnapshot(
+      defineSchema({
+        widgets: defineTable({ name: v.string(), qty: v.int() }).index("by_it", ["qty"]),
+      }),
+    );
+    const v2 = defineSchema({
+      widgets: defineTable({ name: v.string(), qty: v.int() }).index("by_it", ["name"]), // qty → name
+    });
+    const diff = diffAgainstSnapshot(v2, prev);
+    expect(diff.additive).toEqual([
+      "drop index if exists widgets_by_it;",
+      "create index if not exists widgets_by_it on widgets (name);",
+    ]);
+    expect(diff.destructive).toHaveLength(0);
+  });
 });

@@ -23,9 +23,13 @@ export interface Snapshot {
   version: 1;
   columns: LiveSchema;
   indexes: string[];
+  /** Index name → its ordered columns, so a same-name column change is noticed.
+   *  Optional for back-compat: snapshots written before this field are read with
+   *  unknown columns, which the diff treats as a match (no spurious re-create). */
+  indexColumns?: Record<string, string[]>;
 }
 
-export const EMPTY_SNAPSHOT: Snapshot = { version: 1, columns: {}, indexes: [] };
+export const EMPTY_SNAPSHOT: Snapshot = { version: 1, columns: {}, indexes: [], indexColumns: {} };
 
 /** Convert a schema definition into the snapshot (live shape) that applying it
  *  would produce: the engine-managed system columns plus each field's lowered
@@ -34,6 +38,7 @@ export function schemaToSnapshot(schema: AnySchema): Snapshot {
   const described = schema.describe();
   const columns: LiveSchema = {};
   const indexes: string[] = [];
+  const indexColumns: Record<string, string[]> = {};
   for (const [table, { fields, indexes: idxs }] of Object.entries(described)) {
     const cols: Record<string, LiveColumn> = {
       _id: { type: "uuid", notNull: true },
@@ -45,16 +50,22 @@ export function schemaToSnapshot(schema: AnySchema): Snapshot {
       cols[fieldToColumn(field)] = { type: pgType(inner), notNull: !nullable };
     }
     columns[table] = cols;
-    for (const ix of idxs ?? []) indexes.push(`${table}_${ix.name}`);
+    for (const ix of idxs ?? []) {
+      const name = `${table}_${ix.name}`;
+      indexes.push(name);
+      indexColumns[name] = ix.columns.map(fieldToColumn);
+    }
   }
-  return { version: 1, columns, indexes };
+  return { version: 1, columns, indexes, indexColumns };
 }
 
 /** Diff the current schema against the previous snapshot (or empty, for the first
  *  migration). Reuses the live-diff engine with the snapshot standing in for the DB. */
 export function diffAgainstSnapshot(schema: AnySchema, prev: Snapshot | null): SchemaDiff {
   const base = prev ?? EMPTY_SNAPSHOT;
-  return diffSchema(base.columns, schema, new Set(base.indexes));
+  const cols = base.indexColumns ?? {};
+  const liveIndexes = new Map(base.indexes.map((name) => [name, cols[name] ?? []]));
+  return diffSchema(base.columns, schema, liveIndexes);
 }
 
 /** Render an editable migration SQL file from a diff. Additive and alter

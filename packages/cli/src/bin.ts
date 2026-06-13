@@ -15,11 +15,13 @@ import {
   dropStatement,
   isEmptyDiff,
   parseLiveColumns,
+  parseLiveIndexes,
   renderDiff,
   INTROSPECT_SQL,
   INTROSPECT_INDEXES_SQL,
   type Drop,
   type InfoSchemaRow,
+  type IndexColumnRow,
 } from "./diff.js";
 import {
   diffAgainstSnapshot,
@@ -176,14 +178,14 @@ async function connectPg(databaseUrl: string): Promise<PgClient> {
   return client;
 }
 
-/** Read the live database shape (columns + index names) for diffing. */
+/** Read the live database shape (columns + indexes with their columns) for diffing. */
 async function introspect(
   client: PgClient,
-): Promise<{ live: ReturnType<typeof parseLiveColumns>; liveIndexes: Set<string> }> {
+): Promise<{ live: ReturnType<typeof parseLiveColumns>; liveIndexes: Map<string, string[]> }> {
   const cols = await client.query(INTROSPECT_SQL);
   const idx = await client.query(INTROSPECT_INDEXES_SQL);
   const live = parseLiveColumns(cols.rows as InfoSchemaRow[]);
-  const liveIndexes = new Set<string>((idx.rows as { indexname: string }[]).map((r) => r.indexname));
+  const liveIndexes = parseLiveIndexes(idx.rows as IndexColumnRow[]);
   return { live, liveIndexes };
 }
 
