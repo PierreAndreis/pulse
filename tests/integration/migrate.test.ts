@@ -7,6 +7,15 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { defineSchema, defineTable, v } from "../../packages/schema/src/index.js";
 import { generateDDL } from "../../packages/cli/src/ddl.js";
 import {
+  diffSchema,
+  parseLiveColumns,
+  parseLiveIndexes,
+  INTROSPECT_SQL,
+  INTROSPECT_INDEXES_SQL,
+  type IndexColumnRow,
+  type InfoSchemaRow,
+} from "../../packages/cli/src/diff.js";
+import {
   applyPending,
   diffAgainstSnapshot,
   migrationTag,
@@ -205,5 +214,56 @@ describe("pulse migrate — file lifecycle on real Postgres (deploy / journal / 
     await expect(applyPending(psqlClient, await readMigrations(dir))).rejects.toThrow(
       /already applied but its file changed/,
     );
+  });
+});
+
+// The live `db push` path: introspect a real database, then diff the desired
+// schema against it. Covers the actual INTROSPECT_INDEXES_SQL (pg_index + unnest)
+// feeding parseLiveIndexes, so an index that kept its name but changed columns is
+// detected as drop+create against a live DB (not just against a file snapshot).
+describe("pulse db push — live introspection diff (real Postgres)", () => {
+  beforeAll(async () => {
+    await psql("drop table if exists doohickeys cascade");
+    // create with an index on (qty)
+    await psql(
+      generateDDL(
+        defineSchema({
+          doohickeys: defineTable({ name: v.string(), qty: v.int() }).index("by_qty", ["qty"]),
+        }),
+      ),
+    );
+  });
+  afterAll(async () => {
+    await psql("drop table if exists doohickeys cascade");
+  });
+
+  test("introspecting the live DB detects an index column change as drop+create", async () => {
+    // Read the real database shape (columns + index columns).
+    const colRows = (await psql(INTROSPECT_SQL))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [table_name, column_name, data_type, is_nullable] = line.split("|");
+        return { table_name, column_name, data_type, is_nullable } as InfoSchemaRow;
+      });
+    const idxRows = (await psql(INTROSPECT_INDEXES_SQL))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [indexname, column_name, ord] = line.split("|");
+        return { indexname, column_name: column_name || null, ord: Number(ord) } as IndexColumnRow;
+      });
+
+    const live = parseLiveColumns(colRows);
+    const liveIndexes = parseLiveIndexes(idxRows);
+    expect(liveIndexes.get("doohickeys_by_qty")).toEqual(["qty"]); // introspected correctly
+
+    // The schema now wants the same-named index on (name) instead of (qty).
+    const redefined = defineSchema({
+      doohickeys: defineTable({ name: v.string(), qty: v.int() }).index("by_qty", ["name"]),
+    });
+    const diff = diffSchema(live, redefined, liveIndexes);
+    expect(diff.additive).toContain("drop index if exists doohickeys_by_qty;");
+    expect(diff.additive).toContain("create index if not exists doohickeys_by_qty on doohickeys (name);");
   });
 });
