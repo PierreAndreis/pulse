@@ -61,4 +61,33 @@ describe("LocalFirst read-cache persistence (local-first)", () => {
     expect(await lf.queue.size()).toBe(0); // delivered
     expect(sizes.length).toBeGreaterThanOrEqual(2); // notified on enqueue + on drain
   });
+
+  it("a concurrent flush does not double-send an in-flight mutation (re-entrancy guard)", async () => {
+    const kv = new InMemoryKV();
+    // A fetch we can hold in-flight, so the first flush stays parked on the send.
+    const resolvers: Array<() => void> = [];
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((res) =>
+          resolvers.push(() => res(new Response(JSON.stringify({ result: null }), { status: 200 }))),
+        ),
+    );
+    const lf = new LocalFirst({ url: "http://x", fetch: fetchMock as unknown as typeof fetch }, kv);
+
+    // mutate() enqueues then kicks off flush(); the send is now parked on the fetch.
+    await lf.mutate(["messages", "send"], { body: "a" });
+    await new Promise((r) => setTimeout(r, 0)); // let flush reach the in-flight send
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // A second flush while the first is still draining must be a no-op: the queued
+    // mutation is in-flight, not yet removed, so re-reading it would re-send it.
+    await lf.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1); // not double-sent
+
+    // Complete the in-flight send; the mutation drains exactly once.
+    resolvers.forEach((r) => r());
+    await new Promise((r) => setTimeout(r, 10));
+    expect(await lf.queue.size()).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
