@@ -43,6 +43,44 @@ describe("server builder", () => {
     expect(proc.def.kind).toBe("mutation");
   });
 
+  it("a throwing middleware short-circuits — the handler never runs", async () => {
+    const contract = { ping: oc.reactive().output(v.string()) };
+    const impl = implement(contract);
+    let handlerRan = false;
+    const proc = impl.ping
+      .use(
+        os.middleware(async () => {
+          throw new Error("blocked by guard");
+        }),
+      )
+      .handler(async () => {
+        handlerRan = true;
+        return "ok";
+      });
+
+    await expect(
+      executeProcedure(proc, { headers: new Headers(), requestId: "r" }, undefined),
+    ).rejects.toThrow("blocked by guard");
+    expect(handlerRan).toBe(false); // guard rejected before the handler
+  });
+
+  it("rejects when a middleware calls next() more than once", async () => {
+    const contract = { ping: oc.reactive().output(v.string()) };
+    const impl = implement(contract);
+    const proc = impl.ping
+      .use(
+        os.middleware(async ({ next }) => {
+          await next({ context: {} });
+          return next({ context: {} }); // second call must be rejected
+        }),
+      )
+      .handler(async () => "ok");
+
+    await expect(
+      executeProcedure(proc, { headers: new Headers(), requestId: "r" }, undefined),
+    ).rejects.toThrow(/next\(\) called multiple times/);
+  });
+
   it("composes reusable base builders", async () => {
     const contract = { ping: oc.reactive().output(v.string()) };
     const impl = implement(contract);
