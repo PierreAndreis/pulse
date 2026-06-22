@@ -106,7 +106,7 @@ jobs:
       # Publish the GitHub Release FIRST so the npm package we publish next points
       # at binaries that already exist (users can install immediately).
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: |
             artifacts/pulse-server-*
